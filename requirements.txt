@@ -1,0 +1,10 @@
+# Portfolio Manager — runtime dependencies
+# Install: pip install -r requirements.txt
+
+dash==4.1.0
+dash-ag-grid==35.2.0
+pandas==2.3.3
+numpy==2.4.4
+openpyxl==3.1.5
+polars-bloomberg==0.5.4
+plotly==5.24.1            # scenario charts; imported lazily, token-styled

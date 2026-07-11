@@ -1,0 +1,494 @@
+"""Build the canonical ``Position`` record list from an ``PortfolioExtract``.
+
+A ``Position`` is the canonical normalized holdings row. It carries
+everything the downstream schema-coupling modules need
+(``portfolio_snapshot``, ``position_context``, ``portfolio_greeks``,
+``portfolio_diagnostics``) without exposing the raw xlsx column layout.
+
+This module is also responsible for constructing Bloomberg-format
+tickers (e.g. ``'AAPL US Equity'``, ``'AAPL US 1/21/28 C300 Equity'``)
+and joining each Holdings row to its Trades-sheet history.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Optional
+
+import pandas as pd
+
+from pm.core.ticker_utils import construct_option_ticker
+from pm.ingest.extract_loader import PortfolioExtract
+
+
+# ---------------------------------------------------------------------------
+# Country code -> Bloomberg exchange suffix
+# ---------------------------------------------------------------------------
+# Keyed by ISO-3166 alpha-2 codes as they appear in the extract's
+# `Issuer Country Code Final` / `Listing Hint Country Code` columns.
+# Unknown codes fall back to "US" and a parse warning is emitted; that is
+# acceptable for V1 since the sample has only one non-US row and
+# exceptions accumulate empirically as new names appear.
+
+COUNTRY_TO_BBG_SUFFIX: dict[str, str] = {
+    "US": "US",
+    "CH": "SW",  # Switzerland (SIX)
+    "DE": "GY",  # Germany (XETRA)
+    "NL": "NA",  # Netherlands (Euronext Amsterdam)
+    "GB": "LN",  # UK (LSE)
+    "FR": "FP",  # France (Euronext Paris)
+    "IT": "IM",  # Italy (Borsa Italiana)
+    "ES": "SM",  # Spain (BME)
+    "SE": "SS",  # Sweden (Nasdaq Stockholm)
+    "DK": "DC",  # Denmark
+    "NO": "NO",  # Norway (Oslo)
+    "FI": "FH",  # Finland (Helsinki)
+    "BE": "BB",  # Belgium (Euronext Brussels)
+    "JP": "JT",  # Japan (Tokyo)
+    "IE": "ID",  # Ireland (Euronext Dublin)
+}
+
+
+# ---------------------------------------------------------------------------
+# Position record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Position:
+    """One row from the Holdings sheet, normalized and trade-joined.
+
+    Note: ``Position.position_id`` is a distinct identifier from
+    ``Recommendation.position_id``. The latter is the BBG-formatted
+    ticker (set by ``compute_recommendations``); ``Position.position_id``
+    is the canonical row identifier (option_contract_key for options;
+    ticker_final for equities/funds; product_name + per-account suffix
+    for cash/other). V2 will rename one of them.
+    """
+    # Identity
+    account: str
+    position_id: str
+    asset_class: str            # 'option' | 'equity' | 'fund_etf' | 'cash' | 'other'
+    instrument_type: str
+
+    # Tickers
+    symbol: str                 # ticker_final for non-options; underlying_ticker for options
+    bbg_ticker: str             # BBG-format. '' for cash/other.
+    underlying_symbol: Optional[str]
+    underlying_bbg_ticker: Optional[str]
+
+    # Economics (all signed where applicable)
+    quantity: Optional[float]
+    multiplier: int
+    valuation_price: Optional[float]
+    market_value: float
+    cost_basis: Optional[float]
+    unrealized_pnl: Optional[float]
+    unrealized_pnl_pct: Optional[float]
+    pct_pnl: Optional[float]    # alias of unrealized_pnl_pct for PositionContext compat
+
+    # Option-specific
+    option_type: Optional[str]
+    right: Optional[str]        # alias of option_type
+    strike: Optional[float]
+    expiry: Optional[date]
+    option_contract_key: Optional[str]
+
+    # Trade-history-derived
+    open_date: Optional[date] = None
+    days_held: Optional[int] = None
+    last_trade_date: Optional[date] = None
+    last_trade_action: Optional[str] = None
+    n_trades: int = 0
+
+    # Forward-compat
+    style: Optional[str] = None   # The extract has no Style column; always None in V1.
+
+    # Display
+    name: Optional[str] = None    # Human-readable security name, surfaced from
+                                  # the extract's Product Name / Underlying Name
+                                  # column. Display-only; no engine input.
+
+    # Set by the enrichment layer when a held option's ticker (built here from the
+    # equity root) is re-keyed to the true listed ticker resolved from the option
+    # chain: the original constructed string, kept for audit. None when the built
+    # ticker resolved as-is (every US single-name). Non-keyed; diagnostic only.
+    provisional_bbg_ticker: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def build_positions(extract: PortfolioExtract) -> list[Position]:
+    """One ``Position`` per Holdings row, joined to per-account trade
+    history. Mutates ``extract.parse_warnings`` to append any new
+    warnings raised here.
+    """
+    holdings = extract.holdings
+    trades = extract.trades
+    warnings = extract.parse_warnings
+
+    positions: list[Position] = []
+    cash_other_counters: dict[str, int] = {}
+
+    for _, row in holdings.iterrows():
+        # When a load-bearing column is ENTIRELY absent the loader has already
+        # emitted one summary flag with the affected-row count, so these per-row
+        # skips stay silent (no N-note wall). A present column with a bad value
+        # in some rows is a genuine per-row data issue and is still warned.
+        asset_class = row.get("asset_class")
+        if not isinstance(asset_class, str):
+            if "asset_class" in row.index:
+                warnings.append(
+                    f"Holdings: skipped row with non-string asset_class ({asset_class!r})."
+                )
+            continue
+
+        account = str(row.get("account") or "")
+        if not account:
+            if "account" in row.index:
+                warnings.append("Holdings: skipped row with empty account.")
+            continue
+
+        position = _build_one(row, account, asset_class, cash_other_counters, warnings)
+        if position is None:
+            continue
+
+        _attach_trade_history(position, trades)
+
+        positions.append(position)
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _build_one(
+    row: pd.Series,
+    account: str,
+    asset_class: str,
+    cash_other_counters: dict[str, int],
+    warnings: list[str],
+) -> Optional[Position]:
+    market_value = _coerce_float(row.get("market_value"))
+    if market_value is None:
+        market_value = 0.0
+
+    quantity = _coerce_float(row.get("quantity"))
+    cost_basis = _coerce_float(row.get("cost_basis"))
+    unrealized_pnl = _coerce_float(row.get("unrealized_pnl"))
+    unrealized_pnl_pct = _coerce_float(row.get("unrealized_pnl_pct"))
+    valuation_price = _coerce_float(row.get("valuation_price"))
+
+    if asset_class == "option":
+        return _build_option(
+            row, account, market_value, quantity, cost_basis,
+            unrealized_pnl, unrealized_pnl_pct, valuation_price, warnings,
+        )
+    if asset_class in ("equity", "fund_etf"):
+        return _build_equity_or_fund(
+            row, account, asset_class, market_value, quantity, cost_basis,
+            unrealized_pnl, unrealized_pnl_pct, valuation_price, warnings,
+        )
+    if asset_class in ("cash", "other"):
+        return _build_cash_or_other(
+            row, account, asset_class, market_value, quantity, valuation_price,
+            cash_other_counters,
+        )
+
+    warnings.append(
+        f"Holdings: unknown asset_class {asset_class!r} for account {account}; skipped."
+    )
+    return None
+
+
+def _build_option(
+    row: pd.Series, account: str, market_value: float, quantity: Optional[float],
+    cost_basis: Optional[float], unrealized_pnl: Optional[float],
+    unrealized_pnl_pct: Optional[float], valuation_price: Optional[float],
+    warnings: list[str],
+) -> Optional[Position]:
+    # As in build_positions: warn per row only when the column is present (a real
+    # per-row gap); an absent column is the loader's single summary flag's job.
+    contract_key = row.get("option_contract_key")
+    if not isinstance(contract_key, str) or not contract_key:
+        if "option_contract_key" in row.index:
+            warnings.append(
+                f"Holdings option row missing option_contract_key (account={account}); skipped."
+            )
+        return None
+
+    underlying_ticker = row.get("underlying_ticker")
+    if not isinstance(underlying_ticker, str) or not underlying_ticker:
+        if "underlying_ticker" in row.index:
+            warnings.append(
+                f"Holdings option {contract_key} missing underlying_ticker; skipped."
+            )
+        return None
+
+    option_type = row.get("option_type")
+    if option_type not in ("CALL", "PUT"):
+        if "option_type" in row.index:
+            warnings.append(
+                f"Holdings option {contract_key} has invalid option_type {option_type!r}; skipped."
+            )
+        return None
+
+    strike = _coerce_float(row.get("option_strike"))
+    expiry = row.get("option_expiration")
+    if not isinstance(expiry, date) or strike is None:
+        if "option_strike" in row.index and "option_expiration" in row.index:
+            warnings.append(
+                f"Holdings option {contract_key} missing strike/expiry; skipped."
+            )
+        return None
+
+    underlying_cc = _pick_country_code(
+        row, "underlying_issuer_country_code", "issuer_country_code_final",
+        "listing_hint_country_code",
+    )
+    underlying_bbg = _build_equity_bbg_ticker(underlying_ticker, underlying_cc, warnings)
+
+    try:
+        option_bbg = construct_option_ticker(
+            underlying_bbg, expiry, option_type, strike, sector_hint="Equity",
+        )
+    except ValueError as exc:
+        warnings.append(
+            f"Holdings option {contract_key}: construct_option_ticker failed ({exc}); skipped."
+        )
+        return None
+
+    return Position(
+        account=account,
+        position_id=contract_key,
+        asset_class="option",
+        instrument_type="option",
+        symbol=underlying_ticker,
+        bbg_ticker=option_bbg,
+        underlying_symbol=underlying_ticker,
+        underlying_bbg_ticker=underlying_bbg,
+        quantity=quantity,
+        multiplier=100,
+        valuation_price=valuation_price,
+        market_value=market_value,
+        cost_basis=cost_basis,
+        unrealized_pnl=unrealized_pnl,
+        unrealized_pnl_pct=unrealized_pnl_pct,
+        pct_pnl=unrealized_pnl_pct,
+        option_type=option_type,
+        right=option_type,
+        strike=strike,
+        expiry=expiry,
+        option_contract_key=contract_key,
+        name=_security_name(row, "option"),
+    )
+
+
+def _build_equity_or_fund(
+    row: pd.Series, account: str, asset_class: str, market_value: float,
+    quantity: Optional[float], cost_basis: Optional[float],
+    unrealized_pnl: Optional[float], unrealized_pnl_pct: Optional[float],
+    valuation_price: Optional[float], warnings: list[str],
+) -> Optional[Position]:
+    ticker_final = row.get("ticker_final")
+    if not isinstance(ticker_final, str) or not ticker_final:
+        if "ticker_final" in row.index:
+            warnings.append(
+                f"Holdings {asset_class} row missing ticker_final (account={account}); skipped."
+            )
+        return None
+
+    cc = _pick_country_code(
+        row, "issuer_country_code_final", "listing_hint_country_code",
+        "underlying_issuer_country_code",
+    )
+    bbg_ticker = _build_equity_bbg_ticker(ticker_final, cc, warnings)
+
+    return Position(
+        account=account,
+        position_id=ticker_final,
+        asset_class=asset_class,
+        instrument_type=asset_class,
+        symbol=ticker_final,
+        bbg_ticker=bbg_ticker,
+        underlying_symbol=None,
+        underlying_bbg_ticker=None,
+        quantity=quantity,
+        multiplier=1,
+        valuation_price=valuation_price,
+        market_value=market_value,
+        cost_basis=cost_basis,
+        unrealized_pnl=unrealized_pnl,
+        unrealized_pnl_pct=unrealized_pnl_pct,
+        pct_pnl=unrealized_pnl_pct,
+        option_type=None,
+        right=None,
+        strike=None,
+        expiry=None,
+        option_contract_key=None,
+        name=_security_name(row, asset_class),
+    )
+
+
+def _build_cash_or_other(
+    row: pd.Series, account: str, asset_class: str, market_value: float,
+    quantity: Optional[float], valuation_price: Optional[float],
+    cash_other_counters: dict[str, int],
+) -> Position:
+    product_name = row.get("product_name")
+    base = product_name if isinstance(product_name, str) and product_name else asset_class.upper()
+    counter_key = (account, base)
+    cash_other_counters[counter_key] = cash_other_counters.get(counter_key, 0) + 1
+    suffix = cash_other_counters[counter_key]
+    position_id = f"{base}__{suffix}" if suffix > 1 else base
+
+    symbol_value = row.get("ticker_final")
+    symbol = symbol_value if isinstance(symbol_value, str) else base
+
+    return Position(
+        account=account,
+        position_id=position_id,
+        asset_class=asset_class,
+        instrument_type=asset_class,
+        symbol=symbol,
+        bbg_ticker="",
+        underlying_symbol=None,
+        underlying_bbg_ticker=None,
+        quantity=quantity,
+        multiplier=1,
+        valuation_price=valuation_price,
+        market_value=market_value,
+        cost_basis=None,
+        unrealized_pnl=None,
+        unrealized_pnl_pct=None,
+        pct_pnl=None,
+        option_type=None,
+        right=None,
+        strike=None,
+        expiry=None,
+        option_contract_key=None,
+        name=_security_name(row, asset_class),
+    )
+
+
+def _attach_trade_history(position: Position, trades: pd.DataFrame) -> None:
+    if trades is None or trades.empty:
+        return
+
+    # Options join on option_contract_key alone (NO
+    # account filter — cross-account journal entries / book transfers
+    # are valid). Equities/funds join on (account, ticker_final).
+    if position.asset_class == "option" and position.option_contract_key:
+        if "option_contract_key" not in trades.columns:
+            return
+        matches = trades[trades["option_contract_key"] == position.option_contract_key]
+    elif position.asset_class in ("equity", "fund_etf"):
+        if "ticker_final" not in trades.columns or "account" not in trades.columns:
+            return
+        matches = trades[
+            (trades["account"] == position.account)
+            & (trades["ticker_final"] == position.symbol)
+        ]
+    else:
+        return
+
+    if matches.empty:
+        return
+
+    position.n_trades = int(len(matches))
+
+    sorted_matches = matches.sort_values("trade_date") if "trade_date" in matches.columns else matches
+    open_rows = sorted_matches
+    if "option_lifecycle_action" in sorted_matches.columns:
+        open_rows = sorted_matches[
+            sorted_matches["option_lifecycle_action"].isin(["Buy to Open", "Sell to Open"])
+        ]
+    if open_rows.empty and "buy_sell" in sorted_matches.columns and position.asset_class != "option":
+        # For equities / funds in the absence of lifecycle action, treat
+        # the earliest Buy as the opening trade for longs and earliest
+        # Sell for shorts.
+        if position.quantity is not None and position.quantity >= 0:
+            open_rows = sorted_matches[sorted_matches["buy_sell"] == "Buy"]
+        else:
+            open_rows = sorted_matches[sorted_matches["buy_sell"] == "Sell"]
+
+    if not open_rows.empty:
+        first_open = open_rows.iloc[0]
+        open_dt = first_open.get("trade_date")
+        if isinstance(open_dt, date):
+            position.open_date = open_dt
+            position.days_held = max((date.today() - open_dt).days, 0)
+
+    last = sorted_matches.iloc[-1]
+    last_dt = last.get("trade_date")
+    if isinstance(last_dt, date):
+        position.last_trade_date = last_dt
+    last_action = last.get("option_lifecycle_action")
+    if isinstance(last_action, str):
+        position.last_trade_action = last_action
+    elif isinstance(last.get("buy_sell"), str):
+        position.last_trade_action = str(last["buy_sell"])
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _coerce_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_str(value: object) -> Optional[str]:
+    """A non-empty trimmed string, or None (handles NaN / blanks)."""
+    if isinstance(value, str):
+        s = value.strip()
+        return s or None
+    return None
+
+
+def _security_name(row: pd.Series, asset_class: str) -> Optional[str]:
+    """Human-readable name for a holdings row. Options prefer the underlying
+    company name; everything else prefers the product name. Both come straight
+    from the extract — no lookup, no BBG."""
+    product = _clean_str(row.get("product_name"))
+    underlying = _clean_str(row.get("underlying_name"))
+    if asset_class == "option":
+        return underlying or product
+    return product or underlying
+
+
+def _pick_country_code(row: pd.Series, *cols: str) -> Optional[str]:
+    for col in cols:
+        v = row.get(col)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _build_equity_bbg_ticker(
+    ticker: str, country_code: Optional[str], warnings: list[str],
+) -> str:
+    suffix = "US"
+    if country_code:
+        mapped = COUNTRY_TO_BBG_SUFFIX.get(country_code.upper())
+        if mapped is None:
+            warnings.append(
+                f"No BBG exchange suffix for country code {country_code!r} "
+                f"(ticker {ticker}); defaulting to 'US'. Add the mapping if BBG fails."
+            )
+        else:
+            suffix = mapped
+    return f"{ticker} {suffix} Equity"

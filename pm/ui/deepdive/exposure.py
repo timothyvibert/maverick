@@ -1,0 +1,249 @@
+"""Section — Portfolio exposure (the risk view).
+
+Renders the precomputed account exposure (``acc.exposure`` from pm.risk.exposure):
+the net market exposure (beta-adjusted dollar delta) headline, net dollar greeks,
+market value vs economic exposure, both SPX betas, vega by tenor, and the
+position -> structure -> account rollup. A pure read of ``acc.exposure`` — no
+compute, no Bloomberg, no recompute. This section absorbs the old net-greeks panel
+(those stats are the headline here); the one-glance "Net Greeks" KPI in the header
+stays as the separate glance.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from dash import html
+
+from pm.ui.deepdive.aggregations import _fmt_money
+
+_BETA_NOTE = (
+    "Adjusted (Blume) is the default — name betas converge toward 1.0 in a selloff "
+    "(crash correlation), so it is the steadier downside proxy; raw is the current "
+    "empirical sensitivity. Both vs SPX, 2y weekly — distinct from the holdings "
+    "'Weighted β' chip, which uses each name's default index (they agree for US "
+    "names, differ for non-US)."
+)
+
+
+def _stat(label: str, value: str, sub: Optional[str] = None, cls: str = "",
+          title: Optional[str] = None) -> html.Div:
+    children = [html.Div(label, className="dd-stat-label"),
+                html.Div(value, className="dd-stat-value")]
+    if sub:
+        children.append(html.Div(sub, className="dd-stat-sub"))
+    div = html.Div(className=f"dd-stat {cls}".strip(), children=children)
+    if title:
+        div.title = title
+    return div
+
+
+def _sign_cls(v: Optional[float]) -> str:
+    """dd-stat sign colouring (green/red for +/-), neutral at zero/None."""
+    if v is None or v == 0:
+        return ""
+    return "dd-stat-pos" if v > 0 else "dd-stat-neg"
+
+
+def _num_cls(v: Optional[float]) -> str:
+    """Rollup-cell sign colouring on the shared --pos/--neg tokens."""
+    base = "exposure-num"
+    if v is None or v == 0:
+        return base
+    return f"{base} {'exposure-pos' if v > 0 else 'exposure-neg'}"
+
+
+def _struct_label(node) -> str:
+    st = getattr(node, "structure_type", None)
+    label = st.replace("_", " ").capitalize() if st else getattr(node, "label", "—")
+    if getattr(node, "contention_group", None):
+        label += "  (alt)"
+    return label
+
+
+# ---- panels ---------------------------------------------------------------
+
+def _headline_panel(e) -> html.Div:
+    t = e.total
+    nme = e.net_market_exposure
+    return html.Div(className="dd-panel", children=[
+        html.H3("Net market exposure", className="dd-panel-title"),
+        html.Div(className="dd-stat-row", children=[
+            _stat("Net market exposure", _fmt_money(nme),
+                  "β SPX 2y wkly · adjusted", cls=_sign_cls(nme),
+                  title="Σ position dollar-delta × the name's SPX beta "
+                        "(net beta-adjusted market exposure)"),
+            _stat("Net $ Delta", _fmt_money(t.dollar_delta), "economic (delta-$)",
+                  cls=_sign_cls(t.dollar_delta)),
+            _stat("Net $ Gamma", _fmt_money(t.dollar_gamma), cls=_sign_cls(t.dollar_gamma)),
+            _stat("Net $ Vega", _fmt_money(t.dollar_vega), cls=_sign_cls(t.dollar_vega)),
+            _stat("Net $ Theta", _fmt_money(t.dollar_theta), cls=_sign_cls(t.dollar_theta)),
+        ]),
+        html.Div(_provenance(e), className="dd-panel-note"),
+    ])
+
+
+def _mv_vs_econ_panel(e) -> html.Div:
+    t = e.total
+    return html.Div(className="dd-panel", children=[
+        html.H3("Market value vs economic exposure", className="dd-panel-title"),
+        html.Div(className="dd-stat-row", children=[
+            _stat("Market value", _fmt_money(t.market_value), "marked book value",
+                  cls=_sign_cls(t.market_value)),
+            _stat("Economic exposure", _fmt_money(e.economic_exposure),
+                  "delta-equivalent (delta-$)", cls=_sign_cls(e.economic_exposure)),
+        ]),
+        html.Div("Market value is what the book is marked at; economic exposure is its "
+                 "delta-equivalent exposure to the underlyings — they diverge where an "
+                 "option's premium understates its directional exposure.",
+                 className="dd-panel-note"),
+    ])
+
+
+def _beta_panel(e) -> html.Div:
+    t = e.total
+    return html.Div(className="dd-panel", children=[
+        html.Div(className="dd-panel-headrow", children=[
+            html.H3("Beta", className="dd-panel-title"),
+            html.Span("β SPX 2y wkly", className="dd-beta-chip"),
+        ]),
+        html.Div(className="dd-stat-row", children=[
+            _stat("Adjusted (β-$)", _fmt_money(t.dollar_beta_adjusted), "default",
+                  cls=_sign_cls(t.dollar_beta_adjusted)),
+            _stat("Raw (β-$)", _fmt_money(t.dollar_beta_raw),
+                  cls=_sign_cls(t.dollar_beta_raw)),
+        ]),
+        html.Div(_BETA_NOTE, className="dd-panel-note"),
+    ])
+
+
+def _vega_tenor_row(e) -> html.Div:
+    header = html.Div(className="dd-ladder-row dd-ladder-head", children=[
+        html.Span("Tenor"),
+        *[html.Span(b.label) for b in e.vega_by_tenor],
+    ])
+    values = html.Div(className="dd-ladder-row", children=[
+        html.Span("Net $ Vega", className="dd-ladder-bucket"),
+        *[html.Span(_fmt_money(b.dollar_vega) if b.n_options else "—",
+                    className="dd-ladder-count") for b in e.vega_by_tenor],
+    ])
+    return html.Div(className="dd-panel", children=[
+        html.H3("Vega by tenor", className="dd-panel-title"),
+        html.Div("Vega's term structure — dollar vega by days to expiry.",
+                 className="dd-panel-subtitle"),
+        html.Div(className="dd-ladder dd-vega-ladder", children=[header, values]),
+    ])
+
+
+# ---- rollup table ---------------------------------------------------------
+
+_ROLLUP_COLS = [
+    ("Structure", "left"),
+    ("$ Delta", "right"), ("β-$ (SPX)", "right"), ("$ Gamma", "right"),
+    ("$ Vega", "right"), ("$ Theta", "right"), ("Net MV", "right"),
+]
+
+
+def _rollup_row(node, row_cls: str = "") -> html.Tr:
+    degraded = getattr(node, "degraded", False)
+    label_children = [_struct_label(node)]
+    if degraded:
+        label_children.append(html.Span(" ⚠", className="exposure-degraded-mark",
+                                         title="some legs could not be cleanly allocated"))
+    cells = [html.Td(label_children, className="exposure-label")]
+    for v in (node.dollar_delta, node.dollar_beta_adjusted, node.dollar_gamma,
+              node.dollar_vega, node.dollar_theta, node.market_value):
+        cells.append(html.Td(_fmt_money(v), className=_num_cls(v)))
+    cls = f"am-row {row_cls}".strip()
+    if getattr(node, "contention_group", None):
+        cls += " exposure-row-contention"
+    if degraded:
+        cls += " exposure-row-degraded"
+    return html.Tr(className=cls, children=cells)
+
+
+def _rollup_summary(e) -> html.Summary:
+    """The always-visible accordion header: the bold Account total + the expander.
+    Collapsed, the reader sees the account's net exposure; expanding reveals the
+    per-structure breakdown. Native <details>/<summary> — no callback, no JS."""
+    t = e.total
+    n = len(e.structures)
+
+    def _stat(label, v):
+        return html.Span(className="exposure-rollup-stat", children=[
+            html.Span(label, className="exposure-rollup-stat-lbl"),
+            html.Span(_fmt_money(v), className=_num_cls(v)),
+        ])
+
+    return html.Summary(className="exposure-rollup-summary", children=[
+        html.Span("Account", className="exposure-rollup-acct"),
+        _stat("Net $Δ", t.dollar_delta),
+        _stat("β-$", t.dollar_beta_adjusted),
+        _stat("Net MV", t.market_value),
+        html.Span(className="exposure-rollup-toggle", children=[
+            f"Structure → Account ({n}) ",
+            html.Span("▾", className="exposure-rollup-caret"),
+        ]),
+    ])
+
+
+def _rollup_table(e) -> html.Div:
+    head = html.Tr(children=[
+        html.Th(name, className="am-th",
+                style={"textAlign": align}) for name, align in _ROLLUP_COLS
+    ])
+    body: list = [_rollup_row(s) for s in e.structures]
+    body.append(_rollup_row(e.structured, "exposure-row-subtotal"))
+    body.append(_rollup_row(e.unstructured, "exposure-row-subtotal"))
+    body.append(_rollup_row(e.total, "exposure-row-total"))
+    note = ("Structured + Unstructured = Account. Contention alternatives (alt) are "
+            "mutually-exclusive readings of the same legs — shown for context, not "
+            "added into the totals.") if any(
+        getattr(s, "contention_group", None) for s in e.structures) else \
+        "Structured + Unstructured = Account."
+    return html.Div(className="dd-panel dd-exposure-rollup", children=[
+        html.H3("Exposure rollup — structure → account", className="dd-panel-title"),
+        html.Details(open=False, className="exposure-rollup-details", children=[
+            _rollup_summary(e),
+            html.Table(className="am-table exposure-table", children=[
+                html.Thead(children=[head]),
+                html.Tbody(children=body),
+            ]),
+            html.Div(note, className="dd-panel-note"),
+        ]),
+    ])
+
+
+def _provenance(e) -> str:
+    src = (e.trace or {}).get("inputs", {}).get("greek_source", "snapshot greeks")
+    missing = (e.trace or {}).get("inputs", {}).get("names_missing_beta", []) or []
+    base = f"From {src}; beta vs SPX (2y weekly)."
+    if missing:
+        shown = ", ".join(missing[:3]) + ("…" if len(missing) > 3 else "")
+        base += f" {len(missing)} name(s) had no SPX beta and are excluded from " \
+                f"dollar-beta: {shown}."
+    return base
+
+
+# ---- section --------------------------------------------------------------
+
+def render_exposure_section(account_state) -> html.Div:
+    e = getattr(account_state, "exposure", None)
+    head = html.Div(className="dd-section-head", children=[
+        html.H2("Exposure", className="dd-section-title"),
+        html.Span("current-state · beta-adjusted",
+                  className="dd-section-meta"),
+    ])
+    if e is None:
+        return html.Div(className="dd-section", children=[
+            head, html.Div("Exposure unavailable for this account.", className="dd-empty"),
+        ])
+    return html.Div(className="dd-section", children=[
+        head,
+        html.Div(className="dd-analytics-grid", children=[
+            _headline_panel(e),
+            _mv_vs_econ_panel(e),
+            _beta_panel(e),
+            _vega_tenor_row(e),
+        ]),
+        _rollup_table(e),
+    ])

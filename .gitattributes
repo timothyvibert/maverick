@@ -1,0 +1,8 @@
+* text=auto
+
+# Defense-in-depth: local-only trees stay out of `git archive` exports even if
+# a file under them is ever force-added.
+pm/docs export-ignore
+pm/_scratch export-ignore
+tests export-ignore
+pm/conftest.py export-ignore

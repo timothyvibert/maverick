@@ -1,0 +1,208 @@
+"""The per-pattern headline-metric map — data + types only.
+
+For each engine pattern (P1-P15) this names the **single metric whose movement defines
+"materially changed"**: where the value already lives in the fire's ``trace``, the
+``PatternConfig`` threshold it is measured against, and the direction that fires. It is
+the static artifact the *next* item (material-change re-surfacing) consumes to decide
+whether a suppressed alert's condition has moved enough to bring it back — by comparing
+the suppression's captured baseline trace against the current fire's trace at this key.
+
+**This item defines the map; it builds no comparison.** Nothing here reads a suppression
+or compares captured-vs-current — that is deliberately deferred.
+
+Each entry carries a ``metric_type`` describing how the next item should compare it:
+
+* ``monotonic_numeric`` — one number that crosses the threshold one way (P1, P6, P9,
+  P10, P12, P15). The clean case: compare the headline value against the threshold.
+* ``event_recurrence`` — the real trigger is a calendar event, not a drifting metric
+  (P4 a fresh analyst note, P7 the ex-div date, P14 the earnings countdown). Re-surfacing
+  is better keyed to the event recurring than to the numeric drifting.
+* ``multi_axis`` — two or more conditions, or a categorical gate (P2, P3, P5, P11, P13).
+  The primary axis is the economic spine; the secondaries are recorded so the
+  comparison can decide whether one axis suffices.
+* ``proxy_only`` — no clean single metric; the trigger is event/structure-shaped (P8 a
+  roll-timing asymmetry). The primary is the best available numeric proxy, flagged.
+
+``trace_key`` is a path into ``fire.trace`` (e.g. ``("result", "captured_pct")`` or
+``("inputs", "spot_vs_200d_ma", "value")``). ``threshold_field`` is a ``PatternConfig``
+attribute, or ``None`` where the gate is a computed/event condition with no single dial.
+The test suite asserts every ``trace_key`` resolves on a real fire and every
+``threshold_field`` is a real ``PatternConfig`` field, so the map cannot silently drift
+from the detectors.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+# metric_type vocabulary
+MONOTONIC_NUMERIC = "monotonic_numeric"
+EVENT_RECURRENCE = "event_recurrence"
+MULTI_AXIS = "multi_axis"
+PROXY_ONLY = "proxy_only"
+METRIC_TYPES = frozenset({MONOTONIC_NUMERIC, EVENT_RECURRENCE, MULTI_AXIS, PROXY_ONLY})
+
+# direction vocabulary — how movement of the axis relates to firing.
+HIGHER_FIRES = "higher_fires"   # value rising past the threshold fires (captured, NAV%, gains)
+LOWER_FIRES = "lower_fires"     # value falling past the threshold fires (losses, DTE, idle)
+SIGNED = "signed"               # threshold sign depends on the leg (P3 put vs call break)
+EVENT = "event"                 # a calendar event / boolean, not a drifting number
+NOT_APPLICABLE = "n/a"          # categorical or contextual axis with no numeric threshold
+DIRECTIONS = frozenset({HIGHER_FIRES, LOWER_FIRES, SIGNED, EVENT, NOT_APPLICABLE})
+
+
+@dataclass(frozen=True)
+class Axis:
+    """One condition behind a fire: where its value lives in the trace, the dial it is
+    measured against (or None for a computed/event gate), the firing direction, and a
+    short human label for the secondary/sub-case axes."""
+    trace_key: tuple
+    threshold_field: Optional[str]
+    direction: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class HeadlineMetric:
+    pattern_id: str
+    metric_type: str
+    primary: Axis                       # the single headline axis
+    secondary: tuple = ()               # additional axes: gates, sub-cases, event econ
+    note: str = ""
+    # For event_recurrence patterns only: a trace-key path to the EVENT DATE (which cycle),
+    # since the primary/secondary axes point at countdown numbers, not event identity. The
+    # material-change comparison re-surfaces when the current event date is newer than the
+    # captured one. Lives in template_variables (raw values), so it round-trips through the
+    # default=str-serialized captured_trace as an ISO/date string. None for non-event types.
+    event_id_key: Optional[tuple] = None
+
+
+# pattern_id -> HeadlineMetric. Grounded in each detector's actual fire_result / trace
+# inputs (see pm/insight/patterns.py); validated by the test suite against real fires.
+HEADLINE_METRICS: dict[str, HeadlineMetric] = {
+    "P1": HeadlineMetric(
+        "P1", MONOTONIC_NUMERIC,
+        Axis(("result", "captured_pct"), "p1_captured_min", HIGHER_FIRES),
+    ),
+    "P2": HeadlineMetric(
+        "P2", MULTI_AXIS,
+        Axis(("result", "captured_pct"), "p2_captured_min", HIGHER_FIRES),
+        secondary=(
+            Axis(("result", "iv_pctl"), "p2_iv_pctl_min", HIGHER_FIRES, "IV percentile gate"),
+        ),
+        note="Captured premium is the economic spine; the IV-percentile gate distinguishes P2 from P1.",
+    ),
+    "P3": HeadlineMetric(
+        "P3", MULTI_AXIS,
+        Axis(("inputs", "spot_vs_200d_ma", "value"), "p3_200d_break_threshold", SIGNED,
+             "200d MA break (threshold sign flips put vs call)"),
+        secondary=(
+            Axis(("inputs", "option_captured_pct", "value"), "p3_captured_min", HIGHER_FIRES,
+                 "captured gate"),
+            Axis(("inputs", "return_horizons", "value"), "p3_return_5d_threshold", SIGNED,
+                 "5-session move (return_5d within return_horizons)"),
+        ),
+        note="Direction-dependent: short put fires on a break down, short call on a break up.",
+    ),
+    "P4": HeadlineMetric(
+        "P4", EVENT_RECURRENCE,
+        Axis(("result", "captured_pct"), "p4_captured_min", HIGHER_FIRES, "captured gate"),
+        secondary=(
+            Axis(("inputs", "analyst_note_recent", "value"), None, EVENT,
+                 "recent analyst note — the defining catalyst (re-surface on a new note)"),
+        ),
+        note="The trigger is a fresh analyst note (an event), not a drifting number.",
+        event_id_key=("template_variables", "analyst_note_date"),
+    ),
+    "P5": HeadlineMetric(
+        "P5", MULTI_AXIS,
+        Axis(("result", "captured_pct"), "p5_captured_min", HIGHER_FIRES),
+        secondary=(
+            Axis(("result", "dte"), "p5_dte_max", LOWER_FIRES,
+                 "roll window — closer to expiry fires (monotonic time decay)"),
+        ),
+    ),
+    "P6": HeadlineMetric(
+        "P6", MONOTONIC_NUMERIC,
+        Axis(("result", "pnl_pct"), "p6_pnl_pct_max", LOWER_FIRES, "path A loss (with time pressure)"),
+        secondary=(
+            Axis(("result", "pnl_pct"), "p6_extreme_pnl_pct_max", LOWER_FIRES,
+                 "path B extreme loss (any expiry)"),
+            Axis(("inputs", "option_dte", "value"), "p6_dte_max", LOWER_FIRES, "path A time gate"),
+        ),
+        note="P&L% is the headline; path A pairs it with a DTE gate, path B is P&L-only.",
+    ),
+    "P7": HeadlineMetric(
+        "P7", EVENT_RECURRENCE,
+        Axis(("inputs", "option_moneyness", "value"), None, HIGHER_FIRES, "depth ITM"),
+        secondary=(
+            Axis(("result", "extrinsic_estimate"), None, NOT_APPLICABLE,
+                 "extrinsic estimate (the early-exercise economics: extrinsic < dividend)"),
+            Axis(("result", "dividend"), None, NOT_APPLICABLE, "dividend amount"),
+            Axis(("inputs", "days_to_ex_div", "value"), "p7_exdiv_window_days", EVENT,
+                 "ex-div window"),
+        ),
+        note="Event-windowed: assignment economics around the ex-dividend date, not a metric drifting.",
+        event_id_key=("template_variables", "ex_div_date"),
+    ),
+    "P8": HeadlineMetric(
+        "P8", PROXY_ONLY,
+        Axis(("inputs", "position.unrealized_pnl_pct", "value"), "p8_residual_pnl_pct_max",
+             LOWER_FIRES, "residual leg P&L"),
+        note="No clean single metric — the trigger is a roll-timing asymmetry; residual P&L% is a proxy.",
+    ),
+    "P9": HeadlineMetric(
+        "P9", MONOTONIC_NUMERIC,
+        Axis(("result", "nav_pct"), "p9_nav_pct_min", HIGHER_FIRES),
+        note="Headline is size-of-NAV; the freshness window (p9_fresh_window_days) is a locked, "
+             "self-expiring time bound, not a sensitivity dial.",
+    ),
+    "P10": HeadlineMetric(
+        "P10", MONOTONIC_NUMERIC,
+        Axis(("result", "pnl_pct"), "p10_pnl_pct_min", HIGHER_FIRES),
+    ),
+    "P11": HeadlineMetric(
+        "P11", MULTI_AXIS,
+        Axis(("result", "cash_pct"), "p11_cash_pct_min", HIGHER_FIRES),
+        secondary=(
+            Axis(("result", "days_since_trade"), "p11_idle_days_min", HIGHER_FIRES,
+                 "idle window — a new trade resets it"),
+        ),
+        note="Account-level; cash share is the redeploy headline, idle days is partly event-reset.",
+    ),
+    "P12": HeadlineMetric(
+        "P12", MONOTONIC_NUMERIC,
+        Axis(("result", "nav_pct"), "p12_underlying_nav_pct_min", HIGHER_FIRES,
+             "underlying-summed case"),
+        secondary=(
+            Axis(("result", "nav_pct"), "p12_single_position_nav_pct_min", HIGHER_FIRES,
+                 "single-equity case"),
+        ),
+        note="Same headline (share of NAV) measured against two thresholds; result.case says which.",
+    ),
+    "P13": HeadlineMetric(
+        "P13", MULTI_AXIS,
+        Axis(("result", "iv_pctl"), "p13_iv_pctl_min", HIGHER_FIRES),
+        secondary=(
+            Axis(("result", "regime"), None, NOT_APPLICABLE, "MA stack regime (categorical gate)"),
+            Axis(("result", "rsi_regime"), None, NOT_APPLICABLE, "RSI regime (categorical gate)"),
+        ),
+        note="IV percentile is the numeric headline; the trend/RSI gates are categorical state.",
+    ),
+    "P14": HeadlineMetric(
+        "P14", EVENT_RECURRENCE,
+        Axis(("result", "days_to_earnings"), "p14_earnings_window_days", EVENT,
+             "earnings countdown"),
+        secondary=(
+            Axis(("result", "iv_pctl"), "p14_iv_pctl_min", HIGHER_FIRES, "IV percentile gate (OR)"),
+            Axis(("result", "term"), "p14_term_structure_min", HIGHER_FIRES, "term-structure gate (OR)"),
+        ),
+        note="Earnings date is the defining event; the vol condition is an OR of two gates.",
+        event_id_key=("template_variables", "earnings_date"),
+    ),
+    "P15": HeadlineMetric(
+        "P15", MONOTONIC_NUMERIC,
+        Axis(("result", "vol_units"), "p15_vol_multiplier_min", HIGHER_FIRES),
+        note="A single-day vol-adjusted move; re-surface on a new, larger move.",
+    ),
+}
