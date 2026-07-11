@@ -348,8 +348,11 @@ def _select(state, account_state, target, today_ts):
     pids = _target_position_ids(account_state, target)
     if pids is None:
         return legs, equities
+    # Equities match on EITHER key: a structure target's pid set holds
+    # StructureLeg.position_id values (the bare ticker for stock legs), while the
+    # impact table's equity rows drill back by their row id, the bbg ticker.
     return ([lg for lg in legs if lg.position_id in pids],
-            [eq for eq in equities if eq["bbg"] in pids])
+            [eq for eq in equities if eq["pid"] in pids or eq["bbg"] in pids])
 
 
 def _target_position_ids(account_state, target):
@@ -462,7 +465,8 @@ def _equity_legs(account_state, beta_map) -> list:
         qty = _num(getattr(p, "quantity", None))
         if spot is None or qty is None:
             continue
-        out.append({"bbg": bbg, "spot": spot, "qty": qty,
+        out.append({"bbg": bbg, "pid": getattr(p, "position_id", None),
+                    "spot": spot, "qty": qty,
                     "beta": beta_map.get(bbg, DEFAULT_BETA)})
     return out
 
