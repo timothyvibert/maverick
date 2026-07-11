@@ -18,7 +18,7 @@ from typing import Optional
 import pandas as pd
 
 from pm.core.ticker_utils import construct_option_ticker
-from pm.ingest.extract_loader import PortfolioExtract
+from pm.ingest.extract_loader import URGENT_FLAG, PortfolioExtract
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,8 @@ class Position:
     account: str
     position_id: str
     asset_class: str            # 'option' | 'equity' | 'fund_etf' | 'cash' | 'other'
-    instrument_type: str
+    instrument_type: str        # routed class; keeps the raw extract class (e.g.
+                                # 'Warrant') when an unknown class is held as 'other'
 
     # Tickers
     symbol: str                 # ticker_final for non-options; underlying_ticker for options
@@ -198,10 +199,20 @@ def _build_one(
             cash_other_counters,
         )
 
-    warnings.append(
-        f"Holdings: unknown asset_class {asset_class!r} for account {account}; skipped."
+    # An unknown asset class (e.g. a warrant) must never silently vanish from
+    # the book: route it to 'other' — held, shown in the grid, NAV-counted, and
+    # inert to pricing/greeks/signals/structures — with the raw class kept on
+    # instrument_type and an urgent flag naming the position and its size.
+    position = _build_cash_or_other(
+        row, account, "other", market_value, quantity, valuation_price,
+        cash_other_counters, instrument_type=asset_class,
     )
-    return None
+    warnings.append(
+        f"{URGENT_FLAG} Holdings: unknown asset_class {asset_class!r} for account "
+        f"{account} ({position.name or position.symbol}, MV {market_value:,.0f}) — "
+        f"held as 'other' (shown + NAV-counted, not priced)."
+    )
+    return position
 
 
 def _build_option(
@@ -337,6 +348,7 @@ def _build_cash_or_other(
     row: pd.Series, account: str, asset_class: str, market_value: float,
     quantity: Optional[float], valuation_price: Optional[float],
     cash_other_counters: dict[str, int],
+    instrument_type: Optional[str] = None,
 ) -> Position:
     product_name = row.get("product_name")
     base = product_name if isinstance(product_name, str) and product_name else asset_class.upper()
@@ -352,7 +364,10 @@ def _build_cash_or_other(
         account=account,
         position_id=position_id,
         asset_class=asset_class,
-        instrument_type=asset_class,
+        # An unknown extract class routed here keeps its raw string (e.g.
+        # "Warrant") so the position stays identifiable; native cash/other
+        # rows carry their own class.
+        instrument_type=instrument_type or asset_class,
         symbol=symbol,
         bbg_ticker="",
         underlying_symbol=None,
