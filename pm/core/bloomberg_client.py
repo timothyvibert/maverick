@@ -257,9 +257,12 @@ def fetch_underlying_snapshot(ticker: str) -> pd.Series:
 def fetch_analyst_data(ticker: str) -> Dict[str, object]:
     """Fetch provider-specific analyst rating and target price from Bloomberg.
 
-    Uses BDP with the BE998=UBS override for provider-specific data.
-    Falls back to consensus (BEST_ANALYST_REC / BEST_TARGET_PRICE) if
-    the polars_bloomberg override API is not available.
+    Uses BDP with the BE998=UBS override for provider-specific data. Fails
+    CLOSED: if the overridden call cannot be made (override API unavailable)
+    or fails, this returns absent data — never a bare non-overridden retry,
+    which would return street consensus that downstream traces label as
+    provider research. Absent data flows through as a stale signal instead
+    (same posture as ``fetch_spx_betas``).
     """
     if not ticker:
         return {}
@@ -274,10 +277,15 @@ def fetch_analyst_data(ticker: str) -> Dict[str, object]:
             try:
                 raw = bdp_fn([ticker], fields, overrides=[("BE998", "UBS")])
             except TypeError:
-                raw = bdp_fn([ticker], fields)
-            except Exception:
-                logger.debug("BDP call with overrides failed, retrying without")
-                raw = bdp_fn([ticker], fields)
+                # bdp without override support — provider-specific data is
+                # impossible here; surface nothing rather than street consensus.
+                logger.warning("Analyst pull: bdp overrides unsupported; "
+                               "provider analyst data unavailable for %s", ticker)
+                return result
+            except Exception as exc:
+                logger.warning("Analyst pull with override failed for %s: %s "
+                               "(failing closed — no bare retry)", ticker, exc)
+                return result
             df = _ensure_security_column(_to_pandas(raw))
             df = _ensure_columns(df, fields)
             if df.empty:
@@ -769,7 +777,10 @@ def fetch_analyst_note_dates(
     ``query`` is an open ``polars_bloomberg.BQuery`` session (caller-owned,
     mirroring the override-aware ``fetch_analyst_data``). On any error
     (no session, request rejected, override unsupported) logs at WARNING and
-    returns an empty DataFrame with the expected column. Does NOT raise.
+    returns an empty DataFrame with the expected column — it fails CLOSED,
+    never retrying without the override pair (a bare retry would return a
+    non-provider note date labeled as provider data downstream). Does NOT
+    raise.
 
     ``tickers`` must already include the market sector suffix (e.g.
     ``'AAPL US Equity'``); the parser produces these correctly.
@@ -791,7 +802,11 @@ def fetch_analyst_note_dates(
                 overrides=[("BE998", "UBS"), ("PX395", "Best Analyst Rating")],
             )
         except TypeError:
-            raw = bdp_fn(list(tickers), [field])
+            # bdp without override support — the provider-scoped note date is
+            # impossible here; surface nothing rather than a bare-retry date.
+            logger.warning("Analyst-note pull: bdp overrides unsupported; "
+                           "note dates unavailable")
+            return pd.DataFrame(columns=cols)
     except Exception as exc:
         logger.warning("Batched BDP for analyst-note dates failed: %s", exc)
         return pd.DataFrame(columns=cols)
