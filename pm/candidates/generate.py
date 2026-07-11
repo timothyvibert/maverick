@@ -325,9 +325,20 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
 def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
                         risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
                         today=None, cap=_CAP_DEFAULT) -> list:
-    """Single-leg (and collar) overlays on a held stock position: covered call and
-    cash-secured put (max-premium), protective put and collar (add-hedge)."""
+    """Single-leg (and collar) overlays on a held stock position: covered call
+    (max-premium), protective put and collar (add-hedge).
+
+    Overlays are sized to the POSITION: ``floor(shares / 100)`` contracts on
+    every option leg, with ``net_credit`` scaled to match — one contract against
+    a 1,000-share holding is not a covered call, and its economics/greeks/PoP
+    would describe mostly-uncovered stock. The stock leg keeps the FULL share
+    count, so a non-round holding (e.g. 1,050 shares, 10 contracts) prices
+    honestly with its residual uncovered shares. Under 100 shares there is
+    nothing writable — returns no candidates."""
     today = today or date.today()
+    n_contracts = int(_num(stock_shares) or 0) // 100
+    if n_contracts < 1:
+        return []
     contracts = _parse_slice(slice_df)
     stock_leg = _stock_leg(stock_shares, stock_basis)
     kw = dict(spot=spot, curve=risk_free_curve, r_scalar=risk_free_rate, q=div_yield, today=today)
@@ -337,17 +348,17 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
 
     # Covered call (sell an OTM call) — most premium first.
     for c in sorted(calls, key=lambda c: -(c.mid or 0))[:cap]:
-        leg = _option_leg(c, -1, role="short_call", **kw)
+        leg = _option_leg(c, -n_contracts, role="short_call", **kw)
         out.append(_finish(MAX_PREMIUM, "covered_call",
                            f"covered call {c.strike:g} @ {c.expiry:%Y-%m-%d}",
-                           [stock_leg, leg], (c.mid or 0) * _MULT, spot, today))
+                           [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts, spot, today))
 
     # Protective put (buy an OTM put) — closest to spot first.
     for c in sorted(puts, key=lambda c: abs(c.strike - spot))[:cap]:
-        leg = _option_leg(c, 1, role="long_put", **kw)
+        leg = _option_leg(c, n_contracts, role="long_put", **kw)
         out.append(_finish(ADD_HEDGE, "protective_put",
                            f"protective put {c.strike:g} @ {c.expiry:%Y-%m-%d}",
-                           [stock_leg, leg], -(c.mid or 0) * _MULT, spot, today))
+                           [stock_leg, leg], -(c.mid or 0) * _MULT * n_contracts, spot, today))
 
     # Collar (buy put + sell call at the same expiry) — pair the nearest of each.
     by_exp: dict = {}
@@ -362,9 +373,9 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
             continue
         call = min(cc, key=lambda c: abs(c.strike - spot))
         put = min(pp, key=lambda c: abs(c.strike - spot))
-        legs = [stock_leg, _option_leg(put, 1, role="long_put", **kw),
-                _option_leg(call, -1, role="short_call", **kw)]
-        nc = ((call.mid or 0) - (put.mid or 0)) * _MULT
+        legs = [stock_leg, _option_leg(put, n_contracts, role="long_put", **kw),
+                _option_leg(call, -n_contracts, role="short_call", **kw)]
+        nc = ((call.mid or 0) - (put.mid or 0)) * _MULT * n_contracts
         out.append(_finish(ADD_HEDGE, "collar",
                            f"collar {put.strike:g}/{call.strike:g} @ {exp:%Y-%m-%d}",
                            legs, nc, spot, today))

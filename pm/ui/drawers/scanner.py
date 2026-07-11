@@ -20,6 +20,7 @@ from datetime import datetime
 
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
+from pm.candidates.generate import _COSTLESS_PER_SHARE
 from pm.ui import state_access as sa
 from pm.ui.deepdive.aggregations import _fmt_money
 
@@ -196,18 +197,25 @@ def _pills(ranked, objectives, active) -> list:
     return out
 
 
-# Costless band — |net debit/credit| within this per-share $ reads "costless" (× 100 ×
-# contracts at the position level). A named, configurable desk constant.
-_COSTLESS_PER_SHARE = 0.05
+# Costless band: |the ROLL TRANSACTION's net| within _COSTLESS_PER_SHARE (× 100 ×
+# contracts) reads "costless" — the constant is single-sourced from the generation
+# layer (imported above) so the tag and the COSTLESS objective share one band.
 
 
 def _is_costless(c) -> bool:
-    nd = (c.economics or {}).get("net_debit_credit")
-    if nd is None:
+    """True when the candidate's TRANSACTION is (near-)costless.
+
+    Reads ``Candidate.net_credit`` — the roll/overlay's own net, the number the
+    row's Net column shows — NOT ``economics.net_debit_credit``, which is the
+    RESULTING position's entry cost (stock basis included): that number tagged a
+    deeply-debit roll "costless" (tiny resulting entry) while genuinely costless
+    rolls never tagged (the new leg's whole premium)."""
+    nc = getattr(c, "net_credit", None)
+    if nc is None:
         return False
     leg = _primary_leg(c)
     contracts = abs(int(leg.get("qty") or 1)) if leg else 1
-    return abs(nd) <= _COSTLESS_PER_SHARE * 100 * max(contracts, 1)
+    return abs(nc) <= _COSTLESS_PER_SHARE * 100 * max(contracts, 1)
 
 
 def _right(r) -> str:
@@ -720,13 +728,17 @@ def _comparison_sliders(shock=None):
     ])
 
 
-def _comparison_body(ds, obj, rank, shock):
+def _comparison_body(ds, obj, rank, shock, n_expiries=_BASE_EXPIRIES):
     """Figure + side-by-side economics/greeks for one selected candidate at the given
-    shock. Both sides price at the slice's spot so the curves share a grid."""
+    shock. Both sides price at the slice's spot so the curves share a grid.
+    ``n_expiries`` is the scanner's ACTIVE window: the slice cache (and its attached
+    ranking) is keyed by window, so the comparison must resolve (obj, rank) against
+    the same window the clicked table rendered from — not the base default."""
     account, sid, pid = ds.get("account"), ds.get("structure_id"), ds.get("position_id")
-    rc = sa.scanner_candidate(account, pid, obj, rank)
+    rc = sa.scanner_candidate(account, pid, obj, rank, n_expiries=n_expiries)
     current = sa.price_payoff(account, structure_id=sid, position_id=pid, shock=shock)
-    candidate = sa.price_candidate(account, pid, obj, rank, shock=shock)
+    candidate = sa.price_candidate(account, pid, obj, rank, shock=shock,
+                                   n_expiries=n_expiries)
     if rc is None or current is None or candidate is None:
         return html.Div("Comparison unavailable for this candidate.", className="scanner-empty")
     net_to_roll = getattr(rc.candidate, "net_credit", None)
@@ -752,17 +764,20 @@ def register_comparison_callbacks(app) -> None:
         Output("scanner-cmp-sel", "data"),
         Input({"type": "scanner-cand", "obj": ALL, "rank": ALL}, "n_clicks"),
         State("drawer-state", "data"),
+        State("scanner-window", "data"),
         State("scanner-cmp-spot", "value"),
         State("scanner-cmp-vol", "value"),
         State("scanner-cmp-rate", "value"),
         State("scanner-cmp-time", "value"),
         prevent_initial_call=True,
     )
-    def _select(_clicks, ds, spot_pct, vol_pts, rate_bps, time_days):
+    def _select(_clicks, ds, window, spot_pct, vol_pts, rate_bps, time_days):
         trig = ctx.triggered_id
         # The comparison works on any scanner tab; the "current" side prices the enclosing
         # structure when the anchor carries a structure_id, else the standalone leg. Renders
-        # at the sliders' current shock so it agrees with what the dials show.
+        # at the sliders' current shock so it agrees with what the dials show. The window
+        # store rides along so the clicked row resolves against the ranking it came from
+        # (after Expand, the base-window ranking is a DIFFERENT candidate list).
         if not ds or ds.get("view") != "scanner" or not isinstance(trig, dict):
             return no_update, no_update
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
@@ -770,7 +785,9 @@ def register_comparison_callbacks(app) -> None:
         obj, rank = trig.get("obj"), trig.get("rank")
         shock = {"spot_pct": spot_pct or 0.0, "vol_pts": vol_pts or 0.0,
                  "rate_bps": rate_bps or 0.0, "time_days": int(time_days or 0)}
-        return _comparison_body(ds, obj, rank, shock), {"obj": obj, "rank": rank}
+        n_exp = int(window or _BASE_EXPIRIES)
+        return (_comparison_body(ds, obj, rank, shock, n_expiries=n_exp),
+                {"obj": obj, "rank": rank})
 
     @app.callback(
         Output("scanner-cmp-body", "children", allow_duplicate=True),
@@ -780,11 +797,13 @@ def register_comparison_callbacks(app) -> None:
         Input("scanner-cmp-time", "value"),
         State("drawer-state", "data"),
         State("scanner-cmp-sel", "data"),
+        State("scanner-window", "data"),
         prevent_initial_call=True,
     )
-    def _redial(spot_pct, vol_pts, rate_bps, time_days, ds, sel):
+    def _redial(spot_pct, vol_pts, rate_bps, time_days, ds, sel, window):
         if not ds or ds.get("view") != "scanner" or not sel:
             return no_update
         shock = {"spot_pct": spot_pct or 0.0, "vol_pts": vol_pts or 0.0,
                  "rate_bps": rate_bps or 0.0, "time_days": int(time_days or 0)}
-        return _comparison_body(ds, sel.get("obj"), sel.get("rank"), shock)
+        return _comparison_body(ds, sel.get("obj"), sel.get("rank"), shock,
+                                n_expiries=int(window or _BASE_EXPIRIES))
