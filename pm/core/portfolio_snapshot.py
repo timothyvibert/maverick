@@ -11,15 +11,19 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from datetime import date
+
 from pm.core.bloomberg_client import (
     OPTION_SNAPSHOT_FIELDS,
     UNDERLYING_FIELDS,
     fetch_option_chain,
     fetch_option_snapshots,
+    fetch_security_identity,
     fetch_spx_betas,
     fetch_underlying_snapshots,
 )
 from pm.core.ticker_utils import match_option_ticker
+from pm.ingest.extract_loader import URGENT_FLAG
 
 # SPX-relative beta columns merged onto the underlying snapshot for the exposure
 # view (sourced via a separate override-aware pull — see bloomberg_client.fetch_spx_betas).
@@ -67,25 +71,13 @@ def fetch_portfolio_snapshot(
     tickers = _unique_underlying_tickers(positions)
     if tickers:
         under_df = fetch_underlying_snapshots(tickers)
-        # Missing-underlying detection runs on the batched fields only (below),
-        # BEFORE the additive SPX-beta columns are merged, so that warning set is
-        # unchanged by this feature.
-        missing_underlyings: list[str] = []
-        if not under_df.empty:
-            for t in tickers:
-                if t not in under_df.index:
-                    missing_underlyings.append(t)
-                    continue
-                if under_df.loc[t].isna().all():
-                    missing_underlyings.append(t)
-        else:
-            missing_underlyings = list(tickers)
-        if missing_underlyings:
-            warnings.append(
-                f"BBG returned no data for {len(missing_underlyings)} "
-                f"underlying ticker(s): {missing_underlyings[:5]}"
-                + ("..." if len(missing_underlyings) > 5 else "")
-            )
+        # Venue-resolution net: the extract's country codes are UNTRUSTED, so a
+        # constructed ticker can be dead (no such listing) or — worse — resolve
+        # to a different security on the wrong venue. Recover what can be
+        # identity-validated, flag the rest loudly. Runs BEFORE the SPX-beta
+        # pull so recovered names get betas under their live ticker.
+        under_df = _resolve_missing_underlyings(positions, under_df, tickers, warnings)
+        tickers = _unique_underlying_tickers(positions)   # pick up any re-keys
         # Merge the SPX-relative betas (separate override-aware pull) onto the
         # underlying snapshot keyed by ticker, so the exposure view reads one
         # coherent benchmark. Kept apart from the batched pull above so the SPX
@@ -109,6 +101,11 @@ def fetch_portfolio_snapshot(
         opts_df = fetch_option_snapshots(option_tickers)
         missing_options = _missing_option_tickers(opts_df, option_tickers)
         if missing_options:
+            # An already-expired holding can never match a listed chain — tag it
+            # honestly and skip its chain fetch instead of mis-diagnosing it as
+            # a ticker-resolution failure.
+            missing_options = _flag_expired_options(positions, missing_options, warnings)
+        if missing_options:
             # A held option's ticker is built from its EQUITY root, which is wrong
             # for names whose option root differs (NESN SW -> NES1 SW). Enumerate
             # each missing name's listed chain once, re-key the leg to the true
@@ -127,6 +124,236 @@ def fetch_portfolio_snapshot(
         fetch_warnings=warnings,
         bloomberg_available=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Venue resolution for underlying tickers (defense-in-depth for untrusted
+# extract country codes)
+# ---------------------------------------------------------------------------
+
+def _split_venue(ticker: str):
+    """('RACE', 'NA') from 'RACE NA Equity'; (None, None) when not that shape."""
+    parts = ticker.rsplit(" ", 2)
+    if len(parts) != 3 or parts[2] != "Equity":
+        return None, None
+    return parts[0], parts[1]
+
+
+def _reps_by_underlying(positions: list[Position]) -> dict[str, list[Position]]:
+    """Positions keyed by the underlying ticker they ride on (equity/fund rows
+    by their own bbg_ticker; option rows by underlying_bbg_ticker)."""
+    reps: dict[str, list[Position]] = {}
+    for p in positions:
+        if p.asset_class in _UNDERLYING_ASSET_CLASSES and p.bbg_ticker:
+            reps.setdefault(p.bbg_ticker, []).append(p)
+        elif p.asset_class == "option" and p.underlying_bbg_ticker:
+            reps.setdefault(p.underlying_bbg_ticker, []).append(p)
+    return reps
+
+
+def _expected_isin(reps: list[Position]):
+    """The extract's own identity for the name (first non-empty ISIN)."""
+    for p in reps:
+        isin = getattr(p, "isin", None)
+        if isinstance(isin, str) and isin.strip():
+            return isin.strip().upper()
+    return None
+
+
+def _name_tokens(s) -> set:
+    import re
+    return {t for t in re.split(r"[^A-Z0-9]+", str(s or "").upper()) if len(t) >= 4}
+
+
+def _identity_basis(expected_isin, position_name, ident_row: dict):
+    """Why a probed ticker may be ACCEPTED as this name — or None.
+
+    Exact ISIN equality against the extract's own ISIN is the strong basis;
+    name-token agreement is the audited fallback only when the extract carries
+    no ISIN. Presence of data alone is never enough — a wrong-venue ticker can
+    resolve to a different instrument with a matching root."""
+    isin = ident_row.get("ID_ISIN")
+    if expected_isin:
+        if isinstance(isin, str) and isin.strip().upper() == expected_isin:
+            return "ISIN match"
+        return None
+    name = ident_row.get("NAME")
+    if position_name and isinstance(name, str) and (_name_tokens(position_name) & _name_tokens(name)):
+        return "name match (no ISIN in extract)"
+    return None
+
+
+def _ident_row(df, ticker: str) -> dict:
+    if df is None or getattr(df, "empty", True) or ticker not in df.index:
+        return {}
+    row = df.loc[ticker]
+    return {k: (None if pd.isna(row.get(k)) else row.get(k))
+            for k in ("PX_LAST", "NAME", "ID_ISIN", "CRNCY")}
+
+
+def _describe_ident(row: dict) -> str:
+    if not row or all(v is None for v in row.values()):
+        return "returned nothing"
+    if row.get("PX_LAST") is None:
+        return (f"resolved to {row.get('NAME')!r} (ISIN {row.get('ID_ISIN')}), no live price")
+    return f"resolved to {row.get('NAME')!r} (ISIN {row.get('ID_ISIN')}), price {row.get('PX_LAST')}"
+
+
+def _resolve_missing_underlyings(
+    positions: list[Position],
+    under_df: pd.DataFrame,
+    tickers: list[str],
+    warnings: list[str],
+) -> pd.DataFrame:
+    """Recover mis-venued underlying tickers; loudly flag what can't be recovered.
+
+    The extract's country code is untrusted input, so the constructed ticker can
+    (a) resolve to nothing, or (b) resolve to a DIFFERENT security on that venue
+    (observed live: a wrong-venue suffix on a NYSE root returned a defunct local
+    line with the same root — identity fields populated, price dead). Therefore:
+
+    * a ticker is suspect when it has no usable PX_LAST, or when its probed
+      ISIN contradicts the extract's own ISIN for the name (even with a price);
+    * recovery tries the ``<root> US Equity`` variant (the book's symbology is
+      US) and ACCEPTS it only on identity validation — exact ISIN equality with
+      the extract, else name-token agreement when the extract has no ISIN —
+      plus a live price; never blind acceptance;
+    * every re-key is audited in place (``provisional_bbg_ticker`` on
+      equity/fund rows, ``provisional_underlying_bbg_ticker`` on option rows —
+      the option's OWN constructed ticker is then recovered by the option-chain
+      pass below, which enumerates the chain on the re-keyed underlier);
+    * anything still unresolved gets an URGENT per-name flag naming the ticker
+      tried, what came back, and the market value at stake — never a silent
+      blank; a confirmed wrong-security row is dropped from the snapshot so a
+      wrong price can never flow into signals.
+
+    Mutates ``positions`` and ``warnings``; returns the updated frame.
+    """
+    reps_map = _reps_by_underlying(positions)
+
+    def _px(t):
+        if under_df.empty or t not in under_df.index:
+            return None
+        v = under_df.loc[t].get("PX_LAST")
+        return None if pd.isna(v) else v
+
+    dead = [t for t in tickers if _px(t) is None]
+    foreign = [t for t in tickers if (_split_venue(t)[1] or "US") != "US"]
+    audit_set = sorted(set(dead) | set(foreign))
+    if not audit_set:
+        return under_df
+
+    ident = fetch_security_identity(audit_set)
+
+    # What each suspect's CONSTRUCTED ticker actually is, per the identity probe.
+    suspects: list[tuple[str, dict, bool]] = []   # (ticker, ident row, wrong_security)
+    for t in audit_set:
+        reps = reps_map.get(t) or []
+        if not reps:
+            continue
+        row = _ident_row(ident, t)
+        exp_isin = _expected_isin(reps)
+        probed_isin = row.get("ID_ISIN")
+        wrong = bool(exp_isin and isinstance(probed_isin, str)
+                     and probed_isin.strip().upper() != exp_isin)
+        if t in dead or wrong:
+            suspects.append((t, row, wrong))
+
+    if not suspects:
+        return under_df
+
+    variants = {}
+    for t, _row, _wrong in suspects:
+        root, suffix = _split_venue(t)
+        if root and suffix != "US":
+            variants[t] = f"{root} US Equity"
+    vident = fetch_security_identity(sorted(set(variants.values())))
+
+    recovered: dict[str, str] = {}
+    drop_rows: list[str] = []
+    for t, row, wrong in suspects:
+        reps = reps_map[t]
+        exp_isin = _expected_isin(reps)
+        display = next((p.name for p in reps if p.name), None) \
+            or reps[0].underlying_symbol or reps[0].symbol or t
+        mv = sum(abs(p.market_value or 0.0) for p in reps)
+        variant = variants.get(t)
+        vrow = _ident_row(vident, variant) if variant else {}
+        basis = _identity_basis(exp_isin, display, vrow) if variant else None
+
+        if variant and basis and vrow.get("PX_LAST") is not None:
+            for p in reps:
+                if p.asset_class in _UNDERLYING_ASSET_CLASSES and p.bbg_ticker == t:
+                    p.provisional_bbg_ticker = p.bbg_ticker
+                    p.bbg_ticker = variant
+                elif p.asset_class == "option" and p.underlying_bbg_ticker == t:
+                    p.provisional_underlying_bbg_ticker = p.underlying_bbg_ticker
+                    p.underlying_bbg_ticker = variant
+            recovered[t] = variant
+            drop_rows.append(t)
+            warnings.append(
+                f"Underlying re-keyed {t} -> {variant} ({basis}; constructed ticker "
+                f"{_describe_ident(row)}); original kept for audit."
+            )
+            continue
+
+        tried = (f"tried {variant}: {_describe_ident(vrow)}" if variant
+                 else "no venue variant to try (already US-suffixed)")
+        warnings.append(
+            f"{URGENT_FLAG} Market data unresolved for {display} ({t} "
+            f"{_describe_ident(row)}; {tried}); MV {mv:,.0f} affected — "
+            f"market data, signals and alerts are dead on this name."
+        )
+        if wrong:
+            # Never let a wrong security's numbers flow into signals: better an
+            # honest all-NaN (stale) row than a confidently wrong price.
+            drop_rows.append(t)
+
+    if drop_rows:
+        under_df = under_df.drop(index=[t for t in drop_rows if t in under_df.index],
+                                 errors="ignore")
+    if recovered:
+        refetched = fetch_underlying_snapshots(sorted(set(recovered.values())))
+        under_df = refetched if under_df.empty else pd.concat([under_df, refetched])
+        for old, new in recovered.items():
+            if new not in under_df.index or pd.isna(under_df.loc[new].get("PX_LAST")):
+                warnings.append(
+                    f"{URGENT_FLAG} Re-keyed underlying {new} (from {old}) still "
+                    f"returned no market data — signals stay stale on this name."
+                )
+    return under_df
+
+
+def _flag_expired_options(
+    positions: list[Position],
+    missing_options: list[str],
+    warnings: list[str],
+    today=None,
+) -> list[str]:
+    """Split already-expired holdings out of the missing-option set BEFORE the
+    chain pass: a listed chain never contains an expired contract, so the pass
+    would burn one chain fetch per name and mis-diagnose the row as a ticker-
+    resolution failure ('unresolved after OPT_CHAIN'). Emit an honest expired
+    tag instead. Returns the still-live missing tickers."""
+    today = today or date.today()
+    by_ticker: dict[str, Position] = {}
+    for p in positions:
+        if p.asset_class == "option" and p.bbg_ticker in missing_options:
+            by_ticker.setdefault(p.bbg_ticker, p)
+    live: list[str] = []
+    for t in missing_options:
+        p = by_ticker.get(t)
+        if p is not None and p.expiry is not None and p.expiry < today:
+            days = (today - p.expiry).days
+            name = p.underlying_bbg_ticker or p.underlying_symbol or p.bbg_ticker
+            warnings.append(
+                f"expired option still on the book: {name} {p.expiry.isoformat()} "
+                f"{p.right or '?'} {p.strike if p.strike is not None else '?'} "
+                f"({days}d past expiry) — no market data; pending removal from the extract."
+            )
+            continue
+        live.append(t)
+    return live
 
 
 def _missing_option_tickers(opts_df: pd.DataFrame, option_tickers: list[str]) -> list[str]:

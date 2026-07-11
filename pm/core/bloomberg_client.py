@@ -686,6 +686,50 @@ def fetch_underlying_snapshots(tickers: list[str]) -> pd.DataFrame:
     return df[cols]
 
 
+SECURITY_IDENTITY_FIELDS = ["PX_LAST", "NAME", "ID_ISIN", "CRNCY"]
+
+
+def fetch_security_identity(tickers: list[str]) -> pd.DataFrame:
+    """Batch BDP for the identity of each ticker: price, name, ISIN, currency.
+
+    The venue-resolution pass uses this to decide whether a constructed ticker
+    resolved to the RIGHT security — a mis-suffixed ticker can return data for
+    a different instrument entirely (confirmed live: a wrong-venue suffix on a
+    NYSE root returned a defunct local line with a matching root), so presence
+    of data is not proof of identity; the ISIN is.
+
+    Returns a DataFrame indexed by ticker with ``SECURITY_IDENTITY_FIELDS``
+    columns, reindexed to the request (an unresolvable ticker is an all-NaN
+    row). On any error logs at WARNING and returns an empty DataFrame with the
+    expected columns. Does NOT raise.
+    """
+    cols = list(SECURITY_IDENTITY_FIELDS)
+    if not tickers:
+        return pd.DataFrame(columns=cols)
+
+    try:
+        with with_session() as query:
+            raw = query.bdp(list(tickers), cols)
+    except Exception as exc:
+        logger.warning("Batched BDP for security identity failed: %s", exc)
+        return pd.DataFrame(columns=cols)
+
+    df = _ensure_security_column(_to_pandas(raw))
+    df = _ensure_columns(df, cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    sentinels = {"N.A.", "#N/A N/A", "#N/A Field Not Applicable", ""}
+    for col in cols:
+        df[col] = df[col].apply(
+            lambda v: pd.NA if isinstance(v, str) and v.strip() in sentinels else v
+        )
+
+    df = df.set_index("security")
+    df = df.reindex(list(tickers))
+    return df[cols]
+
+
 # ---------------------------------------------------------------------------
 # SPX-relative betas — separate override-aware BDP for the exposure view
 # ---------------------------------------------------------------------------

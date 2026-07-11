@@ -46,6 +46,14 @@ COUNTRY_TO_BBG_SUFFIX: dict[str, str] = {
     "BE": "BB",  # Belgium (Euronext Brussels)
     "JP": "JT",  # Japan (Tokyo)
     "IE": "ID",  # Ireland (Euronext Dublin)
+    # Incorporation-haven codes: issuers domiciled here have no home venue of
+    # that country — in this book's US symbology they are US-listed lines
+    # (e.g. Cayman-incorporated ADRs). Map to US instead of warning per row;
+    # the post-fetch venue-resolution pass validates identity regardless.
+    "KY": "US",  # Cayman Islands
+    "BM": "US",  # Bermuda
+    "JE": "US",  # Jersey
+    "LU": "US",  # Luxembourg
 }
 
 
@@ -114,6 +122,19 @@ class Position:
     # chain: the original constructed string, kept for audit. None when the built
     # ticker resolved as-is (every US single-name). Non-keyed; diagnostic only.
     provisional_bbg_ticker: Optional[str] = None
+
+    # Same audit contract for the venue-resolution pass on the UNDERLYING key:
+    # when a mis-coded underlying ticker (wrong exchange suffix from an untrusted
+    # extract country code) is re-keyed to an identity-validated listing, the
+    # original constructed string is kept here. Non-keyed; diagnostic only.
+    provisional_underlying_bbg_ticker: Optional[str] = None
+
+    # Identity key for venue resolution: the instrument's ISIN (extract
+    # 'ISIN Final') on equity/fund rows, the UNDERLYING's ISIN (extract
+    # 'Underlying ISIN') on option rows. The extract's country codes are
+    # untrusted input; the ISIN is the authoritative identity a recovered
+    # ticker must match before it is accepted. None when the extract has none.
+    isin: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +316,7 @@ def _build_option(
         expiry=expiry,
         option_contract_key=contract_key,
         name=_security_name(row, "option"),
+        isin=_clean_str(row.get("underlying_isin")),
     )
 
 
@@ -341,6 +363,7 @@ def _build_equity_or_fund(
         expiry=None,
         option_contract_key=None,
         name=_security_name(row, asset_class),
+        isin=_clean_str(row.get("isin_final")),
     )
 
 
@@ -493,17 +516,31 @@ def _pick_country_code(row: pd.Series, *cols: str) -> Optional[str]:
     return None
 
 
+def _is_otc_f_share(ticker: str) -> bool:
+    """Five-letter tickers ending in 'F' are US OTC symbology for a foreign
+    ordinary line (e.g. a European name's OTC trading line) — US-traded
+    regardless of the issuer's incorporation country. The extract's country
+    code on such rows describes the issuer, not the venue."""
+    return len(ticker) == 5 and ticker.isalpha() and ticker.isupper() and ticker.endswith("F")
+
+
 def _build_equity_bbg_ticker(
     ticker: str, country_code: Optional[str], warnings: list[str],
 ) -> str:
     suffix = "US"
+    if _is_otc_f_share(ticker):
+        return f"{ticker} US Equity"
     if country_code:
         mapped = COUNTRY_TO_BBG_SUFFIX.get(country_code.upper())
         if mapped is None:
-            warnings.append(
+            msg = (
                 f"No BBG exchange suffix for country code {country_code!r} "
                 f"(ticker {ticker}); defaulting to 'US'. Add the mapping if BBG fails."
             )
+            # One note per (code, ticker) — a name held across several rows
+            # (e.g. one per option leg) must not wall the status bar.
+            if msg not in warnings:
+                warnings.append(msg)
         else:
             suffix = mapped
     return f"{ticker} {suffix} Equity"
