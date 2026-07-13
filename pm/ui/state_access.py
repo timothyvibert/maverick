@@ -235,8 +235,9 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     from pm.candidates.generate import _build_tier1
     from pm.risk.payoff import compute_payoff
     try:
-        tier1 = _build_tier1(legs, date.today())
-        return compute_payoff(legs, float(spot), tier1, shock=shock)
+        today = date.today()   # one as-of for tier1 AND the payoff (consistency)
+        tier1 = _build_tier1(legs, today)
+        return compute_payoff(legs, float(spot), tier1, shock=shock, today=today)
     except Exception:
         import logging
         logging.getLogger(__name__).exception("price_candidate failed for %s", position_id)

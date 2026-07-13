@@ -14,7 +14,10 @@ mark), then orchestrates:
 * the at-expiry NET P&L hockey-stick (``payoff_net_at_expiry``),
 * the engine-priced HORIZON curve at the (optionally shocked) state — fast BS2002,
   priced per leg so multi-expiry legs keep their own r/q/T,
-* breakevens, max profit / loss + capital-at-risk, probability-of-profit,
+* breakevens, max profit / loss + capital-at-risk, probability-of-profit — computed
+  ANALYTICALLY over the piecewise-linear payoff's kink set
+  (:mod:`pm.pricing.payoff_analytic`), never read off a spot grid, so no strike or
+  breakeven is ever outside the window; the grid exists only to render the chart,
 * greeks now vs under the shock.
 
 Two unit conversions are load-bearing and are the conservation oracle's job to prove (both fall
@@ -44,7 +47,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from pm.pricing import payoff_risk
+from pm.pricing import payoff_analytic, payoff_risk
 from pm.pricing.conventions import year_frac
 from pm.pricing.strategy import avg_iv, price_leg
 from pm.risk.pricing_adapter import build_engine_legs
@@ -83,6 +86,9 @@ class PayoffResult:
     degraded: bool
     warnings: list
     trace: dict
+    # Expiry/role-tagged chart markers, one per option leg (added with the analytic
+    # statistics; defaulted so existing constructions stay valid).
+    strike_markers: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
@@ -296,39 +302,60 @@ def build_structure_payoff_legs(state, account_state, target, today=None, elegs=
 # Assembly driver — combined leg dicts -> curves + economics + greeks (pure)
 # ---------------------------------------------------------------------------
 
-def _breakevens(grid, curve):
-    """Zero-crossings of the at-expiry NET P&L curve.
+def _chart_grid(spot, kink_spots, breakevens, shocked_spot, *, n_points, range_pct):
+    """The CHART-rendering grid only — the statistics are analytic and never read it.
 
-    The at-expiry curve is exactly piecewise-linear (intrinsic, no grid noise), so we
-    take every strict sign change (linearly interpolated, exact-grid-point aware) and
-    dedupe within a grid step. We deliberately do NOT use
-    ``payoff_risk.strategy_breakevens`` here: its noise filter drops crossings whose
-    slope is below 1% of the curve's TOTAL scale per grid step, which over-filters
-    genuine breakevens on tail-dominated structures (covered call, short put — the
-    dominant book) and gets stricter as the grid is refined."""
-    g = np.asarray(grid, dtype=float)
-    c = np.asarray(curve, dtype=float)
-    n = g.size
-    if n < 2:
-        return []
-    bes = []
-    for i in range(n - 1):
-        y0, y1 = c[i], c[i + 1]
-        if y0 == 0.0:
-            prev = c[i - 1] if i > 0 else None
-            if prev is not None and prev != 0.0 and y1 != 0.0 and prev * y1 < 0:
-                bes.append(float(g[i]))
-        elif y1 != 0.0 and y0 * y1 < 0:
-            t = -y0 / (y1 - y0)
-            bes.append(float(g[i] + t * (g[i + 1] - g[i])))
-    if bes:
-        tol = max(float(np.median(np.diff(g))), 1e-6)
-        deduped = [bes[0]]
-        for b in bes[1:]:
-            if b - deduped[-1] > tol:
-                deduped.append(b)
-        bes = deduped
-    return sorted(bes)
+    The default ±``range_pct`` window is widened to cover every strike and breakeven
+    (10%/15% padding so a plateau renders visibly flat), floored at 0, and the exact
+    kink spots (strikes, breakevens, spot, shocked spot) are injected so the plotted
+    hockey-stick's vertices are exact. Length is ``n_points`` plus the few inserts."""
+    lo = spot * (1.0 - range_pct)
+    hi = spot * (1.0 + range_pct)
+    marks = [float(k) for k in kink_spots if k and k > 0.0] + [float(b) for b in breakevens]
+    if marks:
+        lo = min(lo, 0.90 * min(marks))
+        hi = max(hi, 1.10 * max(marks))
+    lo = max(lo, 0.0)
+    pts = np.linspace(lo, hi, int(n_points))
+    inserts = [x for x in ([spot, shocked_spot] + marks)
+               if x is not None and lo <= x <= hi]
+    if inserts:
+        return np.unique(np.concatenate([pts, np.asarray(inserts, dtype=float)]))
+    return pts
+
+
+def _bound_str(region) -> Optional[str]:
+    """Human-readable attainment region for a bounded extremum: 'S = 103.00',
+    'S ≥ 110.00' (plateau to +inf), 'S ≤ 100.00' (plateau from 0), 'S = 0',
+    or 'S ∈ [100.00, 110.00]' (interior plateau). None for unbounded."""
+    if region is None:
+        return None
+    lo, hi = region
+    if hi == float("inf"):
+        return f"S ≥ {lo:,.2f}"
+    if lo == hi:
+        return "S = 0" if lo == 0.0 else f"S = {lo:,.2f}"
+    if lo == 0.0:
+        return f"S ≤ {hi:,.2f}"
+    return f"S ∈ [{lo:,.2f}, {hi:,.2f}]"
+
+
+def _iso(d) -> Optional[str]:
+    try:
+        return None if d is None else pd.Timestamp(d).date().isoformat()
+    except Exception:
+        return None
+
+
+def _strike_markers(leg_dicts) -> list:
+    """One expiry/role-tagged marker per option leg, for the chart's strike lines."""
+    out = []
+    for l in leg_dicts:
+        if l.get("opt_type") in ("Call", "Put") and l.get("K") is not None:
+            out.append({"K": float(l["K"]), "expiry": _iso(l.get("expiry")),
+                        "role": l.get("role"), "qty": l.get("qty"),
+                        "opt_type": l["opt_type"]})
+    return sorted(out, key=lambda m: (m["K"], m["expiry"] or ""))
 
 
 def _horizon_curve(leg_dicts, grid, shocked_today, dvol, dr):
@@ -394,11 +421,27 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
     today_ts = _today_ts(today)
     spot = float(spot)
     warnings: list = []
-    grid = payoff_risk.spot_grid(spot, n_points=n_points, range_pct=range_pct)
 
+    # ---- at-expiry statistics: analytic over the PWL kink set (grid-free, so no
+    # strike/breakeven/plateau is ever outside a window) ----
+    pwl = payoff_analytic.pwl_from_legs(leg_dicts)
+    breakevens = payoff_analytic.pwl_breakevens(pwl)
+    maxpl = payoff_analytic.pwl_max_profit_loss(pwl)
+    intervals = payoff_analytic.profit_intervals(pwl)
+
+    # ---- shock parse (up front: the shocked spot is a chart-grid insert) ----
+    sp = shock or {}
+    spot_pct = float(sp.get("spot_pct", 0.0))
+    dvol = float(sp.get("vol_pts", 0.0)) / 100.0
+    dr = float(sp.get("rate_bps", 0.0)) / 1e4
+    dt_days = int(sp.get("time_days", 0))
+    shocked_today = today_ts + pd.Timedelta(days=dt_days)
+    shocked_spot = (spot * (1.0 + spot_pct / 100.0)) if shock is not None else None
+
+    # ---- chart grid (rendering substrate only — statistics never read it) ----
+    grid = _chart_grid(spot, pwl.kinks[1:], breakevens, shocked_spot,
+                       n_points=n_points, range_pct=range_pct)
     expiry_curve = payoff_risk.payoff_net_at_expiry(leg_dicts, grid)
-    breakevens = _breakevens(grid, expiry_curve)
-    maxpl = payoff_risk.strategy_max_profit_loss(grid, expiry_curve, leg_dicts)
 
     # Component (standalone-vs-net) curves: the same at-expiry kernel over leg subsets.
     # Linear in legs, so combined == stock-alone + options-alone at every grid point
@@ -438,19 +481,14 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
 
     pop, pop_caveat = None, None
     if opts and T_repr and T_repr > 0 and sigma_repr == sigma_repr and sigma_repr > 0:
-        val = payoff_risk.pop_lognormal(spot, sigma_repr, T_repr, r_repr, q_repr, grid, expiry_curve)
+        val = payoff_analytic.pop_lognormal_intervals(
+            spot, sigma_repr, T_repr, r_repr, q_repr, intervals)
         pop = None if val != val else float(val)
         if multi_expiry and pop is not None:
             pop_caveat = ("multi-expiry: PoP uses the nearest expiry + |qty|-weighted IV "
                           "(single-σ/T approximation).")
 
     # Horizon P&L = engine value at the (shocked) state − entry cost (net_debit_credit).
-    sp = shock or {}
-    spot_pct = float(sp.get("spot_pct", 0.0))
-    dvol = float(sp.get("vol_pts", 0.0)) / 100.0
-    dr = float(sp.get("rate_bps", 0.0)) / 1e4
-    dt_days = int(sp.get("time_days", 0))
-    shocked_today = today_ts + pd.Timedelta(days=dt_days)
     nd = tier1.get("net_debit_credit")
     horizon_value = _horizon_curve(leg_dicts, grid, shocked_today, dvol, dr)
     if nd is not None:
@@ -459,11 +497,12 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
         horizon_curve = None
         warnings.append("net debit/credit unavailable (degraded slice) — horizon P&L not anchored.")
 
-    shocked_spot = (spot * (1.0 + spot_pct / 100.0)) if shock is not None else None
     greeks_now = _greeks(leg_dicts, spot, today_ts, 0.0, r_repr, q_repr)
     greeks_shocked = (_greeks(leg_dicts, shocked_spot, shocked_today, dvol, r_repr + dr, q_repr)
                       if shock is not None else None)
 
+    expiries = tier1.get("expiries") or []
+    eval_date = _iso(min(expiries)) if expiries else None
     economics = {
         "max_profit": maxpl["max_profit"],
         "max_loss": maxpl["max_loss"],
@@ -476,6 +515,15 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
         "net_debit_credit": nd,
         "current_pnl": tier1.get("net_pnl"),
         "dte": _dte(tier1.get("expiries"), today_ts),
+        # Analytic-statistics additions (all additive to the original contract):
+        "always_profitable": maxpl["always_profitable"],
+        "always_loss": maxpl["always_loss"],
+        "max_profit_bound": _bound_str(maxpl.get("max_profit_region")),
+        "max_loss_bound": _bound_str(maxpl.get("max_loss_region")),
+        "eval_mode": "expiry",
+        "eval_date": eval_date,
+        "econ_caveat": None,
+        "n_expiries": len(expiries),
     }
     conservation_ok = (nd is not None and abs(baked - nd) <= 1e-6 * max(1.0, abs(nd)))
     trace = {
@@ -487,6 +535,10 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
         "T_repr": T_repr, "r_repr": r_repr, "q_repr": q_repr,
         "multi_expiry": multi_expiry,
         "greek_basis": _GREEK_BASIS,
+        "evaluation": {"mode": economics["eval_mode"], "eval_date": eval_date,
+                       "far_leg_count": 0},
+        "statistics": ("analytic: kink-exact over {0} ∪ strikes ∪ tail slopes "
+                       "(no grid window); grid is chart-rendering only."),
         "pricer": ("fast BS2002 (horizon sweep + greeks); at-expiry intrinsic; "
                    "truth-CRR reserved for committed points."),
     }
@@ -494,6 +546,7 @@ def compute_payoff(leg_dicts, spot, tier1, *, shock=None, n_points=DEFAULT_N_POI
         "grid": grid, "expiry_curve": expiry_curve, "horizon_curve": horizon_curve,
         "expiry_curve_stock": expiry_curve_stock, "expiry_curve_options": expiry_curve_options,
         "breakevens": breakevens, "strikes": tier1.get("strikes") or [],
+        "strike_markers": _strike_markers(leg_dicts),
         "economics": economics, "greeks_now": greeks_now, "greeks_shocked": greeks_shocked,
         "shocked_spot": shocked_spot, "spot": spot, "warnings": warnings, "trace": trace,
     }
@@ -536,27 +589,30 @@ def structure_payoff(state, account_state, target, *, shock=None,
         economics=res["economics"], greeks_now=res["greeks_now"],
         greeks_shocked=res["greeks_shocked"], legs=asm["summaries"],
         degraded=asm["degraded"], warnings=asm["warnings"] + res["warnings"], trace=res["trace"],
+        strike_markers=res.get("strike_markers"),
     )
 
 
-def run_structure_tier2(state) -> None:
+def run_structure_tier2(state, today=None) -> None:
     """Load-path pass: per account, build the option engine legs ONCE, then
     compute each structure's zero-shock payoff and store its Tier-2 economics on
     ``account_state.structure_tier2[structure_id]`` — the By-Structure grid reads the
     breakeven(s) from it (killing the 'pending pricing' stub). Pure / read-only; runs
     after ``run_account_scenario``. A structure with no priceable leg / spot is skipped
-    (its grid cell falls back to '—')."""
+    (its grid cell falls back to '—'). ``today`` (default: wall clock, as the live load
+    intends) threads through the engine legs and the payoff so the pass is
+    deterministic under test."""
     for acc in state.accounts.values():
         tier2: dict = {}
         try:
-            elegs = {e.position_id: e for e in build_engine_legs(state, acc)}
+            elegs = {e.position_id: e for e in build_engine_legs(state, acc, today=today)}
         except Exception:
             elegs = {}
         for s in (getattr(acc, "structures", None) or []):
             if getattr(s, "status", None) == "rejected":
                 continue
             try:
-                res = structure_payoff(state, acc, s, elegs=elegs)
+                res = structure_payoff(state, acc, s, elegs=elegs, today=today)
             except Exception:
                 res = None
             if res is None:
@@ -566,5 +622,9 @@ def run_structure_tier2(state) -> None:
                 "max_profit": res.economics.get("max_profit"),
                 "max_loss": res.economics.get("max_loss"),
                 "pop": res.economics.get("pop"),
+                "multi_expiry": bool(res.trace.get("multi_expiry")),
+                "eval_date": res.economics.get("eval_date"),
+                "always_profitable": bool(res.economics.get("always_profitable")),
+                "always_loss": bool(res.economics.get("always_loss")),
             }
         acc.structure_tier2 = tier2
