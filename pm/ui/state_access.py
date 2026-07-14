@@ -116,6 +116,23 @@ def reload_state(reuse_extract: bool = False) -> Optional[PortfolioState]:
     return new_state
 
 
+def recompute_thresholds() -> Optional[PortfolioState]:
+    """Re-derive the alert set over the loaded state under the persisted
+    threshold overrides — the Apply path's recompute. A sanctioned
+    owned-state write path (like ``resolve_structure``): it re-runs the
+    engine + structure fires + suppression marking over data already on the
+    state, with **no Bloomberg call and no extract re-read** — a dial edit
+    changes which fires the engine produces, not the market data they read.
+    Every other load-path product (snapshot, structures, exposure, tier-2,
+    client profile) is untouched. Returns the same state object, or None when
+    nothing is loaded (callers then fall back to a full reload)."""
+    state = _RUNTIME.get("state")
+    if state is None:
+        return None
+    from pm.store.portfolio_state import reapply_thresholds
+    return reapply_thresholds(state)
+
+
 def price_scenario(
     account: str, *, spot_pct: float = 0.0, vol_pts: float = 0.0,
     rate_bps: float = 0.0, time_days: int = 0, target=None, mode: str = "fast",

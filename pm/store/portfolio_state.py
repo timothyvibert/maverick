@@ -320,6 +320,45 @@ def load_portfolio_state(
     return state
 
 
+def reapply_thresholds(state: PortfolioState) -> PortfolioState:
+    """Re-evaluate the alert set over ALREADY-LOADED state under the currently
+    persisted threshold overrides — the recompute-only Apply path. No extract
+    re-read, no Bloomberg call: a threshold edit changes which fires the engine
+    PRODUCES, so the fires must be re-derived, but every input the engine reads
+    (snapshot, IV histories, analyst data, dividends, curve) is already on the
+    state and is unchanged by a dial edit.
+
+    Re-runs exactly the passes whose output depends on PatternConfig or on the
+    fire set it produces, in load-path order:
+      1. ``run_insight_engine(state, build_pattern_config())`` — replaces each
+         account's signals / fires / position_signals wholesale (the engine
+         resets them per account; it never appends to a prior run's output).
+      2. ``run_structure_fires(state)`` — P16–P20 read module constants, not
+         PatternConfig, but they live in ``acc.fires`` which the engine just
+         reset, so they are re-derived and the structure-leg annotations
+         re-attached (both idempotent by design).
+      3. ``apply_suppressions`` + ``apply_material_change`` — the re-run
+         produces fresh, unmarked Fire objects; the marking passes re-flag
+         them from the persisted store, same as a load.
+    Structure detection, exposure, tier-2 economics and the client profile do
+    NOT re-run: none reads PatternConfig, and each lives on its own
+    AccountState field untouched by the engine. ``state.all_warnings`` is left
+    as loaded — this path adds no load events to warn about.
+
+    Mutates and returns the same state object.
+    """
+    from pm.insight.engine import run_insight_engine
+    from pm.insight.structure_fires import run_structure_fires
+    from pm.store.settings_store import build_pattern_config
+    from pm.store.suppression_store import apply_material_change, apply_suppressions
+
+    run_insight_engine(state, build_pattern_config())
+    run_structure_fires(state)
+    apply_suppressions(state)
+    apply_material_change(state)
+    return state
+
+
 def refresh_portfolio_state(
     current: PortfolioState | None,
     data_dir: Path,
