@@ -448,24 +448,35 @@ def register_callbacks(app: dash.Dash) -> None:
     # A SEPARATE modal from the per-alert drawer: its own root, open/close, tab
     # strip and Escape listener, so it never cross-toggles the drawer. The
     # Suppressed tab restores via the SAME state_access.restore_alert the modal
-    # footer uses. Active classes are derived from which tab is shown.
+    # footer uses. Active classes are derived from which tab is shown. Two open
+    # routes: the Alert Manager button (Suppressed tab) and the status bar's
+    # load-notes cluster (straight onto Load notes — the readable, copyable
+    # warnings list the hover tooltip can't provide).
     _AM_OPEN = "drawer-root drawer-open"
 
     def _am_tab_classes(tab):
         return ("view-toggle-btn" + (" view-toggle-btn-active" if tab == "suppressed" else ""),
-                "view-toggle-btn" + (" view-toggle-btn-active" if tab == "thresholds" else ""))
+                "view-toggle-btn" + (" view-toggle-btn-active" if tab == "thresholds" else ""),
+                "view-toggle-btn" + (" view-toggle-btn-active" if tab == "loadnotes" else ""))
 
     @app.callback(
         Output("alert-manager-root", "className"),
         Output("alert-manager-body", "children"),
         Output("am-tab-suppressed", "className"),
         Output("am-tab-thresholds", "className"),
+        Output("am-tab-loadnotes", "className"),
         Input("alert-manager-open-btn", "n_clicks"),
+        Input("status-load-notes-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _open_alert_manager(_n):
-        s_cls, t_cls = _am_tab_classes("suppressed")
-        return _AM_OPEN, render_alert_manager_body("suppressed"), s_cls, t_cls
+    def _open_alert_manager(_n, _notes_n):
+        # The status-bar host is re-rendered on every load, recreating the notes
+        # button with n_clicks=0 — guard the spurious (re)creation fire.
+        if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
+            return (no_update,) * 5
+        tab = "loadnotes" if ctx.triggered_id == "status-load-notes-btn" else "suppressed"
+        s_cls, t_cls, n_cls = _am_tab_classes(tab)
+        return _AM_OPEN, render_alert_manager_body(tab), s_cls, t_cls, n_cls
 
     @app.callback(
         Output("alert-manager-root", "className", allow_duplicate=True),
@@ -480,14 +491,17 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("alert-manager-body", "children", allow_duplicate=True),
         Output("am-tab-suppressed", "className", allow_duplicate=True),
         Output("am-tab-thresholds", "className", allow_duplicate=True),
+        Output("am-tab-loadnotes", "className", allow_duplicate=True),
         Input("am-tab-suppressed", "n_clicks"),
         Input("am-tab-thresholds", "n_clicks"),
+        Input("am-tab-loadnotes", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _switch_am_tab(_s, _t):
-        tab = "thresholds" if ctx.triggered_id == "am-tab-thresholds" else "suppressed"
-        s_cls, t_cls = _am_tab_classes(tab)
-        return render_alert_manager_body(tab), s_cls, t_cls
+    def _switch_am_tab(_s, _t, _n):
+        tab = {"am-tab-thresholds": "thresholds",
+               "am-tab-loadnotes": "loadnotes"}.get(ctx.triggered_id, "suppressed")
+        s_cls, t_cls, n_cls = _am_tab_classes(tab)
+        return render_alert_manager_body(tab), s_cls, t_cls, n_cls
 
     @app.callback(
         Output("alert-manager-body", "children", allow_duplicate=True),
@@ -528,6 +542,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("alert-manager-body", "children", allow_duplicate=True),
         Output("am-tab-suppressed", "className", allow_duplicate=True),
         Output("am-tab-thresholds", "className", allow_duplicate=True),
+        Output("am-tab-loadnotes", "className", allow_duplicate=True),
         Output("status-bar-host", "children", allow_duplicate=True),
         Output("blotter-all-rows", "data", allow_duplicate=True),
         Output("deepdive-refresh-tick", "data", allow_duplicate=True),
@@ -541,7 +556,7 @@ def register_callbacks(app: dash.Dash) -> None:
         prevent_initial_call=True,
     )
     def _apply_thresholds(_apply, _reset_all, _row_resets, values, ids, tick):
-        noop = (no_update,) * 7
+        noop = (no_update,) * 8
         trig = ctx.triggered_id
         # Ignore the spurious fire when the inputs/buttons are (re)created with n_clicks 0.
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
@@ -575,13 +590,13 @@ def register_callbacks(app: dash.Dash) -> None:
         try:
             new_state = sa.reload_state(reuse_extract=True)
         except Exception as exc:
-            return (no_update, no_update, no_update,
+            return (no_update, no_update, no_update, no_update,
                     html.Div(f"Apply failed: {exc}", className="status-left status-empty"),
                     no_update, no_update, "")
-        s_cls, t_cls = _am_tab_classes("thresholds")
+        s_cls, t_cls, n_cls = _am_tab_classes("thresholds")
         body = render_alert_manager_body("thresholds")          # reseed inputs from persisted
         rows = consolidate_fires_to_rows(sa.all_fires(new_state), new_state)
-        return (body, s_cls, t_cls, render_status_bar(new_state), rows,
+        return (body, s_cls, t_cls, n_cls, render_status_bar(new_state), rows,
                 (tick or 0) + 1, "")
 
     # The manager's own Escape listener, bound to its own id (independent of the

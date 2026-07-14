@@ -74,8 +74,9 @@ def _alert_manager_root() -> html.Div:
 
     It reuses the same centered-box / overlay CSS (``drawer-root`` / ``drawer-panel``)
     but has its own id, its own open/close callback and its own Escape listener, so it
-    never cross-toggles the drawer. Header = a Suppressed | Thresholds tab strip + ✕;
-    the body is rendered on open.
+    never cross-toggles the drawer. Header = a Suppressed | Thresholds | Load notes
+    tab strip + ✕; the body is rendered on open (the status bar's notes cluster opens
+    straight onto Load notes).
     """
     return html.Div(id="alert-manager-root", className="drawer-root", children=[
         html.Div(id="alert-manager-overlay", className="drawer-overlay", n_clicks=0),
@@ -85,6 +86,8 @@ def _alert_manager_root() -> html.Div:
                     html.Button("Suppressed", id="am-tab-suppressed", n_clicks=0,
                                 className="view-toggle-btn view-toggle-btn-active"),
                     html.Button("Thresholds", id="am-tab-thresholds", n_clicks=0,
+                                className="view-toggle-btn"),
+                    html.Button("Load notes", id="am-tab-loadnotes", n_clicks=0,
                                 className="view-toggle-btn"),
                 ]),
                 html.Button("✕", id="alert-manager-close-btn", n_clicks=0,

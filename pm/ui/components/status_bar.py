@@ -16,6 +16,10 @@ from pm.store.portfolio_state import PortfolioState
 from pm.store.suppression_store import is_active
 from pm.ui import state_access as sa
 
+# Urgent ⚠ notes each get their own visible chip up to this many; the rest fold
+# into the "+N more" counter (all of them readable on the Load notes tab).
+_MAX_URGENT_CHIPS = 3
+
 
 def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
     """Render the left side of the status strip. Before data has loaded
@@ -59,17 +63,31 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
                   className="status-item status-muted", id="status-refreshed"),
     ]
 
-    # Load-time ingestion notes (header aliasing, missing/optional columns,
-    # skipped rows). Pure read of state.all_warnings — no recompute. Shown amber
-    # when a load-bearing column or high-impact optional is flagged (urgent
-    # prefix); the full list is in the hover title.
+    # Load-time notes (header aliasing, missing/optional columns, skipped rows,
+    # market-data + insight warnings). Pure read of state.all_warnings. Urgent
+    # notes (the ⚠ prefix — unresolved names with MV, missing load-bearing
+    # columns) are each promoted to their own visible amber chip, never hidden
+    # behind a truncated lead; the whole cluster is a click target that opens
+    # the Alert Manager's Load notes tab, where the full list is readable and
+    # copyable (the hover title stays as a convenience, not the only access).
     notes = list(getattr(state, "all_warnings", []) or [])
     if notes:
         urgent = [n for n in notes if n.lstrip().startswith(URGENT_FLAG)]
-        lead = (urgent or notes)[0]
-        extra = len(notes) - 1
-        label = lead + (f"  (+{extra} more)" if extra > 0 else "")
-        cls = "status-item status-load-notes" + (" status-load-urgent" if urgent else "")
-        items.append(html.Span(label, className=cls, title="\n".join(notes)))
+        chips: list = []
+        shown = 0
+        for u in urgent[:_MAX_URGENT_CHIPS]:
+            chips.append(html.Span(u, className="status-load-note-chip status-load-urgent"))
+            shown += 1
+        if not urgent:
+            chips.append(html.Span(notes[0], className="status-load-note-chip"))
+            shown = 1
+        extra = len(notes) - shown
+        if extra > 0:
+            chips.append(html.Span(f"+{extra} more", className="status-load-more"))
+        items.append(html.Button(
+            chips, id="status-load-notes-btn", n_clicks=0,
+            className="status-item status-load-notes",
+            title="\n".join(notes) + "\n\nClick to open the full, copyable list.",
+        ))
 
     return html.Div(items, className="status-left")
