@@ -13,8 +13,14 @@ a v2 concern):
 - ``dollar_delta``:   $ exposure per $1 move in the underlying's spot
 - ``dollar_vega``:    $ P&L per +1 vol point (1.0% IV) move
 - ``dollar_theta``:   $ P&L per 1 calendar day passing
-- ``dollar_gamma``:   $ change in dollar_delta per $1 move in spot
-                      (= qty * mult * gamma * spot)
+- ``dollar_gamma``:   $ change in dollar_delta per **1% move** in spot
+                      (= qty * mult * gamma * spot). The Bloomberg ``GAMMA``
+                      snapshot field is dDelta per 1% underlying move —
+                      live-confirmed against the engine (ratio == S/100 on
+                      names both above and below $100) — so dollarizing it
+                      with spot yields a per-1% quantity, NOT per-$1. The
+                      scenario section's engine dollar-gamma is per-$1; the
+                      two are labeled distinctly and must not be compared.
 """
 from __future__ import annotations
 
@@ -214,7 +220,7 @@ def compute_portfolio_greeks(
         dollar_delta = qty_f * mult * delta * spot
         dollar_vega = qty_f * mult * vega
         dollar_theta = qty_f * mult * theta
-        dollar_gamma = qty_f * mult * gamma * spot  # $Δ per $1 spot move
+        dollar_gamma = qty_f * mult * gamma * spot  # $Δ per 1% spot move (BBG GAMMA is per-1%)
 
         rows.append({
             "position_id": p.position_id,

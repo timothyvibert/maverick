@@ -57,6 +57,18 @@ def _sign_cls(v: Optional[float]) -> str:
     return "scenario-pos" if v > 0 else "scenario-neg"
 
 
+# The section's provenance line. Every rendered number — heatmap, impact table,
+# preset chips (they only set the sliders) — comes from the fast pricer; the
+# caption must never attribute rendered output to a tier that isn't used.
+_CAPTION = (
+    "All numbers here — heatmap, impact table, presets — are fast vectorized "
+    "BS2002 (β-mapped SPX × vol shift, P&L vs current); ● current shock, "
+    "◆ preset points. Γ$ is engine dollar-gamma per $1 spot move — a different "
+    "basis from the Exposure section's per-1% γ; do not compare. θ is engine "
+    "per-business-day (diverges from the BBG snapshot θ). Dial recomputes live, "
+    "no Bloomberg.")
+
+
 def render_scenario_section(account_state, state) -> html.Div:
     head = html.Div(className="dd-section-head", children=[
         html.H2("Scenario & stress", className="dd-section-title"),
@@ -85,11 +97,7 @@ def render_scenario_section(account_state, state) -> html.Div:
                 html.Div(id="scn-total", children=_total_line(impact)),
             ]),
         ]),
-        html.Div(className="scenario-caption", children=[
-            "Heatmap = fast vectorized BS2002 grid (β-mapped SPX × vol shift, P&L vs current); "
-            "● current shock, ◆ preset points; presets/table = truth-CRR n=200. θ is engine "
-            "per-business-day (diverges from the BBG snapshot θ). Dial recomputes live, "
-            "no Bloomberg."]),
+        html.Div(className="scenario-caption", children=[_CAPTION]),
     ])
 
 
@@ -170,7 +178,9 @@ def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
 def _impact_table(rows, target):
     head = html.Tr(className="scn-impact-head", children=[
         html.Th("Position / structure"), html.Th("P&L"), html.Th("Δ$"),
-        html.Th("Γ$"), html.Th("ν$"), html.Th("θ$")])
+        html.Th("Γ$", title="engine dollar-gamma per $1 spot move — different basis "
+                            "from the Exposure section's per-1% γ"),
+        html.Th("ν$"), html.Th("θ$")])
     body = []
     for r in rows:                               # already ranked worst-first
         active = " scn-impact-active" if (target and target == r["id"]) else ""

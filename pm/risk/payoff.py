@@ -881,7 +881,7 @@ def run_structure_tier2(state, today=None) -> None:
     compute each structure's zero-shock payoff and store its Tier-2 economics on
     ``account_state.structure_tier2[structure_id]`` — the By-Structure grid reads the
     breakeven(s) from it (killing the 'pending pricing' stub). Pure / read-only; runs
-    after ``run_account_scenario``. A structure with no priceable leg / spot is skipped
+    after ``run_account_exposure``. A structure with no priceable leg / spot is skipped
     (its grid cell falls back to '—'). ``today`` (default: wall clock, as the live load
     intends) threads through the engine legs and the payoff so the pass is
     deterministic under test."""

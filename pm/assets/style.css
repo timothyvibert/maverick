@@ -1374,48 +1374,11 @@ html, body {
 .exposure-rollup-details[open] .exposure-rollup-caret { transform: rotate(180deg); }
 
 /* ---- Scenario / stress section — reuses the --pm-* / --pos / --neg
-   token set; no new palette. The stress table uses native <details> for
-   callback-free on-expand attribution. ---- */
-.scenario-meta { font-size: 12px; color: var(--pm-grey-500); margin-bottom: 8px; }
-.scenario-table { display: flex; flex-direction: column; }
-.scenario-head-row, .scenario-summary-grid {
-    display: grid; grid-template-columns: 1fr 140px 92px; gap: 12px;
-    align-items: baseline; padding: 5px 8px;
-}
-.scenario-head-row {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); border-bottom: 1px solid var(--pm-grey-300);
-}
-.scenario-row { border-bottom: 1px solid var(--pm-grey-100); }
-/* The grid lives on .scenario-summary-grid (inner div), so the <summary> stays a
-   default block and keeps Chrome's native click-to-toggle. */
-.scenario-summary { cursor: pointer; list-style: none; }
-.scenario-summary::-webkit-details-marker { display: none; }
-.scenario-summary::marker { content: ""; }
-.scenario-summary:hover { background: var(--pm-grey-50); }
-.scenario-row[open] > .scenario-summary { background: var(--pm-grey-50); font-weight: 600; }
-.scenario-name { color: var(--pm-charcoal); }
-.scenario-pnl, .scenario-pct {
-    text-align: right; font-family: "Consolas", monospace; font-variant-numeric: tabular-nums;
-    color: var(--pm-grey-700);
-}
+   token set; no new palette. ---- */
 .scenario-pos { color: var(--pos); }
 .scenario-neg { color: var(--neg); }
-.scenario-attrib { padding: 8px 12px 12px; background: var(--pm-grey-50); }
-.scenario-attrib-title { font-size: 11px; color: var(--pm-grey-700); margin-bottom: 6px; }
-.scenario-attrib-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-.scenario-attrib-cell { display: flex; flex-direction: column; gap: 2px; }
-.scenario-attrib-label { font-size: 11px; color: var(--pm-grey-500); }
-.scenario-attrib-val {
-    font-family: "Consolas", monospace; font-size: 13px; color: var(--pm-grey-700);
-    font-variant-numeric: tabular-nums;
-}
-.scenario-attrib-note { font-size: 11px; color: var(--pm-grey-500); font-style: italic; margin-top: 8px; }
 .scenario-graph { width: 100%; }
 .scenario-caption { font-size: 11px; color: var(--pm-grey-500); margin-top: 6px; line-height: 1.5; }
-@media (max-width: 1100px) {
-    .scenario-attrib-grid { grid-template-columns: repeat(2, 1fr); }
-}
 
 /* ---- Scenario interactive section (controls row over heatmap | impact table) ---- */
 .scn-controls {

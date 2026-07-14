@@ -74,9 +74,15 @@ def _headline_panel(e) -> html.Div:
                         "(net beta-adjusted market exposure)"),
             _stat("Net $ Delta", _fmt_money(t.dollar_delta), "economic (delta-$)",
                   cls=_sign_cls(t.dollar_delta)),
-            _stat("Net $ Gamma", _fmt_money(t.dollar_gamma), cls=_sign_cls(t.dollar_gamma)),
-            _stat("Net $ Vega", _fmt_money(t.dollar_vega), cls=_sign_cls(t.dollar_vega)),
-            _stat("Net $ Theta", _fmt_money(t.dollar_theta), cls=_sign_cls(t.dollar_theta)),
+            _stat("Net $ Gamma", _fmt_money(t.dollar_gamma), "Δ$ per 1% spot move",
+                  cls=_sign_cls(t.dollar_gamma),
+                  title="Bloomberg GAMMA is dDelta per 1% underlying move — a "
+                        "different basis from the Scenario section's engine "
+                        "per-$1 Γ$; do not compare."),
+            _stat("Net $ Vega", _fmt_money(t.dollar_vega), "per 1 vol pt",
+                  cls=_sign_cls(t.dollar_vega)),
+            _stat("Net $ Theta", _fmt_money(t.dollar_theta), "per calendar day",
+                  cls=_sign_cls(t.dollar_theta)),
         ]),
         html.Div(_provenance(e), className="dd-panel-note"),
     ])
@@ -155,7 +161,7 @@ def _vega_tenor_row(e) -> html.Div:
 
 _ROLLUP_COLS = [
     ("Structure", "left"),
-    ("$ Delta", "right"), ("β-$ (SPX)", "right"), ("$ Gamma", "right"),
+    ("$ Delta", "right"), ("β-$ (SPX)", "right"), ("$ Gamma (1%)", "right"),
     ("$ Vega", "right"), ("$ Theta", "right"), ("Net MV", "right"),
 ]
 

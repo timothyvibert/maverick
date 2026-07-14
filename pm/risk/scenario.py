@@ -1,13 +1,16 @@
 """Deterministic stress / scenario engine.
 
-Two consumers, one shared shocked-input / price path so a dialed point and a
+Two entry points, one shared shocked-input / price path so a dialed point and a
 precomputed preset are the *same* reprice, never an interpolation:
 
-  * load path -- ``run_account_scenario`` pre-computes the co-moving preset table
-    (leaned to truth-CRR n=200) + the fast P&L curve onto ``AccountState.scenario``;
-  * interactive -- ``price_scenario`` (in state_access) calls ``shock_reprice``
-    (per position/structure) + ``spot_vol_grid`` (the heatmap mesh) live, read-only
-    over already-loaded state.
+  * interactive (the live consumer) -- ``price_scenario`` (in state_access) calls
+    ``shock_reprice`` (per position/structure) + ``spot_vol_grid`` (the heatmap
+    mesh) live, read-only over already-loaded state. Everything the scenario
+    section renders comes through here, at fast BS2002.
+  * explicit truth tier -- ``run_account_scenario`` computes the co-moving preset
+    table (truth-CRR n=200) + the fast P&L curve onto ``AccountState.scenario``.
+    NOT in the load path (it cost seconds per account and nothing rendered it);
+    retained as the API for a future commit-at-truth view.
 
 Pricer tiers (enforced): every SWEEP / grid is **fast vectorized BS2002**; **truth-CRR**
 is used only for discrete scenario *points* (preset table) and a committed point. A
@@ -131,7 +134,8 @@ class AccountScenario:
 
 
 # --------------------------------------------------------------------------
-# Load-path entry point (leaned: presets at n=200, no eager attribution)
+# Explicit truth-tier entry point (presets at n=200, no eager attribution).
+# Not called by the load path — see the module docstring.
 # --------------------------------------------------------------------------
 def run_account_scenario(state, today=None) -> None:
     for acc in getattr(state, "accounts", {}).values():
