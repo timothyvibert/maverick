@@ -755,7 +755,7 @@ def resolve_structure(
     acc.fires = [f for f in acc.fires if f.structure_id != structure_id]
     acc.fires.extend(rederive_structure_fires(state, acc, target))
     attach_structure_context(acc)
-    # Item 9: re-mark this account's fires so a just-confirmed fire that matches an
+    # Re-mark this account's fires so a just-confirmed fire that matches an
     # active suppression is muted without a reload — same marking logic as the load
     # path, reading only the persisted suppressions (no recompute).
     from pm.store import suppression_store
