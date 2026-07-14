@@ -12,11 +12,24 @@
 # analyst-data override (BE998 / PX395) and the "UBSG" market-data ticker. Those are the
 # only permitted occurrences of "ubs" and are allow-listed below by their citation context.
 #
-# Scope: only staged ADDED lines are scanned, so pre-existing content elsewhere in a file
-# is not re-flagged. Three files are excluded from the scan: this gate (it carries the
-# sanctioned citations), the local Claude Code config dir, and the local token list.
+# Scope — two modes:
+#   (default)            staged ADDED lines only. Catches NEW violations at commit time;
+#                        pre-existing content elsewhere in a file is not re-flagged, so
+#                        residue that predates the gate is structurally invisible to it.
+#   --full-tree / --all  every tracked file's current content. The separate, necessary
+#                        check that catches pre-existing residue; run it before every
+#                        merge/push to a public main.
+# Three files are excluded from either scan: this gate (it carries the sanctioned
+# citations), the local Claude Code config dir, and the local token list.
 #
 set -euo pipefail
+
+mode="staged"
+case "${1:-}" in
+  --full-tree|--all) mode="full" ;;
+  "") ;;
+  *) echo "usage: hygiene_gate.sh [--full-tree|--all]" >&2; exit 2 ;;
+esac
 
 repo_root="$(git rev-parse --show-toplevel)"
 token_file="$repo_root/.hygiene_tokens.local"
@@ -32,12 +45,21 @@ if [[ ! -f "$token_file" ]]; then
   exit 1
 fi
 
-# Staged additions across tracked files (added lines only; drop the +++ file headers).
-staged="$(git diff --cached --no-color -U0 --diff-filter=ACM -- . "${exclude[@]}" \
-  | grep -E '^\+' | grep -Ev '^\+\+\+' || true)"
+if [[ "$mode" == "full" ]]; then
+  # Full-tree corpus: every tracked file's content (git grep over the working tree,
+  # tracked paths only, binaries skipped). Hits report as file:line.
+  scan() { git -C "$repo_root" grep -inIE "$1" -- . "${exclude[@]}" || true; }
+  scope_label="tracked tree"
+else
+  # Staged additions across tracked files (added lines only; drop the +++ file headers).
+  staged="$(git diff --cached --no-color -U0 --diff-filter=ACM -- . "${exclude[@]}" \
+    | grep -E '^\+' | grep -Ev '^\+\+\+' || true)"
 
-if [[ -z "$staged" ]]; then
-  exit 0
+  if [[ -z "$staged" ]]; then
+    exit 0
+  fi
+  scan() { printf '%s\n' "$staged" | grep -inE "$1" || true; }
+  scope_label="staged additions"
 fi
 
 fail=0
@@ -45,9 +67,9 @@ fail=0
 # 1) Hard denylist from the local token file (one grep -iE pattern per non-comment line).
 while IFS= read -r pat || [[ -n "$pat" ]]; do
   [[ -z "${pat// }" || "$pat" == \#* ]] && continue
-  hits="$(printf '%s\n' "$staged" | grep -inE "$pat" || true)"
+  hits="$(scan "$pat")"
   if [[ -n "$hits" ]]; then
-    echo "hygiene-gate: barred token /$pat/ in staged additions:" >&2
+    echo "hygiene-gate: barred token /$pat/ in $scope_label:" >&2
     printf '%s\n' "$hits" | sed 's/^/    /' >&2
     fail=1
   fi
@@ -56,7 +78,7 @@ done < "$token_file"
 # 2) 'ubs' is permitted ONLY inside the sanctioned Bloomberg citations. Word-boundary the
 #    match (so subset/substr do not trip it), then subtract the citation contexts; any
 #    residue is an unsanctioned occurrence and blocks.
-ubs_hits="$(printf '%s\n' "$staged" | grep -inE '\bubs\b' \
+ubs_hits="$(scan '\bubs\b' \
   | grep -ivE 'BE998|PX395|UBSG|BEST_ANALYST_REC|BEST_TARGET_PRICE|INTERVAL_END_VALUE_DATE|Best Analyst Rating' \
   || true)"
 if [[ -n "$ubs_hits" ]]; then
