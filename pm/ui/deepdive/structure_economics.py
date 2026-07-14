@@ -7,9 +7,10 @@ anything upstream. A leg whose quantity is None/0 (the loader yields None
 quantities when the Quantity column is absent) cannot be pro-rated, so the
 dependent aggregate degrades to None ("—") rather than crashing.
 
-Tier-2 economics (breakeven, max profit/loss, structure Greeks, theoretical
-value) need layer-2 pricing and are intentionally absent — the view renders a
-``PENDING_PRICING`` marker for them, not a fabricated number.
+Tier-2 economics (breakevens, max profit/loss, PoP) are the pricing engine's —
+computed in the load path by ``pm.risk.payoff.run_structure_tier2`` and stored on
+``AccountState.structure_tier2``; the grid and the structure modal read that
+record, and this module carries no placeholder for them.
 """
 from __future__ import annotations
 
@@ -20,10 +21,6 @@ from typing import Optional
 # By-Structure view and the portfolio exposure rollup share one conservation rule.
 # Re-exported here so existing callers keep importing it from this module.
 from pm.insight.structures import reconcile_allocations  # noqa: F401
-
-# Tier-2 placeholder — a clean "incomplete" marker, distinct from the legacy
-# "<indicative — terminal quote required>" alert-rationale token.
-PENDING_PRICING = "pending pricing"
 
 
 def _slice_fraction(allocated_qty, quantity) -> Optional[float]:
@@ -95,9 +92,4 @@ def structure_economics(structure, by_id: dict) -> dict:
         "strikes": sorted(set(strikes)),
         "expiries": sorted(set(expiries)),
         "degraded": degraded,
-        # Tier-2 — pending layer-2 pricing.
-        "breakeven": PENDING_PRICING,
-        "max_profit_loss": PENDING_PRICING,
-        "greeks": PENDING_PRICING,
-        "theoretical_value": PENDING_PRICING,
     }

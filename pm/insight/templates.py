@@ -437,15 +437,17 @@ P8_RATIONALE_TEMPLATE = (
 P9_LABEL_TEMPLATE = (
     "{symbol} — fresh position ({days_held}d old, {nav_pct:.0%} NAV)"
 )
+# days_held is a CALENDAR-day count (position_builder), so the copy says
+# "days", not "business days" — the text must match the arithmetic.
 P9_RATIONALE_TEMPLATE_OPTION = (
     "{symbol} {right} ${strike} expiring {expiry}: opened {open_date} "
-    "({days_held} business days ago), notional ${notional}, {nav_pct:.0%} of "
+    "({days_held} days ago), notional ${notional}, {nav_pct:.0%} of "
     "account NAV. Spot ${spot} vs strike ${strike} ({moneyness:.1%} {itm_otm}, "
     "breakeven ${breakeven}). **Watch-list item** — significant fresh "
     "exposure; ensure client is comfortable with current positioning."
 )
 P9_RATIONALE_TEMPLATE_EQUITY = (
-    "{symbol} equity: opened {open_date} ({days_held} business days ago), "
+    "{symbol} equity: opened {open_date} ({days_held} days ago), "
     "notional ${notional}, {nav_pct:.0%} of account NAV. Spot ${spot}. "
     "**Watch-list item** — significant fresh exposure; ensure client is "
     "comfortable with current positioning."
@@ -464,9 +466,10 @@ P10_RATIONALE_TEMPLATE = (
 
 # ----- P11 -----
 P11_LABEL_TEMPLATE = "{account} — idle ({days_since_trade}d), {cash_pct:.0%} cash"
+# days_since_trade is a CALENDAR-day count (detect_p11) — copy matches.
 P11_RATIONALE_TEMPLATE = (
-    "{account}: last trade {last_trade_date} ({days_since_trade} business "
-    "days ago). Cash + sweep positions = ${cash_total} ({cash_pct:.0%} of "
+    "{account}: last trade {last_trade_date} ({days_since_trade} days ago). "
+    "Cash + sweep positions = ${cash_total} ({cash_pct:.0%} of "
     "NAV). **Redeploy candidates** drawn from existing equity holdings with "
     "vol-rich setups (see P13 fires for this account)."
 )

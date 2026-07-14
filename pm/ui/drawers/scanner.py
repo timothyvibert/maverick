@@ -74,10 +74,16 @@ def _sign(v) -> str:
     return "scanner-pos" if v > 0 else "scanner-neg"
 
 
+def _maxup(e) -> str:
+    """Profit-only max-upside cell: '∞' for an unbounded-gain candidate (whose
+    max_profit is the None sentinel — a bare _money would show the missing-data
+    dash where infinity is meant)."""
+    return "∞" if e.get("unbounded_gain") else _money(e.get("max_profit"))
+
+
 def _maxpl(e) -> str:
-    mp = "∞" if e.get("unbounded_gain") else _money(e.get("max_profit"))
     ml = "−∞" if e.get("unbounded_loss") else _money(e.get("max_loss"))
-    return f"{mp} / {ml}"
+    return f"{_maxup(e)} / {ml}"
 
 
 def _pop(v) -> str:
@@ -281,7 +287,7 @@ def _browse_row(ct, rc, held_strike) -> html.Tr:
         html.Td(_money(nc) if is_cand else "",
                 className=f"scanner-num scanner-grp {_sign(nc) if is_cand else ''}".strip()),
         html.Td(_pop(e.get("pop")) if is_cand else "", className="scanner-num"),
-        html.Td(_money(e.get("max_profit")) if is_cand else "", className="scanner-num"),
+        html.Td(_maxup(e) if is_cand else "", className="scanner-num"),
         html.Td(html.Span("costless", className="scanner-tag-costless")
                 if (is_cand and _is_costless(rc.candidate)) else "", className="scanner-tag"),
     ]
@@ -664,12 +670,15 @@ def _comparison_figure(current, candidate):
     return fig
 
 
-def _cmp_money_row(label, cur, new):
+def _cmp_money_row(label, cur, new, cur_txt=None, new_txt=None):
+    """One economics comparison row. ``cur_txt`` / ``new_txt`` override the money
+    formatting for non-numeric truths (∞ / −∞ / 'unbounded'); with an unbounded
+    side the Δ is undefined and renders '—' (the None arithmetic already does)."""
     d = (new - cur) if (cur is not None and new is not None) else None
     return html.Tr([
         html.Td(label, className="cmp-lbl"),
-        html.Td(_money(cur), className="scanner-num"),
-        html.Td(_money(new), className="scanner-num"),
+        html.Td(cur_txt if cur_txt is not None else _money(cur), className="scanner-num"),
+        html.Td(new_txt if new_txt is not None else _money(new), className="scanner-num"),
         html.Td(_money(d) if d is not None else "—", className=f"scanner-num {_sign(d)}".strip()),
     ])
 
@@ -683,11 +692,24 @@ def _side_by_side_econ(current, candidate, net_to_roll):
         html.Td("PoP", className="cmp-lbl"),
         html.Td(_pop(pc), className="scanner-num"), html.Td(_pop(pn), className="scanner-num"),
         html.Td((f"{pop_d * 100:+.0f} pp" if pop_d is not None else "—"), className="scanner-num")])
+    def _up_txt(e):
+        return "∞" if e.get("unbounded_gain") else None
+
+    def _dn_txt(e):
+        return "−∞" if e.get("unbounded_loss") else None
+
+    def _car_txt(e):
+        return ("unbounded" if (e.get("unbounded_loss")
+                                and e.get("capital_at_risk") is None) else None)
+
     head = html.Tr([html.Th("Economics", className="cmp-lbl"), html.Th("Current"),
                     html.Th("Candidate"), html.Th("Δ")])
-    body = [_cmp_money_row("Max profit", ce.get("max_profit"), ne.get("max_profit")),
-            _cmp_money_row("Max loss", ce.get("max_loss"), ne.get("max_loss")),
-            _cmp_money_row("Cap at risk", ce.get("capital_at_risk"), ne.get("capital_at_risk")),
+    body = [_cmp_money_row("Max profit", ce.get("max_profit"), ne.get("max_profit"),
+                           _up_txt(ce), _up_txt(ne)),
+            _cmp_money_row("Max loss", ce.get("max_loss"), ne.get("max_loss"),
+                           _dn_txt(ce), _dn_txt(ne)),
+            _cmp_money_row("Cap at risk", ce.get("capital_at_risk"), ne.get("capital_at_risk"),
+                           _car_txt(ce), _car_txt(ne)),
             pop_row,
             _cmp_money_row("Net premium", ce.get("net_premium"), ne.get("net_premium"))]
     foot = html.Tr(className="cmp-foot", children=[

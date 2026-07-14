@@ -87,6 +87,12 @@ def net_greeks_summary(account_state) -> dict:
     Returns keys: dollar_delta, dollar_gamma, dollar_vega, dollar_theta,
     delta_pct_of_nav, headline (signed compact, for the KPI strip),
     interpretation (worded, for Analytics).
+
+    Honesty rule: a total the engine set to None (every eligible row missing
+    that greek) renders "—", never $0, and the interpretation says the data is
+    missing; a partially-missing total keeps its sum but carries an explicit
+    "n/m missing" cue — a zero from missing data must never look like a zero
+    exposure.
     """
     greeks = getattr(account_state, "greeks", None)
     totals = getattr(greeks, "totals", None) or {}
@@ -97,8 +103,31 @@ def net_greeks_summary(account_state) -> dict:
     dt = _coerce_float(totals.get("dollar_theta"))
     delta_pct = _coerce_float(totals.get("delta_pct_of_nav"))
 
+    cov = totals.get("greeks_coverage") or {}
+
+    def _missing(col: str) -> tuple[int, int]:
+        c = cov.get(col) or {}
+        try:
+            return int(c.get("n_missing") or 0), int(c.get("n_total") or 0)
+        except (TypeError, ValueError):
+            return 0, 0
+
+    miss_d, tot_d = _missing("dollar_delta")
+    miss_v, tot_v = _missing("dollar_vega")
+
     phrases = [p for p in (_dir_phrase("delta", dd), _dir_phrase("vega", dv)) if p]
-    interpretation = " · ".join(phrases) if phrases else "no greeks"
+    if dd is None and dv is None and (tot_d or tot_v):
+        interpretation = (f"greeks unavailable — market data missing on all "
+                          f"{tot_d} position(s)")
+    else:
+        interpretation = " · ".join(phrases) if phrases else "no greeks"
+        cues = []
+        if dd is not None and miss_d:
+            cues.append(f"Δ missing {miss_d}/{tot_d}")
+        if dv is not None and miss_v:
+            cues.append(f"vega missing {miss_v}/{tot_v}")
+        if cues:
+            interpretation += " · " + ", ".join(cues)
     headline = (f"net Δ {_signed_money(dd)} · "
                 f"net vega {_signed_money(dv)}")
 
@@ -108,6 +137,7 @@ def net_greeks_summary(account_state) -> dict:
         "dollar_vega": dv,
         "dollar_theta": dt,
         "delta_pct_of_nav": delta_pct,
+        "greeks_coverage": cov,
         "headline": headline,
         "interpretation": interpretation,
     }
@@ -201,12 +231,17 @@ _LADDER_BUCKETS = [
 ]
 
 
-def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
+def expiry_ladder(account_state, as_of: Optional[date] = None) -> tuple[list[dict], int]:
     """Option positions bucketed by days-to-expiry window with the count and
-    summed **strike** notional (``|qty| × multiplier × strike``) per bucket.
+    summed **strike** notional (``|qty| × multiplier × strike``) per bucket,
+    plus the count of EXPIRED options excluded from the ladder.
 
-    Always returns the four buckets in order (zeros if empty). DTE is computed
-    from ``position.expiry`` against ``as_of`` (default today) — matching the
+    Returns ``(buckets, n_expired)`` — always the four buckets in order (zeros
+    if empty). An expired option (negative DTE, e.g. from a stale extract — a
+    designed-for operating mode) is a dead obligation, not an imminent one: it
+    must never inflate the ≤30d window or its strike notional, so it is counted
+    separately for the panel's "expired (n)" cue. DTE is computed from
+    ``position.expiry`` against ``as_of`` (default today) — matching the
     blotter's DTE column. Positions without an expiry or strike are skipped.
 
     ``as_of`` is exposed only so tests can pin a reference date; runtime uses
@@ -214,6 +249,7 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
     """
     ref = as_of or date.today()
     buckets = [{"label": lbl, "count": 0, "notional": 0.0} for lbl, _ in _LADDER_BUCKETS]
+    n_expired = 0
 
     for p in getattr(account_state, "positions", []) or []:
         if not _is_option(p):
@@ -228,6 +264,9 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
             dte = (expiry - ref).days
         except Exception:
             continue
+        if dte < 0:
+            n_expired += 1
+            continue
         notional = abs(qty) * mult * strike
         for i, (_lbl, pred) in enumerate(_LADDER_BUCKETS):
             if pred(dte):
@@ -235,7 +274,7 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
                 buckets[i]["notional"] += notional
                 break
 
-    return buckets
+    return buckets, n_expired
 
 
 # ---------------------------------------------------------------------------

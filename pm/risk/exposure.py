@@ -72,12 +72,13 @@ class ExposureNode:
     """Aggregated dollar exposure for one slice of the book — the whole account, a
     single structure, the structured total, or the unstructured residual. Dollar
     beta is the beta-weighted dollar-delta under each beta (None when no contributing
-    name had a beta)."""
+    name had a beta). Each dollar greek is likewise None when NO contributing slice
+    carried that greek — an all-missing slice must never read as $0."""
     label: str
-    dollar_delta: float
-    dollar_gamma: float
-    dollar_vega: float
-    dollar_theta: float
+    dollar_delta: Optional[float]
+    dollar_gamma: Optional[float]
+    dollar_vega: Optional[float]
+    dollar_theta: Optional[float]
     dollar_beta_adjusted: Optional[float]
     dollar_beta_raw: Optional[float]
     market_value: float
@@ -94,6 +95,10 @@ class VegaTenorBucket:
     label: str
     dollar_vega: float
     n_options: int
+    # options in the bucket whose vega is missing from the snapshot — the bucket's
+    # dollar_vega understates by these; n_missing_vega == n_options means the
+    # bucket's $0 is pure missing data, not zero exposure.
+    n_missing_vega: int = 0
 
 
 @dataclass
@@ -110,6 +115,14 @@ class AccountExposure:
     vega_by_tenor: list[VegaTenorBucket]
     warnings: list[str] = field(default_factory=list)
     trace: dict = field(default_factory=dict)
+    # tickers whose row is missing one or more dollar greeks (the beta analogue:
+    # missing_beta discloses names excluded from dollar-beta; this discloses names
+    # whose greeks are absent, so the greek totals understate). Rendered in the
+    # panel provenance.
+    missing_greeks: list[str] = field(default_factory=list)
+    # expired options still on the book (stale extract) — excluded from the vega
+    # tenor ladder; rendered as an "expired (n)" cue on that panel.
+    n_expired_options: int = 0
 
     @property
     def net_market_exposure(self) -> Optional[float]:
@@ -120,9 +133,10 @@ class AccountExposure:
                 else node.dollar_beta_raw)
 
     @property
-    def economic_exposure(self) -> float:
+    def economic_exposure(self) -> Optional[float]:
         """Delta-equivalent underlying exposure — the economic side of the
-        market-value-vs-economic contrast (== net dollar delta)."""
+        market-value-vs-economic contrast (== net dollar delta; None when no
+        contributing row had a delta)."""
         return self.total.dollar_delta
 
 
@@ -190,18 +204,22 @@ def _sector_of(underlyings, ticker: Optional[str]) -> str:
 
 def _new_acc() -> dict:
     return {"dd": 0.0, "dg": 0.0, "dv": 0.0, "dt": 0.0,
+            "dd_has": False, "dg_has": False, "dv_has": False, "dt_has": False,
             "ba": 0.0, "br": 0.0, "ba_has": False, "br_has": False,
             "mv": 0.0, "n": 0, "degraded": False, "pids": []}
 
 
 def _add_slice(acc: dict, frac: float, row: dict, *, degraded: bool = False) -> None:
     """Add ``frac`` of one position's dollar greeks to an accumulator. Greeks are
-    skipna (a missing BBG greek contributes nothing, matching ``greeks.totals``);
-    dollar-beta only accrues where both the delta and the name's beta are present."""
+    skipna (a missing BBG greek contributes nothing, matching ``greeks.totals``),
+    with a has-flag per greek so a node where NOTHING accrued finalizes to None,
+    not a fake 0.0; dollar-beta only accrues where both the delta and the name's
+    beta are present."""
     dd = row["dd"]
     for key, val in (("dd", dd), ("dg", row["dg"]), ("dv", row["dv"]), ("dt", row["dt"])):
         if val is not None:
             acc[key] += frac * val
+            acc[key + "_has"] = True
     if dd is not None and row["beta_adj"] is not None:
         acc["ba"] += frac * dd * row["beta_adj"]
         acc["ba_has"] = True
@@ -217,10 +235,19 @@ def _add_slice(acc: dict, frac: float, row: dict, *, degraded: bool = False) -> 
 
 
 def _finalize(acc: dict, label: str, **extra) -> ExposureNode:
+    # A slice with no rows at all genuinely holds zero exposure (0.0); a slice
+    # WITH rows where nothing accrued for a greek is missing data (None).
+    def _val(key: str):
+        if acc[key + "_has"]:
+            return acc[key]
+        return 0.0 if acc["n"] == 0 else None
+
     return ExposureNode(
         label=label,
-        dollar_delta=acc["dd"], dollar_gamma=acc["dg"],
-        dollar_vega=acc["dv"], dollar_theta=acc["dt"],
+        dollar_delta=_val("dd"),
+        dollar_gamma=_val("dg"),
+        dollar_vega=_val("dv"),
+        dollar_theta=_val("dt"),
         dollar_beta_adjusted=(acc["ba"] if acc["ba_has"] else None),
         dollar_beta_raw=(acc["br"] if acc["br_has"] else None),
         market_value=acc["mv"], n_positions=acc["n"], degraded=acc["degraded"],
@@ -280,7 +307,10 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
 
     # Build one greek row per greek-bearing position (equity + option). Cash/other
     # carry no greeks and are absent from by_position — they contribute nothing.
+    # Names with a missing dollar greek are collected for the provenance line
+    # (the beta analogue): the totals silently understate by exactly these rows.
     rows_by_pid: dict[str, dict] = {}
+    missing_greeks: list[str] = []
     if by_position is not None and not getattr(by_position, "empty", True):
         for _, r in by_position.iterrows():
             pid = r.get("position_id")
@@ -289,7 +319,7 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             pos = pos_by_id.get(pid)
             underlying = r.get("underlying_ticker")
             ba, br = _betas(underlying)
-            rows_by_pid[pid] = {
+            row = {
                 "pid": pid,
                 "dd": _num(r.get("dollar_delta")),
                 "dg": _num(r.get("dollar_gamma")),
@@ -302,6 +332,11 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
                 "instrument_type": r.get("instrument_type"),
                 "expiry": getattr(pos, "expiry", None) if pos is not None else None,
             }
+            rows_by_pid[pid] = row
+            if any(row[k] is None for k in ("dd", "dg", "dv", "dt")):
+                name = str(r.get("bbg_ticker") or underlying or pid)
+                if name not in missing_greeks:
+                    missing_greeks.append(name)
 
     # The conserved split: how much of each position the structures claim vs leave
     # standalone (rejected-skip + contention-collapse live in this ledger).
@@ -364,9 +399,14 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             contention_group=getattr(st, "contention_group", None),
         ))
 
-    # Vega term structure — option positions bucketed by days to expiry.
-    buckets = {label: {"dv": 0.0, "n": 0} for label, _ in VEGA_TENOR_BUCKETS}
+    # Vega term structure — option positions bucketed by days to expiry. An option
+    # whose vega is missing still counts into its bucket (n) but is tallied as
+    # missing so the UI can dash an all-missing bucket instead of showing $0.
+    # An EXPIRED option (negative DTE — a stale extract is a designed-for mode)
+    # is excluded entirely: a dead contract must not read as ≤1m vega.
+    buckets = {label: {"dv": 0.0, "n": 0, "nm": 0} for label, _ in VEGA_TENOR_BUCKETS}
     n_no_expiry = 0
+    n_expired = 0
     for row in rows_by_pid.values():
         if row["instrument_type"] != "option":
             continue
@@ -375,16 +415,25 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             n_no_expiry += 1
             continue
         dte = (exp - today).days
+        if dte < 0:
+            n_expired += 1
+            continue
         for label, pred in VEGA_TENOR_BUCKETS:
             if pred(dte):
                 buckets[label]["n"] += 1
                 if row["dv"] is not None:
                     buckets[label]["dv"] += row["dv"]
+                else:
+                    buckets[label]["nm"] += 1
                 break
-    vega_by_tenor = [VegaTenorBucket(label, buckets[label]["dv"], buckets[label]["n"])
+    vega_by_tenor = [VegaTenorBucket(label, buckets[label]["dv"], buckets[label]["n"],
+                                     buckets[label]["nm"])
                      for label, _ in VEGA_TENOR_BUCKETS]
     if n_no_expiry:
         warnings.append(f"{n_no_expiry} option position(s) had no expiry — "
+                        "excluded from the vega tenor ladder.")
+    if n_expired:
+        warnings.append(f"{n_expired} expired option position(s) still on the book — "
                         "excluded from the vega tenor ladder.")
 
     # Warnings: names with no SPX beta drop out of dollar-beta (never zeroed).
@@ -404,6 +453,7 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             "beta_source": beta_source,
             "n_positions_with_greeks": len(rows_by_pid),
             "names_missing_beta": list(missing_beta),
+            "names_missing_greeks": list(missing_greeks),
             "as_of": today.isoformat(),
         },
         "computation": "dollar greeks summed across positions; dollar_beta = "
@@ -423,6 +473,8 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
         vega_by_tenor=vega_by_tenor,
         warnings=warnings,
         trace=trace,
+        missing_greeks=missing_greeks,
+        n_expired_options=n_expired,
     )
 
 
@@ -534,4 +586,26 @@ def economic_exposure_by_sector(account_state) -> list[dict]:
            for s, v in sums.items()]
     out.sort(key=lambda d: abs(d["dollar_delta"]), reverse=True)
     return out
+
+
+def economic_exposure_missing(account_state) -> dict:
+    """What the economic-exposure breakdowns silently leave out: greek rows whose
+    ``dollar_delta`` is missing are skipped by both by-underlying and by-sector,
+    so a name whose every row is missing vanishes from the bars and a partially-
+    missing name understates. Returns ``{"n_rows": int, "names": [str]}`` — the
+    skipped row count and the affected display symbols — so the panels can say so
+    instead of rendering a silently-partial book. Pure read of
+    ``greeks.by_position``."""
+    sym_by_ut = _symbol_by_underlying(account_state)
+    n_rows = 0
+    names: list[str] = []
+    for r in _iter_greek_rows(account_state):
+        if _num(r.get("dollar_delta")) is not None:
+            continue
+        n_rows += 1
+        ut = r.get("underlying_ticker")
+        sym = sym_by_ut.get(ut) or _short_name(ut)
+        if sym not in names:
+            names.append(sym)
+    return {"n_rows": n_rows, "names": names}
 

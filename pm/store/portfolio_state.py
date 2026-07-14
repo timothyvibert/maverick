@@ -99,11 +99,13 @@ class AccountState:
     # and never recomputes. See pm.risk.exposure.
     exposure: Optional["AccountExposure"] = None
     # Deterministic stress / scenario views (co-moving shock table at truth-CRR +
-    # the beta-mapped portfolio P&L curve at fast BS2002), pre-computed in the load
-    # path after exposure. The UI reads it and never recomputes. See pm.risk.scenario.
+    # the beta-mapped portfolio P&L curve at fast BS2002). NOT populated by the
+    # load path — the scenario section prices live via price_scenario (fast), and
+    # the truth table is only written by an explicit run_account_scenario call
+    # (a future commit-at-truth view). None until then. See pm.risk.scenario.
     scenario: Optional["AccountScenario"] = None
     # Per-structure Tier-2 economics (zero-shock breakevens + max P/L + PoP), precomputed
-    # in the load path after scenario. The By-Structure grid reads the breakeven
+    # in the load path after exposure. The By-Structure grid reads the breakeven
     # from here; the payoff drawer carries the full set. structure_id -> dict.
     structure_tier2: dict = field(default_factory=dict)
     # Client behavioural profile derived from the account's trade history (strategy
@@ -257,19 +259,18 @@ def load_portfolio_state(
     from pm.risk.exposure import run_account_exposure
     run_account_exposure(state)
 
-    # Deterministic stress / scenario engine — pre-computes the co-moving shock
-    # table (truth-CRR points) and the beta-mapped portfolio P&L curve (fast
-    # vectorized BS2002) onto each AccountState. Built on the pricing adapter; the
-    # first engine-consuming risk view. Reads already-loaded state (no Bloomberg,
-    # no recompute). Runs after exposure so beta + greeks are in place.
-    from pm.risk.scenario import run_account_scenario
-    run_account_scenario(state)
+    # The scenario section prices live through the read-only price_scenario
+    # recompute (fast vectorized BS2002) — nothing rendered reads a precomputed
+    # scenario table, so none is computed here. run_account_scenario (the
+    # truth-CRR preset table) remains available as an explicit call for a future
+    # commit-at-truth view; in the load path it cost seconds per account and its
+    # output was consumed by nothing.
 
     # Per-structure Tier-2 economics — zero-shock payoff per structure (engine
     # legs built once per account, reused), storing breakeven / max P/L / PoP on
     # acc.structure_tier2. Fills the By-Structure grid's Breakeven column (was the
-    # 'pending pricing' stub). Pure/read-only; runs after scenario so the engine legs +
-    # structures are in place.
+    # 'pending pricing' stub). Pure/read-only; runs after exposure so the
+    # structures + snapshot are in place.
     from pm.risk.payoff import run_structure_tier2
     run_structure_tier2(state)
 

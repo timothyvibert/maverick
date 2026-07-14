@@ -334,7 +334,9 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         fig = _heatmap_fig(out["grid"], spx or 0, vol or 0, target_label=tlabel)
         table = _impact_table(out["positions"], target)
         total = _total_line({"account_pnl": out["account"]["pnl"],
-                             "account_pnl_pct": out["account"]["pnl_pct"]})
+                             "account_pnl_pct": out["account"]["pnl_pct"],
+                             "n_priced": out["account"].get("n_priced"),
+                             "n_skipped": out["account"].get("n_skipped")})
         return fig, table, total
 
     # ---- Preset chips set the controls (which then drive the recompute) ------

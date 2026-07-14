@@ -117,7 +117,8 @@ class PatternConfig:
     p6_extreme_pnl_pct_max: float = -2.0  # ≤ −200%
     # P7
     p7_exdiv_window_days: int = 7
-    # P8
+    # P8 — business days (the spec's "within last 5 business days"; the
+    # detector counts via bdate_range, weekend-safe).
     p8_recent_trade_window_days: int = 5
     p8_residual_pnl_pct_max: float = -1.0
     # P9 — calendar-days approximation of "≤10 business days".
@@ -709,7 +710,13 @@ def detect_p8_account(account_state, config: PatternConfig) -> list[Fire]:
         by_under.setdefault(p.underlying_symbol, []).append(p)
 
     today = date.today()
-    cutoff = today - pd.Timedelta(days=int(config.p8_recent_trade_window_days * 1.5))
+
+    def _bdays_ago(d: date) -> int:
+        # Business days between the trade date and today (weekend-safe): the
+        # spec's window is "5 business days", so a Friday trade is 1 BD old on
+        # Monday, not 3. Same convention as the signal library's
+        # _safe_business_days_until (len(bdate_range) - 1).
+        return int(len(pd.bdate_range(d, today)) - 1) if d <= today else 0
 
     for under, legs in by_under.items():
         if len(legs) < 2:
@@ -734,7 +741,7 @@ def detect_p8_account(account_state, config: PatternConfig) -> list[Fire]:
             if isinstance(latest_dt, pd.Timestamp):
                 latest_dt = latest_dt.date()
             if latest_dt and isinstance(latest_dt, date):
-                bdays_ago = (today - latest_dt).days
+                bdays_ago = _bdays_ago(latest_dt)
                 if bdays_ago <= config.p8_recent_trade_window_days:
                     recent_legs.append(leg)
                 else:
@@ -761,7 +768,7 @@ def detect_p8_account(account_state, config: PatternConfig) -> list[Fire]:
         ]
         if not action_col.empty:
             recent_action = str(action_col.iloc[0])
-        days_ago = (today - recent_trade_date).days if isinstance(recent_trade_date, date) else None
+        days_ago = _bdays_ago(recent_trade_date) if isinstance(recent_trade_date, date) else None
 
         for residual in residual_legs:
             extras = {

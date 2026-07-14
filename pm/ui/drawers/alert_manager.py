@@ -1,18 +1,20 @@
 """Alert Manager — the book-wide review/reverse surface for suppressed alerts.
 
 A discrete modal (separate from the per-alert drawer) opened from the top-right
-control cluster. Two tabs: **Suppressed** (the active suppressions, restorable) and
-**Thresholds** (the editable alert-sensitivity dials). Both are dense
-``html.Table``s — not a second AG-Grid — matching the signal-sheet / trace design
-language. Restore here uses the *same* ``state_access.restore_alert`` as the modal's
-Muted footer; there is no second mechanism. The Thresholds tab edits the persisted
-overrides via ``settings_store`` and applies them with a persist-then-reload (write the
-override, re-run the engine on the current book) — a deliberate reload, not a UI-layer
-recompute. See ``pm/insight/threshold_catalog.py`` for the dials.
+control cluster. Three tabs: **Suppressed** (the active suppressions, restorable),
+**Thresholds** (the editable alert-sensitivity dials), and **Load notes** (every
+load/ingestion/market-data warning, readable and copyable — the status bar shows
+only the headline). All are dense ``html.Table``s — not a second AG-Grid —
+matching the signal-sheet / trace design language. Restore here uses the *same*
+``state_access.restore_alert`` as the modal's Muted footer; there is no second
+mechanism. The Thresholds tab edits the persisted overrides via ``settings_store``
+and applies them with a persist-then-reload (write the override, re-run the engine
+on the current book) — a deliberate reload, not a UI-layer recompute. See
+``pm/insight/threshold_catalog.py`` for the dials.
 
-Days-active (today − created_at) is the deliberate staleness cue: a suppression aging
-past usefulness shows it and the user restores it — there is no automatic
-re-surfacing in this increment (that is the deferred material-change feature).
+Days-active (today − created_at) is the deliberate staleness cue; a muted alert
+whose condition moves materially is re-surfaced by the load-path material-change
+pass and shows its third state here (see ``suppression_store``).
 """
 from __future__ import annotations
 
@@ -177,7 +179,44 @@ def render_thresholds_tab() -> html.Div:
     return html.Div(className="am-thr-wrap", children=[table, actions])
 
 
+def render_loadnotes_tab() -> html.Div:
+    """Every load-time warning — ingestion notes, market-data misses, insight
+    skip notes — as a dense, natively-selectable table (the status bar shows
+    only the headline; this is the readable, copyable full list). Urgent ⚠
+    notes sort first and render amber. Reads the live singleton at open time
+    (all_warnings is per-load, not per-interaction)."""
+    from pm.ingest.extract_loader import URGENT_FLAG
+
+    state = sa.get_state()
+    notes = list(getattr(state, "all_warnings", []) or []) if state else []
+    if not notes:
+        return html.Div("No load notes — the last load was clean.", className="am-empty")
+    urgent = [n for n in notes if n.lstrip().startswith(URGENT_FLAG)]
+    rest = [n for n in notes if not n.lstrip().startswith(URGENT_FLAG)]
+    header = html.Tr([html.Th(h, className="am-th") for h in ("", "Note")])
+    body_rows = []
+    for n_ in urgent + rest:
+        is_urgent = n_.lstrip().startswith(URGENT_FLAG)
+        body_rows.append(html.Tr(className="am-row", children=[
+            html.Td("⚠" if is_urgent else "", className="am-note-flag"),
+            html.Td(n_, className="am-note-text am-note-urgent" if is_urgent
+                    else "am-note-text"),
+        ]))
+    count_line = html.Div(
+        f"{len(notes)} note(s) from the last load"
+        + (f" — {len(urgent)} urgent" if urgent else ""),
+        className="am-thr-note")
+    table = html.Table(className="am-table am-notes-table",
+                       children=[html.Thead(header), html.Tbody(body_rows)])
+    return html.Div([count_line, table])
+
+
 def render_alert_manager_body(tab: str = "suppressed",
                               today: Optional[date] = None) -> html.Div:
-    inner = render_thresholds_tab() if tab == "thresholds" else render_suppressed_tab(today)
+    if tab == "thresholds":
+        inner = render_thresholds_tab()
+    elif tab == "loadnotes":
+        inner = render_loadnotes_tab()
+    else:
+        inner = render_suppressed_tab(today)
     return html.Div(className="am-body-inner", children=[inner])

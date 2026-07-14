@@ -13,8 +13,14 @@ a v2 concern):
 - ``dollar_delta``:   $ exposure per $1 move in the underlying's spot
 - ``dollar_vega``:    $ P&L per +1 vol point (1.0% IV) move
 - ``dollar_theta``:   $ P&L per 1 calendar day passing
-- ``dollar_gamma``:   $ change in dollar_delta per $1 move in spot
-                      (= qty * mult * gamma * spot)
+- ``dollar_gamma``:   $ change in dollar_delta per **1% move** in spot
+                      (= qty * mult * gamma * spot). The Bloomberg ``GAMMA``
+                      snapshot field is dDelta per 1% underlying move —
+                      live-confirmed against the engine (ratio == S/100 on
+                      names both above and below $100) — so dollarizing it
+                      with spot yields a per-1% quantity, NOT per-$1. The
+                      scenario section's engine dollar-gamma is per-$1; the
+                      two are labeled distinctly and must not be compared.
 """
 from __future__ import annotations
 
@@ -43,7 +49,14 @@ class PortfolioGreeks:
     totals: dict
     # keys: dollar_delta, dollar_vega, dollar_theta, dollar_gamma,
     #       delta_pct_of_nav, net_long_options_count,
-    #       net_short_options_count, coverage_ratio_by_underlying
+    #       net_short_options_count, coverage_ratio_by_underlying,
+    #       greeks_coverage.
+    # A dollar-greek total is None (never 0.0) when EVERY eligible row was
+    # missing that greek — a zero from all-missing data is not a real zero.
+    # greeks_coverage = {col: {"n_missing": int, "n_total": int}} counts the
+    # missing rows per dollar greek so the UI can cue partial coverage
+    # (delta is eligible on every greek-bearing row; gamma/vega/theta only on
+    # options — an equity's 0.0 vega is genuine, not missing).
 
     warnings: list[str]
 
@@ -207,7 +220,7 @@ def compute_portfolio_greeks(
         dollar_delta = qty_f * mult * delta * spot
         dollar_vega = qty_f * mult * vega
         dollar_theta = qty_f * mult * theta
-        dollar_gamma = qty_f * mult * gamma * spot  # $Δ per $1 spot move
+        dollar_gamma = qty_f * mult * gamma * spot  # $Δ per 1% spot move (BBG GAMMA is per-1%)
 
         rows.append({
             "position_id": p.position_id,
@@ -231,15 +244,29 @@ def compute_portfolio_greeks(
     by_pos = pd.DataFrame(rows, columns=_BY_POSITION_COLS)
 
     # -- Totals -------------------------------------------------------------
+    # Skipna sums, with one honesty rule: when every eligible row is missing a
+    # greek, the total is None — an all-missing book must never render as a
+    # confident $0. Coverage counts ride along so partial missingness can be
+    # cued ("n of m missing") next to the summed number.
+    option_rows = by_pos[by_pos["instrument_type"] == "option"] if not by_pos.empty else by_pos
     totals: dict = {}
+    greeks_coverage: dict[str, dict] = {}
     for col in ("dollar_delta", "dollar_vega", "dollar_theta", "dollar_gamma"):
-        totals[col] = float(by_pos[col].sum(skipna=True)) if not by_pos.empty else 0.0
+        eligible = by_pos if col == "dollar_delta" else option_rows
+        n_total = int(len(eligible))
+        n_missing = int(eligible[col].isna().sum()) if n_total else 0
+        greeks_coverage[col] = {"n_missing": n_missing, "n_total": n_total}
+        if n_total and n_missing == n_total:
+            totals[col] = None
+        else:
+            totals[col] = float(by_pos[col].sum(skipna=True)) if not by_pos.empty else 0.0
+    totals["greeks_coverage"] = greeks_coverage
 
     # NAV here = sum of |market_value| across all positions handed in. Per-
     # account NAV is enforced by the caller (load_portfolio_state computes
     # greeks per account slice).
     nav = sum(abs(_safe_position_mv(p)) for p in positions)
-    if nav:
+    if nav and totals["dollar_delta"] is not None:
         totals["delta_pct_of_nav"] = totals["dollar_delta"] / float(nav)
     else:
         totals["delta_pct_of_nav"] = float("nan")

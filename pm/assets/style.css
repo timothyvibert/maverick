@@ -580,10 +580,19 @@ html, body {
 .status-tier-3 { color: var(--pm-grey-500); }
 .status-bbg-on  { color: var(--pos); font-weight: 700; }
 .status-bbg-off { color: var(--pm-grey-300); font-weight: 700; }
-/* Load-time ingestion notes; urgent (load-bearing / high-impact) reads amber. */
-.status-load-notes { color: var(--pm-grey-700); max-width: 520px; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; }
+/* Load-time notes cluster — a click target opening the Alert Manager's Load
+   notes tab (the readable, copyable list); urgent ⚠ notes each render as their
+   own visible amber chip. Button chrome reset so it reads as status text. */
+.status-load-notes {
+    background: none; border: none; padding: 0; font: inherit; cursor: pointer;
+    color: var(--pm-grey-700); max-width: 640px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; text-align: left;
+    display: inline-flex; gap: 10px; align-items: baseline;
+}
+.status-load-notes:hover { text-decoration: underline; }
+.status-load-note-chip { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
 .status-load-urgent { color: var(--pm-urgent); font-weight: 600; }
+.status-load-more { color: var(--pm-grey-500); font-weight: 600; flex: none; }
 .status-refresh-btn {
     background: var(--pm-accent);
     color: white;
@@ -907,6 +916,10 @@ html, body {
 .am-state-resurfaced { color: var(--pm-urgent); font-weight: 600; }  /* material-change re-surfacing: condition moved */
 .am-days { text-align: right; font-variant-numeric: tabular-nums; color: var(--pm-grey-700); }
 .am-restore-btn { padding: 2px 12px; }
+/* Load notes tab — the full, selectable warnings list (urgent ⚠ first, amber). */
+.am-note-flag { width: 24px; color: var(--pm-urgent); font-weight: 700; }
+.am-note-text { color: var(--pm-grey-700); white-space: normal; user-select: text; }
+.am-note-text.am-note-urgent { color: var(--pm-urgent); font-weight: 600; }
 .am-stub { padding: 56px 16px; text-align: center; }
 .am-stub-title { font-size: 14px; font-weight: 600; color: var(--pm-charcoal); margin-bottom: 8px; }
 .am-stub-note { font-size: 12.5px; color: var(--pm-grey-500); }
@@ -1261,7 +1274,10 @@ html, body {
 .struct-econ-item { display: flex; flex-direction: column; }
 .struct-econ-label { font-size: 11px; color: var(--pm-grey-500); }
 .struct-econ-value { font-size: 14px; color: var(--pm-charcoal); font-weight: 600; }
+/* degrade styling — an unpriceable structure's honest dash (grey italic) */
 .struct-econ-value.struct-econ-pending { color: var(--pm-grey-400); font-style: italic; font-weight: 400; }
+/* multi-expiry evaluation note under the Tier-2 block (mirrors the grid's † tooltip) */
+.struct-t2-note { font-size: 11px; color: var(--pm-grey-500); font-style: italic; margin: 2px 0 4px 0; }
 
 /* Analytics — panel grid */
 .dd-analytics-grid {
@@ -1374,48 +1390,11 @@ html, body {
 .exposure-rollup-details[open] .exposure-rollup-caret { transform: rotate(180deg); }
 
 /* ---- Scenario / stress section — reuses the --pm-* / --pos / --neg
-   token set; no new palette. The stress table uses native <details> for
-   callback-free on-expand attribution. ---- */
-.scenario-meta { font-size: 12px; color: var(--pm-grey-500); margin-bottom: 8px; }
-.scenario-table { display: flex; flex-direction: column; }
-.scenario-head-row, .scenario-summary-grid {
-    display: grid; grid-template-columns: 1fr 140px 92px; gap: 12px;
-    align-items: baseline; padding: 5px 8px;
-}
-.scenario-head-row {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); border-bottom: 1px solid var(--pm-grey-300);
-}
-.scenario-row { border-bottom: 1px solid var(--pm-grey-100); }
-/* The grid lives on .scenario-summary-grid (inner div), so the <summary> stays a
-   default block and keeps Chrome's native click-to-toggle. */
-.scenario-summary { cursor: pointer; list-style: none; }
-.scenario-summary::-webkit-details-marker { display: none; }
-.scenario-summary::marker { content: ""; }
-.scenario-summary:hover { background: var(--pm-grey-50); }
-.scenario-row[open] > .scenario-summary { background: var(--pm-grey-50); font-weight: 600; }
-.scenario-name { color: var(--pm-charcoal); }
-.scenario-pnl, .scenario-pct {
-    text-align: right; font-family: "Consolas", monospace; font-variant-numeric: tabular-nums;
-    color: var(--pm-grey-700);
-}
+   token set; no new palette. ---- */
 .scenario-pos { color: var(--pos); }
 .scenario-neg { color: var(--neg); }
-.scenario-attrib { padding: 8px 12px 12px; background: var(--pm-grey-50); }
-.scenario-attrib-title { font-size: 11px; color: var(--pm-grey-700); margin-bottom: 6px; }
-.scenario-attrib-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-.scenario-attrib-cell { display: flex; flex-direction: column; gap: 2px; }
-.scenario-attrib-label { font-size: 11px; color: var(--pm-grey-500); }
-.scenario-attrib-val {
-    font-family: "Consolas", monospace; font-size: 13px; color: var(--pm-grey-700);
-    font-variant-numeric: tabular-nums;
-}
-.scenario-attrib-note { font-size: 11px; color: var(--pm-grey-500); font-style: italic; margin-top: 8px; }
 .scenario-graph { width: 100%; }
 .scenario-caption { font-size: 11px; color: var(--pm-grey-500); margin-top: 6px; line-height: 1.5; }
-@media (max-width: 1100px) {
-    .scenario-attrib-grid { grid-template-columns: repeat(2, 1fr); }
-}
 
 /* ---- Scenario interactive section (controls row over heatmap | impact table) ---- */
 .scn-controls {
@@ -1464,6 +1443,8 @@ html, body {
 .scn-total-val { font-family: "Consolas", monospace; font-weight: 700; font-size: 14px; }
 .scn-total-val.scenario-pos { color: var(--pos); }
 .scn-total-val.scenario-neg { color: var(--neg); }
+/* pricing-coverage disclosure beside the total ("n of m legs priced") */
+.scn-total-coverage { font-size: 11px; color: var(--pm-grey-700); margin-left: 8px; }
 @media (max-width: 1100px) {
     .scn-body { flex-direction: column; }
     .scn-heatmap-wrap, .scn-impact-wrap { flex-basis: auto; width: 100%; }

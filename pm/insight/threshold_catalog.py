@@ -35,6 +35,7 @@ from pm.insight.patterns import PATTERN_META, PatternConfig
 PERCENT = "%"
 PERCENTILE = "pctl"
 DAYS = "days"
+BUSINESS_DAYS = "business days"
 SIGMA = "σ"          # σ — vol-adjusted move multiplier
 VOL_PTS = "vol pts"
 
@@ -106,8 +107,8 @@ _SPECS: tuple[ThresholdSpec, ...] = (
                   True, 1, 60),
     # --- P8 ---------------------------------------------------------------
     ThresholdSpec("p8_recent_trade_window_days", "P8",
-                  "Roll asymmetry: a leg counts as 'recently traded' within", DAYS,
-                  True, 1, 60),
+                  "Roll asymmetry: a leg counts as 'recently traded' within",
+                  BUSINESS_DAYS, True, 1, 60),
     ThresholdSpec("p8_residual_pnl_pct_max", "P8",
                   "Roll asymmetry: a residual leg's loss is at least", PERCENT,
                   False, 0, 1000, _PCT, sign=-1),
