@@ -904,6 +904,14 @@ def run_structure_tier2(state, today=None) -> None:
                 "breakevens": list(res.breakevens or []),
                 "max_profit": res.economics.get("max_profit"),
                 "max_loss": res.economics.get("max_loss"),
+                # attainment-region bound strings + unbounded flags + capital at
+                # risk, so the structure modal can render the full economics
+                # without a per-click engine reprice.
+                "max_profit_bound": res.economics.get("max_profit_bound"),
+                "max_loss_bound": res.economics.get("max_loss_bound"),
+                "unbounded_gain": bool(res.economics.get("unbounded_gain")),
+                "unbounded_loss": bool(res.economics.get("unbounded_loss")),
+                "capital_at_risk": res.economics.get("capital_at_risk"),
                 "pop": res.economics.get("pop"),
                 "multi_expiry": bool(res.trace.get("multi_expiry")),
                 "eval_date": res.economics.get("eval_date"),

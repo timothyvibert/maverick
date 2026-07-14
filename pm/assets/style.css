@@ -1261,7 +1261,10 @@ html, body {
 .struct-econ-item { display: flex; flex-direction: column; }
 .struct-econ-label { font-size: 11px; color: var(--pm-grey-500); }
 .struct-econ-value { font-size: 14px; color: var(--pm-charcoal); font-weight: 600; }
+/* degrade styling — an unpriceable structure's honest dash (grey italic) */
 .struct-econ-value.struct-econ-pending { color: var(--pm-grey-400); font-style: italic; font-weight: 400; }
+/* multi-expiry evaluation note under the Tier-2 block (mirrors the grid's † tooltip) */
+.struct-t2-note { font-size: 11px; color: var(--pm-grey-500); font-style: italic; margin: 2px 0 4px 0; }
 
 /* Analytics — panel grid */
 .dd-analytics-grid {

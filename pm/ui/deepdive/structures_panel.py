@@ -9,10 +9,13 @@ Confirm / Reject / Edit / Choose affordances. Those affordances reuse the existi
 buttons + ``state_access.resolve_structure`` (the single write path); this module
 only renders.
 
-Pure presentation: reads ``AccountState.structures`` + ``Position`` fields and the
-Tier-1 aggregation in ``structure_economics``; never recomputes. Tier-2 economics
-(breakeven, max P/L, Greeks, theoretical value) await layer-2 pricing and render as
-``PENDING_PRICING`` markers.
+Pure presentation: reads ``AccountState.structures`` + ``Position`` fields, the
+Tier-1 aggregation in ``structure_economics``, and the stored engine economics in
+``AccountState.structure_tier2``; never recomputes. The modal's Tier-2 block reads
+the same stored record the grid's Breakeven column reads (one seam, so modal and
+grid cannot disagree); greeks and the full curves live on the payoff drawer. A
+structure with no stored record (unpriceable) degrades to an honest dash — no
+surface renders a placeholder where the engine has a real number.
 """
 from __future__ import annotations
 
@@ -25,7 +28,6 @@ from pm.store.suppression_store import is_active
 from pm.ui.blotter.grid import format_position_descriptor
 from pm.ui.deepdive.formatters import MONEY_FULL_FMT, QTY_FMT, SIGNED_COLOR_STYLE
 from pm.ui.deepdive.structure_economics import (
-    PENDING_PRICING,
     leg_slice,
     structure_economics,
 )
@@ -333,13 +335,49 @@ def _tier1_block(e: dict) -> html.Div:
     ])
 
 
-def _tier2_block() -> html.Div:
-    return html.Div(className="struct-econ struct-econ-t2", children=[
-        _econ_item("Breakeven", PENDING_PRICING, pending=True),
-        _econ_item("Max profit/loss", PENDING_PRICING, pending=True),
-        _econ_item("Greeks", PENDING_PRICING, pending=True),
-        _econ_item("Theoretical value", PENDING_PRICING, pending=True),
-    ])
+def _mpl_str(t2: dict, val_key: str, unbounded_key: str, bound_key: str,
+             symbol: str) -> str:
+    """Max profit/loss cell: ∞/−∞ when unbounded, else the value with its
+    attainment-region bound ('8,200 (S ≥ 110.00)') — the payoff drawer's
+    formatting, from the stored record."""
+    if t2.get(unbounded_key):
+        return symbol
+    val = t2.get(val_key)
+    txt = _money(val)
+    bound = t2.get(bound_key)
+    return f"{txt} ({bound})" if (bound and val is not None) else txt
+
+
+def _tier2_block(t2) -> html.Div:
+    """Engine economics from the stored ``structure_tier2`` record — the same
+    record the grid's Breakeven column reads, so the two surfaces cannot
+    disagree. No recompute on open; greeks + curves live on the payoff drawer.
+    A structure with no record (unpriceable / no spot) degrades to a dash."""
+    if not t2:
+        return html.Div(className="struct-econ struct-econ-t2", children=[
+            _econ_item("Breakeven", "— (unpriceable — no market data)", pending=True),
+            _econ_item("Max profit/loss", "—", pending=True),
+        ])
+    car = t2.get("capital_at_risk")
+    car_str = (_money(abs(car)) if car is not None
+               else ("unbounded" if t2.get("unbounded_loss") else "—"))
+    pop = t2.get("pop")
+    pop_str = f"{pop * 100:.0f}%" if pop is not None else "—"
+    pop_label = ("PoP (at nearest expiry)" if t2.get("multi_expiry")
+                 else "PoP (at expiry)")
+    items = [
+        _econ_item("Breakeven(s)", _breakeven_str(t2)),
+        _econ_item("Max profit", _mpl_str(t2, "max_profit", "unbounded_gain",
+                                          "max_profit_bound", "∞")),
+        _econ_item("Max loss", _mpl_str(t2, "max_loss", "unbounded_loss",
+                                        "max_loss_bound", "−∞")),
+        _econ_item("Capital at risk", car_str),
+        _econ_item(pop_label, pop_str),
+    ]
+    children: list = [html.Div(items, className="struct-econ struct-econ-t2")]
+    if t2.get("multi_expiry"):
+        children.append(html.Div(_breakeven_tooltip(t2), className="struct-t2-note"))
+    return html.Div(children)
 
 
 def _legs_block(account, s, by_id, removable: bool) -> html.Div:
@@ -377,7 +415,7 @@ def _sub_block(account, structures, underlying, by_id) -> list:
     return out
 
 
-def _single_detail(account, s, structures, by_id) -> html.Div:
+def _single_detail(account, s, structures, by_id, t2=None) -> html.Div:
     confirmed = s.status in _CONFIRMED
     e = structure_economics(s, by_id)
     head = [
@@ -409,8 +447,10 @@ def _single_detail(account, s, structures, by_id) -> html.Div:
         html.Div(head, className="struct-card-head"),
         html.Div("Tier-1 economics", className="drawer-section-label"),
         _tier1_block(e),
-        html.Div("Tier-2 — pending layer-2 pricing", className="drawer-section-label"),
-        _tier2_block(),
+        html.Div("Tier-2 economics — engine, at expiry (greeks + curves: "
+                 "open the structure row's payoff view)",
+                 className="drawer-section-label"),
+        _tier2_block(t2),
         html.Div("Legs", className="drawer-section-label"),
         _legs_block(account, s, by_id, removable=not confirmed),
         *_sub_block(account, structures, s.underlying, by_id),
@@ -444,10 +484,11 @@ def _contention_detail(account, target, structures, by_id) -> html.Div:
 
 
 def render_structure_detail(account, structure_id, state) -> html.Div:
-    """Modal body for a structure row: Tier-1 economics, legs, Tier-2 placeholders,
-    and the Confirm / Reject / Edit / Choose affordances (which call the existing
-    resolve_structure). A contended structure renders the alternative chooser —
-    explicit choice required, no one-click confirm."""
+    """Modal body for a structure row: Tier-1 economics, the stored Tier-2 engine
+    economics (breakevens / max P&L / PoP from ``acc.structure_tier2`` — no
+    recompute), legs, and the Confirm / Reject / Edit / Choose affordances (which
+    call the existing resolve_structure). A contended structure renders the
+    alternative chooser — explicit choice required, no one-click confirm."""
     acc = state.accounts.get(account) if state else None
     if acc is None:
         return html.Div("No account selected.", className="trace-muted")
@@ -458,4 +499,6 @@ def render_structure_detail(account, structure_id, state) -> html.Div:
     by_id = {p.position_id: p for p in acc.positions}
     if target.contention_group and target.status not in _CONFIRMED:
         return _contention_detail(account, target, structures, by_id)
-    return _single_detail(account, target, structures, by_id)
+    t2_map = getattr(acc, "structure_tier2", None) or {}
+    return _single_detail(account, target, structures, by_id,
+                          t2=t2_map.get(target.structure_id))
