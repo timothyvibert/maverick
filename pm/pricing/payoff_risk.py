@@ -126,6 +126,14 @@ def pnl_at_state(legs, perturbed_spot, perturbed_today,
 def strategy_breakevens(spot_grid, expiry_curve):
     """Spot prices where the at-expiry NET P&L curve crosses zero.
 
+    DEPRECATED — superseded by :func:`pm.pricing.payoff_analytic.pwl_breakevens`,
+    which is exact over the kink set with no window and no slope filter. This
+    grid-sampled finder has no live consumer: its slope filter (1% of the curve's
+    total scale per grid step) is resolution-coupled — refinement makes it stricter —
+    and drops genuine crossings on tail-dominated structures (covered calls, short
+    puts). It is retained behavior-identical because the byte-identical regression
+    gate pins its outputs and binds its name; do not use it in new code.
+
     Requires expiry_curve to be NET P&L (intrinsic + net premium), not gross
     intrinsic. Only strict sign-change crossings with a non-trivial local slope
     count (plateau-zero touches and grid noise below 1% of the curve scale per grid
