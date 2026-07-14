@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -723,6 +723,7 @@ def _safe_call(fn, *args, **kwargs):
 def compute_per_underlying_signals(
     underlying_snapshot: pd.DataFrame,
     bloomberg_available: bool = True,
+    iv_histories: Optional[dict] = None,
 ) -> dict[str, list[Signal]]:
     """Run all signal functions against every row of the snapshot.
 
@@ -733,6 +734,11 @@ def compute_per_underlying_signals(
     History-derived signals (vol_risk_premium, iv_percentile, momentum,
     breakout) require BDH fetches; those degrade gracefully if BBG is
     unavailable or returns nothing.
+
+    ``iv_histories``: an already-fetched ``{ticker: pd.Series}`` 1Y IV-history
+    dict to reuse — the load path fetches it once and shares it with the
+    insight prefetch, so the same BDH is not issued twice per load. ``None``
+    means fetch here (standalone callers).
     """
     from pm.core.vol_metrics import (
         iv_percentile,
@@ -746,7 +752,7 @@ def compute_per_underlying_signals(
 
     tickers = list(underlying_snapshot.index)
     price_hist: dict[str, pd.Series] = {}
-    iv_hist: dict[str, pd.Series] = {}
+    iv_hist: dict[str, pd.Series] = dict(iv_histories) if iv_histories is not None else {}
     if bloomberg_available and tickers:
         try:
             from pm.core.bloomberg_client import (
@@ -754,7 +760,8 @@ def compute_per_underlying_signals(
                 fetch_price_history,
             )
             price_hist = fetch_price_history(tickers, lookback_days=365)
-            iv_hist = fetch_iv_history(tickers, lookback_days=365)
+            if iv_histories is None:
+                iv_hist = fetch_iv_history(tickers, lookback_days=365)
         except Exception:
             # Pipeline must keep going with degraded signals on history
             # fetch failure.
