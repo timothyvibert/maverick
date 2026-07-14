@@ -14,6 +14,7 @@ from dash import html
 from pm.risk.exposure import (
     economic_exposure_by_sector,
     economic_exposure_by_underlying,
+    economic_exposure_missing,
 )
 from pm.ui.deepdive.aggregations import (
     _fmt_money,
@@ -83,6 +84,20 @@ def _ladder_panel(account_state) -> html.Div:
     ])
 
 
+def _missing_delta_note(account_state) -> Optional[html.Div]:
+    """The economic (delta-$) bars silently skip rows with no delta — when any
+    were skipped, say so instead of presenting a partial book as complete."""
+    missing = economic_exposure_missing(account_state)
+    if not missing["n_rows"]:
+        return None
+    names = missing["names"]
+    shown = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+    return html.Div(
+        f"Delta missing on {missing['n_rows']} position(s) across "
+        f"{len(names)} name(s) — excluded from these bars: {shown}.",
+        className="dd-panel-note")
+
+
 def _sector_panel(account_state) -> html.Div:
     items = economic_exposure_by_sector(account_state)  # sorted by |delta-$| desc
     max_w = max((abs(r["pct_nav"] or 0) for r in items), default=0)
@@ -92,7 +107,7 @@ def _sector_panel(account_state) -> html.Div:
     diag = getattr(account_state, "diagnostics", None)
     beta = getattr(diag, "weighted_beta", None)
     beta_str = f"{beta:.2f}" if isinstance(beta, (int, float)) else "—"
-    return html.Div(className="dd-panel", children=[
+    children = [
         html.Div(className="dd-panel-headrow", children=[
             html.H3("Sector breakdown", className="dd-panel-title"),
             html.Span(f"Weighted β {beta_str}", className="dd-beta-chip"),
@@ -100,7 +115,11 @@ def _sector_panel(account_state) -> html.Div:
         html.Div("Economic exposure (delta-$) by sector, signed % NAV — options "
                  "included and netted against stock.", className="dd-panel-subtitle"),
         html.Div(className="dd-bars", children=bars),
-    ])
+    ]
+    note = _missing_delta_note(account_state)
+    if note is not None:
+        children.append(note)
+    return html.Div(className="dd-panel", children=children)
 
 
 def _concentration_panel(account_state) -> html.Div:
@@ -109,12 +128,16 @@ def _concentration_panel(account_state) -> html.Div:
     rows = [bar_row(r["symbol"] or "—", r["pct_nav"], max_w) for r in top]
     if not rows:
         rows = [html.Div("No economic exposure.", className="dd-empty")]
-    return html.Div(className="dd-panel", children=[
+    children = [
         html.H3("Top-5 economic concentrations (% NAV)", className="dd-panel-title"),
         html.Div("Largest names by delta-equivalent exposure — options netted "
                  "against stock; cash excluded.", className="dd-panel-subtitle"),
         html.Div(className="dd-bars", children=rows),
-    ])
+    ]
+    note = _missing_delta_note(account_state)
+    if note is not None:
+        children.append(note)
+    return html.Div(className="dd-panel", children=children)
 
 
 def render_analytics_section(account_state) -> html.Div:

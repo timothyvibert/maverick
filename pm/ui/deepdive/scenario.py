@@ -191,6 +191,21 @@ def _total_line(impact) -> html.Div:
     pnl = impact["account_pnl"]
     pct = impact["account_pnl_pct"]
     pct_s = "" if pct is None else f"  ({pct * 100:+.2f}% NAV)"
-    return html.Div(className="scn-total", children=[
-        html.Span("Account P&L @ shock", className="scn-total-lbl"),
-        html.Span(_fmt_money(pnl) + pct_s, className=f"scn-total-val {_sign_cls(pnl)}")])
+    # Coverage honesty: the total covers only the priceable book. With nothing
+    # priceable the $0 total is vacuous — say so instead of showing it; with a
+    # partial book, disclose the n-of-m coverage beside the number.
+    n_priced = impact.get("n_priced")
+    n_skipped = impact.get("n_skipped") or 0
+    children = [html.Span("Account P&L @ shock", className="scn-total-lbl")]
+    if n_skipped and not n_priced:
+        children.append(html.Span("— no priceable legs (market data missing)",
+                                  className="scn-total-val"))
+    else:
+        children.append(html.Span(_fmt_money(pnl) + pct_s,
+                                  className=f"scn-total-val {_sign_cls(pnl)}"))
+        if n_skipped and n_priced:
+            children.append(html.Span(
+                f"{n_priced} of {n_priced + n_skipped} legs priced — "
+                f"{n_skipped} skipped (unpriceable)",
+                className="scn-total-coverage"))
+    return html.Div(className="scn-total", children=children)

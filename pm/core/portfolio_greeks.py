@@ -43,7 +43,14 @@ class PortfolioGreeks:
     totals: dict
     # keys: dollar_delta, dollar_vega, dollar_theta, dollar_gamma,
     #       delta_pct_of_nav, net_long_options_count,
-    #       net_short_options_count, coverage_ratio_by_underlying
+    #       net_short_options_count, coverage_ratio_by_underlying,
+    #       greeks_coverage.
+    # A dollar-greek total is None (never 0.0) when EVERY eligible row was
+    # missing that greek — a zero from all-missing data is not a real zero.
+    # greeks_coverage = {col: {"n_missing": int, "n_total": int}} counts the
+    # missing rows per dollar greek so the UI can cue partial coverage
+    # (delta is eligible on every greek-bearing row; gamma/vega/theta only on
+    # options — an equity's 0.0 vega is genuine, not missing).
 
     warnings: list[str]
 
@@ -231,15 +238,29 @@ def compute_portfolio_greeks(
     by_pos = pd.DataFrame(rows, columns=_BY_POSITION_COLS)
 
     # -- Totals -------------------------------------------------------------
+    # Skipna sums, with one honesty rule: when every eligible row is missing a
+    # greek, the total is None — an all-missing book must never render as a
+    # confident $0. Coverage counts ride along so partial missingness can be
+    # cued ("n of m missing") next to the summed number.
+    option_rows = by_pos[by_pos["instrument_type"] == "option"] if not by_pos.empty else by_pos
     totals: dict = {}
+    greeks_coverage: dict[str, dict] = {}
     for col in ("dollar_delta", "dollar_vega", "dollar_theta", "dollar_gamma"):
-        totals[col] = float(by_pos[col].sum(skipna=True)) if not by_pos.empty else 0.0
+        eligible = by_pos if col == "dollar_delta" else option_rows
+        n_total = int(len(eligible))
+        n_missing = int(eligible[col].isna().sum()) if n_total else 0
+        greeks_coverage[col] = {"n_missing": n_missing, "n_total": n_total}
+        if n_total and n_missing == n_total:
+            totals[col] = None
+        else:
+            totals[col] = float(by_pos[col].sum(skipna=True)) if not by_pos.empty else 0.0
+    totals["greeks_coverage"] = greeks_coverage
 
     # NAV here = sum of |market_value| across all positions handed in. Per-
     # account NAV is enforced by the caller (load_portfolio_state computes
     # greeks per account slice).
     nav = sum(abs(_safe_position_mv(p)) for p in positions)
-    if nav:
+    if nav and totals["dollar_delta"] is not None:
         totals["delta_pct_of_nav"] = totals["dollar_delta"] / float(nav)
     else:
         totals["delta_pct_of_nav"] = float("nan")

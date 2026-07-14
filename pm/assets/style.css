@@ -1464,6 +1464,8 @@ html, body {
 .scn-total-val { font-family: "Consolas", monospace; font-weight: 700; font-size: 14px; }
 .scn-total-val.scenario-pos { color: var(--pos); }
 .scn-total-val.scenario-neg { color: var(--neg); }
+/* pricing-coverage disclosure beside the total ("n of m legs priced") */
+.scn-total-coverage { font-size: 11px; color: var(--pm-grey-700); margin-left: 8px; }
 @media (max-width: 1100px) {
     .scn-body { flex-direction: column; }
     .scn-heatmap-wrap, .scn-impact-wrap { flex-basis: auto; width: 100%; }

@@ -116,6 +116,16 @@ def _beta_panel(e) -> html.Div:
     ])
 
 
+def _bucket_cell(b) -> str:
+    """A bucket's display value. Dash when it holds no options — or when every
+    option in it is missing vega (that $0 would be pure missing data, not zero
+    exposure)."""
+    n_missing = getattr(b, "n_missing_vega", 0) or 0
+    if not b.n_options or n_missing >= b.n_options:
+        return "—"
+    return _fmt_money(b.dollar_vega)
+
+
 def _vega_tenor_row(e) -> html.Div:
     header = html.Div(className="dd-ladder-row dd-ladder-head", children=[
         html.Span("Tenor"),
@@ -123,15 +133,22 @@ def _vega_tenor_row(e) -> html.Div:
     ])
     values = html.Div(className="dd-ladder-row", children=[
         html.Span("Net $ Vega", className="dd-ladder-bucket"),
-        *[html.Span(_fmt_money(b.dollar_vega) if b.n_options else "—",
+        *[html.Span(_bucket_cell(b),
                     className="dd-ladder-count") for b in e.vega_by_tenor],
     ])
-    return html.Div(className="dd-panel", children=[
+    children = [
         html.H3("Vega by tenor", className="dd-panel-title"),
         html.Div("Vega's term structure — dollar vega by days to expiry.",
                  className="dd-panel-subtitle"),
         html.Div(className="dd-ladder dd-vega-ladder", children=[header, values]),
-    ])
+    ]
+    n_missing = sum(getattr(b, "n_missing_vega", 0) or 0 for b in e.vega_by_tenor)
+    n_options = sum(b.n_options for b in e.vega_by_tenor)
+    if n_missing:
+        children.append(html.Div(
+            f"Vega missing on {n_missing} of {n_options} option(s) — buckets "
+            "understate by those positions.", className="dd-panel-note"))
+    return html.Div(className="dd-panel", children=children)
 
 
 # ---- rollup table ---------------------------------------------------------
@@ -221,6 +238,11 @@ def _provenance(e) -> str:
         shown = ", ".join(missing[:3]) + ("…" if len(missing) > 3 else "")
         base += f" {len(missing)} name(s) had no SPX beta and are excluded from " \
                 f"dollar-beta: {shown}."
+    missing_greeks = getattr(e, "missing_greeks", []) or []
+    if missing_greeks:
+        shown = ", ".join(missing_greeks[:3]) + ("…" if len(missing_greeks) > 3 else "")
+        base += f" Greeks missing on {len(missing_greeks)} name(s) — " \
+                f"totals understate: {shown}."
     return base
 
 

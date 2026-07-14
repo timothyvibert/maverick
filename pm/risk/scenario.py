@@ -187,10 +187,12 @@ def compute_account_scenario(state, account_state, today=None) -> AccountScenari
 def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=None,
                   mode="fast") -> dict:
     """Per-position / structure P&L (+ shocked-state dollar greeks) under one shock,
-    plus the account total. The per-position rows SUM to the account total. Fast on
-    the dial; ``mode='truth'`` for a committed point. Pure, read-only."""
+    plus the account total. The per-position rows SUM to the account total — the
+    total covers the PRICEABLE book only, so the return also carries n_priced /
+    n_skipped (whole-book counts) for the coverage cue. Fast on the dial;
+    ``mode='truth'`` for a committed point. Pure, read-only."""
     today_ts = _normalize_today(today)
-    legs, equities = _select(state, account_state, target, today_ts)
+    legs, equities, skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
     shifted = _shifted_curve(getattr(state, "risk_free_curve", None) or [], shock.rate_bps)
     nav = _num(getattr(account_state, "nav", None))
@@ -221,7 +223,9 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
             "dg": 0.0, "dv": 0.0, "dt": 0.0})
 
     rows.sort(key=lambda r: r["pnl"])
-    return {"account_pnl": total, "account_pnl_pct": (total / nav if nav else None), "rows": rows}
+    n_skipped = skips["n_options_skipped"] + skips["n_equities_skipped"]
+    return {"account_pnl": total, "account_pnl_pct": (total / nav if nav else None),
+            "rows": rows, "n_priced": len(legs) + len(equities), "n_skipped": n_skipped}
 
 
 def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=None,
@@ -230,7 +234,7 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
     Cells are P&L vs the *current* (unshocked) state; rate/time shocks shift the
     per-leg r / T / today before the sweep. Pure, read-only."""
     today_ts = _normalize_today(today)
-    legs, equities = _select(state, account_state, target, today_ts)
+    legs, equities, _skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
     shifted = _shifted_curve(getattr(state, "risk_free_curve", None) or [], rate_bps)
     spot_axis = np.round(np.linspace(-GRID_SPOT_SPAN, GRID_SPOT_SPAN, GRID_SPOT_N), 4)
@@ -343,16 +347,24 @@ def _shifted_curve(curve, rate_bps):
 # Target selection (account / position / structure)
 # --------------------------------------------------------------------------
 def _select(state, account_state, target, today_ts):
-    legs = [lg for lg in build_engine_legs(state, account_state, today=today_ts) if lg.priceable]
-    equities = _equity_legs(account_state, _beta_map(account_state))
+    """Priceable option + equity legs for the target scope, plus the full-book
+    skip counts (unpriceable options; spot-/qty-less equities). The counts are
+    pre-target (whole book) — they describe the book's pricing coverage, which
+    the impact/total surfaces disclose regardless of any drill."""
+    all_legs = build_engine_legs(state, account_state, today=today_ts)
+    legs = [lg for lg in all_legs if lg.priceable]
+    equities, n_eq_skipped = _equity_legs_with_skips(account_state, _beta_map(account_state))
+    skips = {"n_options_skipped": len(all_legs) - len(legs),
+             "n_equities_skipped": n_eq_skipped}
     pids = _target_position_ids(account_state, target)
     if pids is None:
-        return legs, equities
+        return legs, equities, skips
     # Equities match on EITHER key: a structure target's pid set holds
     # StructureLeg.position_id values (the bare ticker for stock legs), while the
     # impact table's equity rows drill back by their row id, the bbg ticker.
     return ([lg for lg in legs if lg.position_id in pids],
-            [eq for eq in equities if eq["pid"] in pids or eq["bbg"] in pids])
+            [eq for eq in equities if eq["pid"] in pids or eq["bbg"] in pids],
+            skips)
 
 
 def _target_position_ids(account_state, target):
@@ -455,8 +467,17 @@ def _beta_map(account_state) -> dict:
 
 
 def _equity_legs(account_state, beta_map) -> list:
+    out, _ = _equity_legs_with_skips(account_state, beta_map)
+    return out
+
+
+def _equity_legs_with_skips(account_state, beta_map) -> tuple:
+    """Equity/fund legs plus the count of ones dropped for missing spot/quantity —
+    the drop must be countable so the scenario surfaces can disclose partial
+    coverage instead of silently repricing a smaller book."""
     snap = getattr(getattr(account_state, "snapshot", None), "underlyings", None)
     out = []
+    n_skipped = 0
     for p in getattr(account_state, "positions", []) or []:
         if getattr(p, "asset_class", None) not in ("equity", "fund_etf"):
             continue
@@ -464,11 +485,12 @@ def _equity_legs(account_state, beta_map) -> list:
         spot = _num(_snap_val(snap, bbg, "PX_LAST"))
         qty = _num(getattr(p, "quantity", None))
         if spot is None or qty is None:
+            n_skipped += 1
             continue
         out.append({"bbg": bbg, "pid": getattr(p, "position_id", None),
                     "spot": spot, "qty": qty,
                     "beta": beta_map.get(bbg, DEFAULT_BETA)})
-    return out
+    return out, n_skipped
 
 
 def _snap_val(snap, idx, col):
