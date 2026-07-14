@@ -120,6 +120,9 @@ class AccountExposure:
     # whose greeks are absent, so the greek totals understate). Rendered in the
     # panel provenance.
     missing_greeks: list[str] = field(default_factory=list)
+    # expired options still on the book (stale extract) — excluded from the vega
+    # tenor ladder; rendered as an "expired (n)" cue on that panel.
+    n_expired_options: int = 0
 
     @property
     def net_market_exposure(self) -> Optional[float]:
@@ -399,8 +402,11 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
     # Vega term structure — option positions bucketed by days to expiry. An option
     # whose vega is missing still counts into its bucket (n) but is tallied as
     # missing so the UI can dash an all-missing bucket instead of showing $0.
+    # An EXPIRED option (negative DTE — a stale extract is a designed-for mode)
+    # is excluded entirely: a dead contract must not read as ≤1m vega.
     buckets = {label: {"dv": 0.0, "n": 0, "nm": 0} for label, _ in VEGA_TENOR_BUCKETS}
     n_no_expiry = 0
+    n_expired = 0
     for row in rows_by_pid.values():
         if row["instrument_type"] != "option":
             continue
@@ -409,6 +415,9 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             n_no_expiry += 1
             continue
         dte = (exp - today).days
+        if dte < 0:
+            n_expired += 1
+            continue
         for label, pred in VEGA_TENOR_BUCKETS:
             if pred(dte):
                 buckets[label]["n"] += 1
@@ -422,6 +431,9 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
                      for label, _ in VEGA_TENOR_BUCKETS]
     if n_no_expiry:
         warnings.append(f"{n_no_expiry} option position(s) had no expiry — "
+                        "excluded from the vega tenor ladder.")
+    if n_expired:
+        warnings.append(f"{n_expired} expired option position(s) still on the book — "
                         "excluded from the vega tenor ladder.")
 
     # Warnings: names with no SPX beta drop out of dollar-beta (never zeroed).
@@ -462,6 +474,7 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
         warnings=warnings,
         trace=trace,
         missing_greeks=missing_greeks,
+        n_expired_options=n_expired,
     )
 
 

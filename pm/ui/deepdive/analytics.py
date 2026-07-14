@@ -58,7 +58,7 @@ def _premium_panel(account_state) -> html.Div:
 
 
 def _ladder_panel(account_state) -> html.Div:
-    ladder = expiry_ladder(account_state)
+    ladder, n_expired = expiry_ladder(account_state)
     header = html.Div(className="dd-ladder-row dd-ladder-head", children=[
         html.Span("Window"),
         html.Span("Contracts"),
@@ -73,7 +73,7 @@ def _ladder_panel(account_state) -> html.Div:
             html.Span(_fmt_money(b["notional"]) if b["notional"] else "—",
                       className="dd-ladder-notional"),
         ]))
-    return html.Div(className="dd-panel", children=[
+    children = [
         html.H3("Expiry ladder", className="dd-panel-title"),
         html.Div("Strike-obligation exposure by expiry window",
                  className="dd-panel-subtitle"),
@@ -81,7 +81,13 @@ def _ladder_panel(account_state) -> html.Div:
         html.Div("Notional is the strike obligation (contracts × 100 × strike), "
                  "not market value — driven by position size, shown beside the "
                  "contract count.", className="dd-panel-note"),
-    ])
+    ]
+    if n_expired:
+        children.append(html.Div(
+            f"Expired ({n_expired}) — dead contract(s) still on the book "
+            "(stale extract); excluded from every window above.",
+            className="dd-panel-note"))
+    return html.Div(className="dd-panel", children=children)
 
 
 def _missing_delta_note(account_state) -> Optional[html.Div]:

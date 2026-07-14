@@ -154,6 +154,12 @@ def _vega_tenor_row(e) -> html.Div:
         children.append(html.Div(
             f"Vega missing on {n_missing} of {n_options} option(s) — buckets "
             "understate by those positions.", className="dd-panel-note"))
+    n_expired = getattr(e, "n_expired_options", 0) or 0
+    if n_expired:
+        children.append(html.Div(
+            f"Expired ({n_expired}) — dead contract(s) still on the book "
+            "(stale extract); excluded from every tenor bucket.",
+            className="dd-panel-note"))
     return html.Div(className="dd-panel", children=children)
 
 

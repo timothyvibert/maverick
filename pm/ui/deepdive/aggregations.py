@@ -231,12 +231,17 @@ _LADDER_BUCKETS = [
 ]
 
 
-def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
+def expiry_ladder(account_state, as_of: Optional[date] = None) -> tuple[list[dict], int]:
     """Option positions bucketed by days-to-expiry window with the count and
-    summed **strike** notional (``|qty| × multiplier × strike``) per bucket.
+    summed **strike** notional (``|qty| × multiplier × strike``) per bucket,
+    plus the count of EXPIRED options excluded from the ladder.
 
-    Always returns the four buckets in order (zeros if empty). DTE is computed
-    from ``position.expiry`` against ``as_of`` (default today) — matching the
+    Returns ``(buckets, n_expired)`` — always the four buckets in order (zeros
+    if empty). An expired option (negative DTE, e.g. from a stale extract — a
+    designed-for operating mode) is a dead obligation, not an imminent one: it
+    must never inflate the ≤30d window or its strike notional, so it is counted
+    separately for the panel's "expired (n)" cue. DTE is computed from
+    ``position.expiry`` against ``as_of`` (default today) — matching the
     blotter's DTE column. Positions without an expiry or strike are skipped.
 
     ``as_of`` is exposed only so tests can pin a reference date; runtime uses
@@ -244,6 +249,7 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
     """
     ref = as_of or date.today()
     buckets = [{"label": lbl, "count": 0, "notional": 0.0} for lbl, _ in _LADDER_BUCKETS]
+    n_expired = 0
 
     for p in getattr(account_state, "positions", []) or []:
         if not _is_option(p):
@@ -258,6 +264,9 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
             dte = (expiry - ref).days
         except Exception:
             continue
+        if dte < 0:
+            n_expired += 1
+            continue
         notional = abs(qty) * mult * strike
         for i, (_lbl, pred) in enumerate(_LADDER_BUCKETS):
             if pred(dte):
@@ -265,7 +274,7 @@ def expiry_ladder(account_state, as_of: Optional[date] = None) -> list[dict]:
                 buckets[i]["notional"] += notional
                 break
 
-    return buckets
+    return buckets, n_expired
 
 
 # ---------------------------------------------------------------------------
