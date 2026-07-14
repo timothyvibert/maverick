@@ -1,5 +1,8 @@
 * text=auto
 
+# Shell scripts must stay LF so Git Bash can execute them on Windows checkouts.
+*.sh text eol=lf
+
 # Defense-in-depth: local-only trees stay out of `git archive` exports even if
 # a file under them is ever force-added.
 pm/docs export-ignore

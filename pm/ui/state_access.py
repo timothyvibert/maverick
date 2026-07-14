@@ -178,31 +178,55 @@ def price_payoff(
     return structure_payoff(state, acc, target, shock=shock)
 
 
-def scanner_candidate(account: str, position_id: str, objective: str, rank: int):
+def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
+                      *, n_expiries: int = 3):
     """The cached ranked scanner candidate at ``(objective, rank)`` for a held position,
-    or None. A pure read of the slice the scanner already pulled + ranked."""
+    or None. A pure read of the slice the scanner already pulled + ranked.
+
+    ``n_expiries`` must be the scanner's ACTIVE window (the drawer threads its
+    window store through): the slice cache is keyed by window, so reading the
+    default while the table shows an expanded window would resolve (objective,
+    rank) against a different, stale ranking than the row the user clicked.
+    Held-stock (overlay) positions have no option slice — their ranking is read
+    from the per-position overlay cache instead."""
     state = _RUNTIME.get("state")
     if state is None:
         return None
-    sl = pull_slice(account, position_id)          # cache hit after the scan
-    if sl is None:
+    pos = position_by_id(state, account, position_id)
+    if pos is None:
         return None
-    ranked = (sl.get("candidates_ranked") or {}).get(objective) or []
+    if pos.asset_class == "option":
+        sl = pull_slice(account, position_id, n_expiries=n_expiries)  # cache hit after the scan
+        ranked_map = sl.get("candidates_ranked") if sl else None
+    else:
+        ranked_map = state.slice_cache.get("overlay_ranked", {}).get(position_id)
+    ranked = (ranked_map or {}).get(objective) or []
     return next((r for r in ranked if getattr(r, "rank", None) == rank), None)
 
 
-def price_candidate(account: str, position_id: str, objective: str, rank: int, *, shock=None):
+def price_candidate(account: str, position_id: str, objective: str, rank: int, *,
+                    shock=None, n_expiries: int = 3):
     """The candidate side of the current-vs-candidate comparison — a read-only payoff
     reprice of a ranked candidate's resulting position under a shock. Prices the
     candidate's engine legs through the pure ``compute_payoff`` (the same engine the
-    structure payoff wraps) at the SLICE's spot, so the candidate curve shares the
-    current position's grid. No Bloomberg, no reload, no ``_RUNTIME`` write, no engine
-    change. Returns the ``compute_payoff`` dict or None."""
-    rc = scanner_candidate(account, position_id, objective, rank)
+    structure payoff wraps) at the SLICE's spot (option rolls) or the snapshot spot
+    (stock overlays), so the candidate curve shares the current position's grid.
+    ``n_expiries`` is the scanner's active window (see ``scanner_candidate``).
+    No Bloomberg beyond the already-cached slice, no reload, no ``_RUNTIME`` write,
+    no engine change. Returns the ``compute_payoff`` dict or None."""
+    rc = scanner_candidate(account, position_id, objective, rank, n_expiries=n_expiries)
     if rc is None:
         return None
-    sl = pull_slice(account, position_id)
-    spot = sl.get("spot") if sl else None
+    state = _RUNTIME.get("state")
+    acc = state.accounts.get(account) if state else None
+    pos = position_by_id(state, account, position_id) if state else None
+    if acc is None or pos is None:
+        return None
+    if pos.asset_class == "option":
+        sl = pull_slice(account, position_id, n_expiries=n_expiries)
+        spot = sl.get("spot") if sl else None
+    else:
+        spot = _spot_from_snapshot(acc, pos.bbg_ticker)
     cand = getattr(rc, "candidate", None)
     legs = getattr(cand, "legs", None)
     if spot is None or not (spot > 0) or not legs:
@@ -211,8 +235,9 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     from pm.candidates.generate import _build_tier1
     from pm.risk.payoff import compute_payoff
     try:
-        tier1 = _build_tier1(legs, date.today())
-        return compute_payoff(legs, float(spot), tier1, shock=shock)
+        today = date.today()   # one as-of for tier1 AND the payoff (consistency)
+        tier1 = _build_tier1(legs, today)
+        return compute_payoff(legs, float(spot), tier1, shock=shock, today=today)
     except Exception:
         import logging
         logging.getLogger(__name__).exception("price_candidate failed for %s", position_id)
@@ -516,11 +541,18 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     if pos is None:
         return None
     # Free pill switches: an option scan's full ranking (all objectives) is cached on the
-    # slice at pull time, so a pill change reads it rather than re-generating + re-pricing.
+    # slice at pull time; an overlay scan's ranking is cached per position (a held-stock
+    # scan has no option slice). Either way a pill change reads the cache rather than
+    # re-generating + re-pricing — and the comparison tab resolves clicked rows from the
+    # SAME cache, so the overlay path is no longer compare-dead.
     if pos.asset_class == "option":
         cached_sl = pull_slice(account, position_id, n_expiries=n_expiries)
         if cached_sl and cached_sl.get("candidates_ranked"):
             return cached_sl["candidates_ranked"]
+    else:
+        cached = state.slice_cache.get("overlay_ranked", {}).get(position_id)
+        if cached:
+            return cached
 
     cands = generate_slice_candidates(account, position_id, objectives=objectives, cap=cap,
                                       n_expiries=n_expiries)
@@ -552,6 +584,11 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
 
     if sl is not None:
         sl["candidates_ranked"] = ranked
+    elif pos.asset_class in ("equity", "fund_etf"):
+        # The overlay analog of the slice-attached ranking cache: keyed per
+        # position beside overlay_dfs, read by scanner_candidate / the pill
+        # cache-hit above. Dropped by a scanner Refresh (scanner_view_data).
+        state.slice_cache.setdefault("overlay_ranked", {})[position_id] = ranked
     return ranked
 
 
@@ -573,10 +610,14 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
     if pos is None:
         return None
 
-    # A refresh re-snapshots the option slice (the sanctioned write path); the overlay
-    # path has no cached slice, so a refresh simply re-generates from a fresh snapshot.
+    # A refresh re-snapshots the option slice (the sanctioned write path); on the
+    # overlay path it drops the position's cached df + ranking so the scan genuinely
+    # re-generates instead of cache-hitting.
     if refresh and pos.asset_class == "option":
         pull_slice(account, position_id, refresh=True, n_expiries=n_expiries)
+    elif refresh:
+        state.slice_cache.get("overlay_dfs", {}).pop(position_id, None)
+        state.slice_cache.get("overlay_ranked", {}).pop(position_id, None)
 
     ranked = rank_slice_candidates(account, position_id, objectives=objectives, cap=cap,
                                    n_expiries=n_expiries)
@@ -714,7 +755,7 @@ def resolve_structure(
     acc.fires = [f for f in acc.fires if f.structure_id != structure_id]
     acc.fires.extend(rederive_structure_fires(state, acc, target))
     attach_structure_context(acc)
-    # Item 9: re-mark this account's fires so a just-confirmed fire that matches an
+    # Re-mark this account's fires so a just-confirmed fire that matches an
     # active suppression is muted without a reload — same marking logic as the load
     # path, reading only the persisted suppressions (no recompute).
     from pm.store import suppression_store

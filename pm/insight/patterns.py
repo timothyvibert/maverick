@@ -83,7 +83,7 @@ class Fire:
     # The rationale before any structure-leg context is appended, captured once so
     # the annotation can be rebuilt from a clean base — re-running never doubles it.
     rationale_base: Optional[str] = None
-    # Item 9: set by suppression_store.apply_suppressions when an active suppression
+    # Set by suppression_store.apply_suppressions when an active suppression
     # matches (account, underlying, pattern_id). None = active alert. The fire stays
     # in acc.fires either way — active surfaces filter it out (suppression_store.
     # is_active), the modal's Muted footer and the Alert Manager show it to restore.

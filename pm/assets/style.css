@@ -845,7 +845,7 @@ html, body {
 .drawer-header-sub { font-size: 13px; color: var(--pm-grey-700); margin-top: 6px; }
 .drawer-account { font-family: "Consolas", monospace; font-weight: 600; }
 
-/* Item 9 — per-alert suppress controls (right of the tier badge) + Muted footer.
+/* Per-alert suppress controls (right of the tier badge) + Muted footer.
    Charcoal-neutral, deliberately quieter than the tier badge. */
 .alert-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .alert-action-btn {
@@ -882,8 +882,8 @@ html, body {
 .muted-line-state { color: var(--pm-grey-500); font-style: italic; }
 .muted-restore-btn { margin-left: auto; }
 
-/* Item 9 — Alert Manager (Part C). Reuses the drawer overlay/centering; the panel
-   is sized down from the per-alert modal and the Suppressed tab is a dense table. */
+/* Alert Manager. Reuses the drawer overlay/centering; the panel is sized down
+   from the per-alert modal and the Suppressed tab is a dense table. */
 .am-panel { width: 860px; height: auto; max-height: 82vh; }
 .am-tabs { gap: 0; }
 .am-body { padding: 14px 16px; overflow-y: auto; }
@@ -911,7 +911,7 @@ html, body {
 .am-stub-title { font-size: 14px; font-weight: 600; color: var(--pm-charcoal); margin-bottom: 8px; }
 .am-stub-note { font-size: 12.5px; color: var(--pm-grey-500); }
 
-/* Item 11 — Alert Manager Thresholds tab (editable alert-sensitivity dials).
+/* Alert Manager Thresholds tab (editable alert-sensitivity dials).
    Inherits the dense am-table look; controls are quieter than the data, charcoal-neutral. */
 .am-thr-group {
     padding: 13px 10px 5px;

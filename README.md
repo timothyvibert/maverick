@@ -109,6 +109,28 @@ A dedicated environment matching the pins is recommended (e.g. a conda env with
 Python 3.12+); the app is developed and tested against exactly the versions in
 `requirements.txt`.
 
+### Local setup (maintainer)
+
+A few working-tree conveniences are deliberately kept **local** — they are not
+tracked, so they do not travel with a clone and must be re-created on any new
+working machine:
+
+- **Local ignore entries.** The maintainer's environment keeps a handful of
+  paths out of the tree via `.git/info/exclude` (which, unlike `.gitignore`, is
+  itself never committed). Re-add them on a fresh clone.
+- **The hygiene token list.** A local, untracked `.hygiene_tokens.local` at the
+  repository root holds the de-identification denylist (one `grep -iE` pattern
+  per line). Add it to `.git/info/exclude` and populate it.
+- **The pre-commit hygiene gate.** `scripts/hygiene_gate.sh` is tracked and
+  scans each commit's staged additions for barred identity/tooling tokens,
+  permitting only the sanctioned third-party data-vendor citations. Git hooks
+  are not tracked, so install the hook once per machine:
+
+  ```bash
+  printf '#!/usr/bin/env bash\nexec "$(git rev-parse --show-toplevel)/scripts/hygiene_gate.sh"\n' \
+    > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+  ```
+
 ## Running
 
 ```bash

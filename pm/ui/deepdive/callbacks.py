@@ -79,6 +79,21 @@ def _ids_from_cell(cell):
     return parts[0], pid, underlying
 
 
+def scn_payoff_drawer_state(account, position_id) -> dict:
+    """Drawer-state payload for a Scenario impact-row payoff open.
+
+    Deliberately carries NO structure_id: the payoff dial recompute passes
+    ``drawer-state``'s ids to ``price_payoff``, where a structure_id takes
+    precedence — storing the clicked leg's enclosing structure here would
+    silently re-target the drawer from the rendered leg to the whole parent
+    structure on the first dial/Compare interaction. This route's contract is
+    the CLICKED LEG, on its own axis; the body and every recompute must price
+    the same object. (The By-Structure row and the popup Payoff tab store a
+    structure_id on purpose — structure pricing is their documented intent.)"""
+    return {"view": "payoff", "account": account,
+            "position_id": position_id, "structure_id": None}
+
+
 def _short_leg_pid(acc_state, structure_id):
     """The structure's roll-target leg — its short option leg (short call preferred,
     then short put), so the Payoff|Scanner toggle anchors the scan on the contract the
@@ -378,6 +393,4 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         if pos is None:
             return no_update, no_update, no_update
         body = render_payoff(acct, position_id=pos.position_id)
-        return body, _OPEN_CLS, {"view": "payoff", "account": acct,
-                                 "position_id": pos.position_id,
-                                 "structure_id": sa.structure_for_position(state, acct, pos.position_id)}
+        return body, _OPEN_CLS, scn_payoff_drawer_state(acct, pos.position_id)

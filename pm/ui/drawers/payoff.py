@@ -51,6 +51,15 @@ def _mon(d) -> str:
         return ""
 
 
+def _mon_iso(iso_str) -> str:
+    """'2026-09-18' -> 'Sep-26' (falls back to the raw string)."""
+    try:
+        from datetime import date as _date
+        return _date.fromisoformat(iso_str).strftime("%b-%y")
+    except Exception:
+        return iso_str or ""
+
+
 def _leg_phrase(leg) -> str:
     qty = leg.get("qty") or 0.0
     side = "long" if qty >= 0 else "short"
@@ -98,10 +107,25 @@ def payoff_figure(result, show_components=False):
 
     x = result.grid
     horizon = result.horizon_curve
+    econ = result.economics or {}
+    multi = econ.get("eval_mode") == "nearest_expiry"
     fig = go.Figure()
     fig.add_hline(y=0, line=dict(color=_GRID, width=1))
-    for k in (result.strikes or []):
-        fig.add_vline(x=k, line=dict(color=_MUTED, width=1, dash="dot"))
+    # Per-leg strike markers, labelled (and expiry-tagged for a multi-expiry
+    # structure, so a ladder's strike levels read per leg). Falls back to plain
+    # lines when the result predates the marker field.
+    markers = getattr(result, "strike_markers", None)
+    if markers:
+        for m in markers:
+            label = f"{(m.get('opt_type') or '?')[0]}{m.get('K'):g}"
+            if multi and m.get("expiry"):
+                label += f" · {_mon_iso(m['expiry'])}"
+            fig.add_vline(x=m["K"], line=dict(color=_MUTED, width=1, dash="dot"),
+                          annotation_text=label, annotation_position="top",
+                          annotation_font=dict(size=9, color=_MUTED))
+    else:
+        for k in (result.strikes or []):
+            fig.add_vline(x=k, line=dict(color=_MUTED, width=1, dash="dot"))
     # Component (standalone-vs-net) curves, faint and UNDER the combined line: the
     # stock leg alone vs the option overlay alone (combined = their sum at every point).
     # On by default for stock+option overlays (see render_payoff / the dial toggle).
@@ -116,8 +140,11 @@ def payoff_figure(result, show_components=False):
                 x=x, y=result.expiry_curve_options, mode="lines", name="Options alone",
                 line=dict(color=_GREY3, width=1.6, dash="dash"),
                 hovertemplate="px %{x:,.2f}<br>options-alone P&L %{y:$,.0f}<extra></extra>"))
+    expiry_name = "At expiry"
+    if multi and econ.get("eval_date"):
+        expiry_name = f"At nearest expiry ({_mon_iso(econ['eval_date'])})"
     fig.add_trace(go.Scatter(
-        x=x, y=result.expiry_curve, mode="lines", name="At expiry",
+        x=x, y=result.expiry_curve, mode="lines", name=expiry_name,
         line=dict(color=_CHARCOAL, width=2),
         hovertemplate="px %{x:,.2f}<br>expiry P&L %{y:$,.0f}<extra></extra>"))
     if horizon is not None:
@@ -175,22 +202,48 @@ def _mpl(val, unbounded, symbol) -> str:
 
 def economics_block(result) -> html.Div:
     e = result.economics
-    be = " / ".join(f"{b:,.2f}" for b in (result.breakevens or [])) or "—"
+    if result.breakevens:
+        be = " / ".join(f"{b:,.2f}" for b in result.breakevens)
+    elif e.get("always_profitable"):
+        be = "always profitable"          # the analytic list is complete: no crossing
+    elif e.get("always_loss"):
+        be = "always loss"
+    else:
+        be = "—"
     car = (_fmt_money(e["capital_at_risk"]) if e["capital_at_risk"] is not None
            else ("unbounded" if e["unbounded_loss"] else "—"))
     pop = f"{e['pop'] * 100:.0f}%" if e["pop"] is not None else "—"
+
+    def _with_bound(txt, bound):
+        # "8,200 (S ≥ 110.00)" — the attainment region beside the bounded extreme.
+        return f"{txt} ({bound})" if bound else txt
+
+    multi = (e.get("n_expiries") or 0) > 1
+    dte = (str(e["dte"]) if e["dte"] is not None else "—")
+    if multi and e["dte"] is not None:
+        dte += f" (nearest of {e['n_expiries']} expiries)"
+    pop_label = "PoP (at nearest expiry)" if e.get("eval_mode") == "nearest_expiry" \
+        else "PoP (at expiry)"
     rows = [
         _stat("Breakeven(s)", be),
-        _stat("Max profit", _mpl(e["max_profit"], e["unbounded_gain"], "∞"), _sign_cls(e["max_profit"])),
-        _stat("Max loss", _mpl(e["max_loss"], e["unbounded_loss"], "−∞"), _sign_cls(e["max_loss"])),
+        _stat("Max profit",
+              _with_bound(_mpl(e["max_profit"], e["unbounded_gain"], "∞"),
+                          None if e["unbounded_gain"] else e.get("max_profit_bound")),
+              _sign_cls(e["max_profit"])),
+        _stat("Max loss",
+              _with_bound(_mpl(e["max_loss"], e["unbounded_loss"], "−∞"),
+                          None if e["unbounded_loss"] else e.get("max_loss_bound")),
+              _sign_cls(e["max_loss"])),
         _stat("Capital at risk", car),
-        _stat("PoP (at expiry)", pop),
+        _stat(pop_label, pop),
         _stat("Net premium", _fmt_money(e["net_premium"])),
         _stat("Current P&L", _fmt_money(e["current_pnl"]), _sign_cls(e["current_pnl"])),
-        _stat("DTE", str(e["dte"]) if e["dte"] is not None else "—"),
+        _stat("DTE", dte),
     ]
     children = [html.H4("Economics", className="payoff-block-title"),
                 html.Div(rows, className="payoff-stats")]
+    if e.get("econ_caveat"):
+        children.append(html.Div(e["econ_caveat"], className="payoff-caveat"))
     if e.get("pop_caveat"):
         children.append(html.Div(e["pop_caveat"], className="payoff-caveat"))
     return html.Div(children)

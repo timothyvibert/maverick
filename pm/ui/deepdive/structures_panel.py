@@ -121,7 +121,7 @@ def build_structure_columns() -> list[dict]:
         {"field": "net_premium", "headerName": "Net Premium", "width": 124,
          "type": "rightAligned", "valueFormatter": MONEY_FULL_FMT, "filter": "agNumberColumnFilter"},
         {"field": "t2_pricing", "headerName": "Breakeven", "width": 124,
-         "filter": "agTextColumnFilter"},
+         "filter": "agTextColumnFilter", "tooltipField": "t2_tooltip"},
         {"field": "band", "headerName": "Band", "width": 116, "filter": "agTextColumnFilter"},
         {"field": "status", "headerName": "Status", "width": 130, "filter": "agTextColumnFilter"},
     ]
@@ -129,14 +129,35 @@ def build_structure_columns() -> list[dict]:
 
 def _breakeven_str(t2_entry) -> str:
     """Format a structure's zero-shock breakeven(s) for the grid cell, '/'-joined.
-    '—' when no Tier-2 (unpriceable / no spot); 'none' when the structure never crosses
-    zero (e.g. an always-profitable or always-losing leg-set)."""
+    '—' when no Tier-2 (unpriceable / no spot). The stored breakevens are analytic
+    (complete by construction), so an empty list truthfully means the curve never
+    crosses zero and renders as the curve's constant sign — 'always profitable' /
+    'always loss' — never an ambiguous 'none'. A multi-expiry structure carries a
+    dagger; the cell tooltip names the evaluation horizon."""
     if not t2_entry:
         return "—"
     bes = t2_entry.get("breakevens") or []
     if not bes:
-        return "none"
-    return " / ".join(f"{b:,.2f}" for b in bes)
+        if t2_entry.get("always_profitable"):
+            s = "always profitable"
+        elif t2_entry.get("always_loss"):
+            s = "always loss"
+        else:
+            s = "—"
+    else:
+        s = " / ".join(f"{b:,.2f}" for b in bes)
+    if t2_entry.get("multi_expiry"):
+        s += " †"
+    return s
+
+
+def _breakeven_tooltip(t2_entry) -> str:
+    """Cell tooltip for the Breakeven column: names the multi-expiry horizon."""
+    if t2_entry and t2_entry.get("multi_expiry"):
+        when = t2_entry.get("eval_date") or "the nearest leg expiry"
+        return (f"† multi-expiry structure — evaluated at nearest expiry {when}; "
+                "far legs at model value on that date.")
+    return ""
 
 
 def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None) -> dict:
@@ -158,6 +179,7 @@ def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None
         "net_pnl": e["net_pnl"],
         "net_premium": e["net_premium"],
         "t2_pricing": _breakeven_str((t2_map or {}).get(s.structure_id)),
+        "t2_tooltip": _breakeven_tooltip((t2_map or {}).get(s.structure_id)),
     }
 
 
@@ -199,6 +221,7 @@ def _substructure_row(sub, by_id, t2_map=None) -> dict:
         "net_pnl": e["net_pnl"],
         "net_premium": e["net_premium"],
         "t2_pricing": _breakeven_str((t2_map or {}).get(sub.structure_id)),
+        "t2_tooltip": _breakeven_tooltip((t2_map or {}).get(sub.structure_id)),
     }
 
 

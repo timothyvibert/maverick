@@ -18,7 +18,7 @@ from typing import Optional
 import pandas as pd
 
 from pm.core.ticker_utils import construct_option_ticker
-from pm.ingest.extract_loader import PortfolioExtract
+from pm.ingest.extract_loader import URGENT_FLAG, PortfolioExtract
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +46,14 @@ COUNTRY_TO_BBG_SUFFIX: dict[str, str] = {
     "BE": "BB",  # Belgium (Euronext Brussels)
     "JP": "JT",  # Japan (Tokyo)
     "IE": "ID",  # Ireland (Euronext Dublin)
+    # Incorporation-haven codes: issuers domiciled here have no home venue of
+    # that country — in this book's US symbology they are US-listed lines
+    # (e.g. Cayman-incorporated ADRs). Map to US instead of warning per row;
+    # the post-fetch venue-resolution pass validates identity regardless.
+    "KY": "US",  # Cayman Islands
+    "BM": "US",  # Bermuda
+    "JE": "US",  # Jersey
+    "LU": "US",  # Luxembourg
 }
 
 
@@ -68,7 +76,8 @@ class Position:
     account: str
     position_id: str
     asset_class: str            # 'option' | 'equity' | 'fund_etf' | 'cash' | 'other'
-    instrument_type: str
+    instrument_type: str        # routed class; keeps the raw extract class (e.g.
+                                # 'Warrant') when an unknown class is held as 'other'
 
     # Tickers
     symbol: str                 # ticker_final for non-options; underlying_ticker for options
@@ -113,6 +122,19 @@ class Position:
     # chain: the original constructed string, kept for audit. None when the built
     # ticker resolved as-is (every US single-name). Non-keyed; diagnostic only.
     provisional_bbg_ticker: Optional[str] = None
+
+    # Same audit contract for the venue-resolution pass on the UNDERLYING key:
+    # when a mis-coded underlying ticker (wrong exchange suffix from an untrusted
+    # extract country code) is re-keyed to an identity-validated listing, the
+    # original constructed string is kept here. Non-keyed; diagnostic only.
+    provisional_underlying_bbg_ticker: Optional[str] = None
+
+    # Identity key for venue resolution: the instrument's ISIN (extract
+    # 'ISIN Final') on equity/fund rows, the UNDERLYING's ISIN (extract
+    # 'Underlying ISIN') on option rows. The extract's country codes are
+    # untrusted input; the ISIN is the authoritative identity a recovered
+    # ticker must match before it is accepted. None when the extract has none.
+    isin: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +220,20 @@ def _build_one(
             cash_other_counters,
         )
 
-    warnings.append(
-        f"Holdings: unknown asset_class {asset_class!r} for account {account}; skipped."
+    # An unknown asset class (e.g. a warrant) must never silently vanish from
+    # the book: route it to 'other' — held, shown in the grid, NAV-counted, and
+    # inert to pricing/greeks/signals/structures — with the raw class kept on
+    # instrument_type and an urgent flag naming the position and its size.
+    position = _build_cash_or_other(
+        row, account, "other", market_value, quantity, valuation_price,
+        cash_other_counters, instrument_type=asset_class,
     )
-    return None
+    warnings.append(
+        f"{URGENT_FLAG} Holdings: unknown asset_class {asset_class!r} for account "
+        f"{account} ({position.name or position.symbol}, MV {market_value:,.0f}) — "
+        f"held as 'other' (shown + NAV-counted, not priced)."
+    )
+    return position
 
 
 def _build_option(
@@ -284,6 +316,7 @@ def _build_option(
         expiry=expiry,
         option_contract_key=contract_key,
         name=_security_name(row, "option"),
+        isin=_clean_str(row.get("underlying_isin")),
     )
 
 
@@ -330,6 +363,7 @@ def _build_equity_or_fund(
         expiry=None,
         option_contract_key=None,
         name=_security_name(row, asset_class),
+        isin=_clean_str(row.get("isin_final")),
     )
 
 
@@ -337,6 +371,7 @@ def _build_cash_or_other(
     row: pd.Series, account: str, asset_class: str, market_value: float,
     quantity: Optional[float], valuation_price: Optional[float],
     cash_other_counters: dict[str, int],
+    instrument_type: Optional[str] = None,
 ) -> Position:
     product_name = row.get("product_name")
     base = product_name if isinstance(product_name, str) and product_name else asset_class.upper()
@@ -352,7 +387,10 @@ def _build_cash_or_other(
         account=account,
         position_id=position_id,
         asset_class=asset_class,
-        instrument_type=asset_class,
+        # An unknown extract class routed here keeps its raw string (e.g.
+        # "Warrant") so the position stays identifiable; native cash/other
+        # rows carry their own class.
+        instrument_type=instrument_type or asset_class,
         symbol=symbol,
         bbg_ticker="",
         underlying_symbol=None,
@@ -478,17 +516,31 @@ def _pick_country_code(row: pd.Series, *cols: str) -> Optional[str]:
     return None
 
 
+def _is_otc_f_share(ticker: str) -> bool:
+    """Five-letter tickers ending in 'F' are US OTC symbology for a foreign
+    ordinary line (e.g. a European name's OTC trading line) — US-traded
+    regardless of the issuer's incorporation country. The extract's country
+    code on such rows describes the issuer, not the venue."""
+    return len(ticker) == 5 and ticker.isalpha() and ticker.isupper() and ticker.endswith("F")
+
+
 def _build_equity_bbg_ticker(
     ticker: str, country_code: Optional[str], warnings: list[str],
 ) -> str:
     suffix = "US"
+    if _is_otc_f_share(ticker):
+        return f"{ticker} US Equity"
     if country_code:
         mapped = COUNTRY_TO_BBG_SUFFIX.get(country_code.upper())
         if mapped is None:
-            warnings.append(
+            msg = (
                 f"No BBG exchange suffix for country code {country_code!r} "
                 f"(ticker {ticker}); defaulting to 'US'. Add the mapping if BBG fails."
             )
+            # One note per (code, ticker) — a name held across several rows
+            # (e.g. one per option leg) must not wall the status bar.
+            if msg not in warnings:
+                warnings.append(msg)
         else:
             suffix = mapped
     return f"{ticker} {suffix} Equity"
