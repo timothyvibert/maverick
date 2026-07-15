@@ -25,8 +25,14 @@ straight out of the slice algebra — the ``allocated_qty`` cancels):
 
 * stock leg per-share cost basis  = ``position.cost_basis / position.quantity``
   (total-$ cost over total qty),
-* option leg entry premium / share = ``position.cost_basis / (position.quantity * 100)``
-  (a positive magnitude; the long/short sign is carried by ``qty``).
+* option leg entry premium / share = ``position.cost_basis / (position.quantity *
+  multiplier)`` (a positive magnitude; the long/short sign is carried by ``qty``).
+
+The toolkit's option arithmetic (and the pinned ``pm.pricing`` kernels) carries the
+standard 100-share contract multiplier. A non-standard contract (mini/adjusted) is
+normalised at assembly into the exactly-equivalent number of standard contracts —
+``qty × multiplier/100`` with the entry premium per REAL share — so the kernels stay
+untouched; a standard contract passes through bit-identically.
 
 Consequently ``Σ baked premium across legs == net_debit_credit`` exactly, mark-free —
 the primary conservation gate. The Tier-1 slice sums are recomputed here (mirroring
@@ -210,7 +216,18 @@ def _assemble_legs(by_id, elegs, norm, account_state, today_ts) -> dict:
         ac = pos.asset_class
         if ac == "option":
             qf, cb = _num(pos.quantity), _num(pos.cost_basis)
-            mid = (cb / (qf * 100.0)) if (cb is not None and qf) else 0.0   # ENTRY premium/share
+            # The whole payoff toolkit (this module's curves/tails/greeks and the
+            # pinned pm.pricing kernels) carries the standard 100-share contract
+            # multiplier. A non-standard contract (mini/adjusted) enters as the
+            # exactly-equivalent number of STANDARD contracts — qty scaled by
+            # mult/100, entry premium per REAL share — so every kernel stays
+            # untouched and a standard contract passes through bit-identically.
+            # The drawer's leg summary keeps the real contract count.
+            mult = _num(getattr(pos, "multiplier", None)) or 100.0
+            mid = (cb / (qf * mult)) if (cb is not None and qf) else 0.0   # ENTRY premium/share
+            qty_std = (_num(alloc) or 0.0)
+            if mult != 100.0:
+                qty_std = qty_std * (mult / 100.0)
             opt_type = _opt_type_of(pos)
             K = _num(pos.strike)
             expiry = pos.expiry
@@ -230,7 +247,7 @@ def _assemble_legs(by_id, elegs, norm, account_state, today_ts) -> dict:
             if not priceable:
                 warnings.append(f"{pid}: option not priceable (no σ) — at-expiry intrinsic only.")
             d = {"opt_type": opt_type, "K": K, "expiry": expiry, "T": T, "sigma": sigma,
-                 "style": style, "qty": _num(alloc) or 0.0, "mid": mid, "r": r, "q": q,
+                 "style": style, "qty": qty_std, "mid": mid, "r": r, "q": q,
                  "priceable": priceable, "position_id": pid, "role": role}
         elif ac in ("equity", "fund_etf"):
             qf, cb = _num(pos.quantity), _num(pos.cost_basis)
@@ -255,8 +272,10 @@ def _assemble_legs(by_id, elegs, norm, account_state, today_ts) -> dict:
             continue
 
         leg_dicts.append(d)
+        # The summary carries the REAL allocated quantity (contracts as held),
+        # not the standard-contract-equivalent the toolkit prices.
         summaries.append({"role": role, "opt_type": d["opt_type"], "K": d.get("K"),
-                          "expiry": d.get("expiry"), "qty": d["qty"],
+                          "expiry": d.get("expiry"), "qty": _num(alloc) or 0.0,
                           "is_stock": d["opt_type"] == "Stock",
                           "priceable": d.get("priceable", True)})
 
@@ -280,8 +299,10 @@ def build_structure_payoff_legs(state, account_state, target, today=None, elegs=
     """Assemble a combined leg list for the payoff toolkit, sliced and entry-based.
 
     Option legs reuse the resolved engine inputs (σ/style/T/r/q via ``EngineLeg``) but
-    override ``qty`` -> the structure's ``allocated_qty`` slice and ``mid`` -> the ENTRY
-    premium per share (``cost_basis / (quantity*100)``). The long-stock leg — which no
+    override ``qty`` -> the structure's ``allocated_qty`` slice (scaled to
+    standard-contract equivalents when the contract multiplier is not 100 — see the
+    module docstring) and ``mid`` -> the ENTRY premium per share
+    (``cost_basis / (quantity × multiplier)``). The long-stock leg — which no
     producer emits — is synthesised ``{opt_type:'Stock', qty:allocated_shares,
     cost_basis:per_share}`` with per-share = ``cost_basis / quantity``.
 

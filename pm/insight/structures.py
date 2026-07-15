@@ -48,8 +48,21 @@ STRANGLE = "strangle"
 RESIDUAL_LONG = "residual_long"
 NAKED_EXCESS_SHORT_CALL = "naked_excess_short_call"
 
-_MULT = 100  # option contract multiplier
+_MULT = 100  # standard option contract multiplier (the fallback)
 _OPEN_ACTIONS = {"Buy to Open", "Sell to Open"}
+
+
+def _opt_mult(o) -> int | float:
+    """The leg's own shares-per-contract, read from ``Position.multiplier``
+    (100 fallback). Every contracts<->shares conversion in detection goes
+    through this so an adjusted/mini contract covers exactly the shares it
+    delivers — a hardcoded 100 turned a fully-covered mini write into a false
+    naked-excess (and its false tier-1 coverage breach). Integral multipliers
+    stay ints so share counts (and their rationale strings) stay integers."""
+    m = _num(getattr(o, "multiplier", None))
+    if m is None or m <= 0:
+        return _MULT
+    return int(m) if float(m).is_integer() else m
 
 
 @dataclass
@@ -171,10 +184,12 @@ def _detect_for_underlying(
             for lc in list(calls_long()):
                 if sc.expiry is None or sc.expiry != lc.expiry or sc.strike == lc.strike:
                     continue
+                if _opt_mult(sc) != _opt_mult(lc):
+                    continue  # mixed contract sizes are not an equal-size two-reading tie
                 qty = int(abs(opt_rem[sc.position_id]))
                 if qty == 0 or qty != int(abs(opt_rem[lc.position_id])):
                     continue
-                shares = qty * _MULT
+                shares = qty * _opt_mult(sc)
                 if stock_rem < shares:
                     continue  # stock can't fully cover → not the clean two-reading case
                 if _co_opened([sc.option_contract_key, lc.option_contract_key], trades_df):
@@ -220,10 +235,13 @@ def _detect_for_underlying(
             for lp in sorted(puts_long(), key=lambda o: (str(o.expiry), o.strike or 0)):
                 if sc.expiry is None or sc.expiry != lp.expiry:
                     continue  # mismatched expiry is NOT a collar (it's a CC + standalone hedge)
-                lots = min(int(stock_rem // _MULT), int(abs(opt_rem[sc.position_id])), int(opt_rem[lp.position_id]))
+                mult = _opt_mult(sc)
+                if mult != _opt_mult(lp):
+                    continue  # cap and floor must hedge the same shares per contract
+                lots = min(int(stock_rem // mult), int(abs(opt_rem[sc.position_id])), int(opt_rem[lp.position_id]))
                 if lots <= 0:
                     continue
-                shares = lots * _MULT
+                shares = lots * mult
                 out.append(Structure(
                     structure_id=_sid(account, underlying, COLLAR, [stock_pid, sc.position_id, lp.position_id]),
                     account=account, underlying=underlying, type=COLLAR, confidence_band=HIGH,
@@ -247,38 +265,45 @@ def _detect_for_underlying(
     # ---- 2) Covered call: long stock + short call(s); split partial / over-write
     short_calls = sorted(calls_short(), key=lambda o: (str(o.expiry), o.strike or 0))
     if stock_pid is not None and stock_rem > 0 and short_calls:
-        short_call_shares = sum(abs(opt_rem[o.position_id]) for o in short_calls) * _MULT
-        covered_shares = min(stock_rem, short_call_shares)
-        covered_contracts = int(covered_shares // _MULT)
+        short_call_shares = sum(abs(opt_rem[o.position_id]) * _opt_mult(o) for o in short_calls)
 
-        covered_legs: list[StructureLeg] = [StructureLeg(stock_pid, covered_contracts * _MULT, "long_stock")]
+        # Greedy per-leg cover in (expiry, strike) order, each contract claiming
+        # its OWN shares-per-contract — for the all-standard book this reproduces
+        # the single-multiplier arithmetic take for take.
+        covered_legs: list[StructureLeg] = [StructureLeg(stock_pid, 0, "long_stock")]
         excess_legs: list[StructureLeg] = []
-        need = covered_contracts
+        stock_avail = stock_rem
+        covered_shares = 0
+        covered_contracts = 0
         for o in short_calls:
+            mult = _opt_mult(o)
             have = int(abs(opt_rem[o.position_id]))
-            take = min(need, have)
+            take = min(have, int(stock_avail // mult))
             if take > 0:
                 covered_legs.append(StructureLeg(o.position_id, -take, "short_call"))
-                need -= take
+                stock_avail -= take * mult
+                covered_shares += take * mult
+                covered_contracts += take
             leftover = have - take
             if leftover > 0:
                 excess_legs.append(StructureLeg(o.position_id, -leftover, "naked_excess_short_call"))
             opt_rem[o.position_id] = 0.0  # all short calls accounted for (covered or naked-excess)
+        covered_legs[0] = StructureLeg(stock_pid, covered_shares, "long_stock")
 
-        full = covered_contracts * _MULT == stock_rem and not excess_legs
+        full = covered_shares == stock_rem and not excess_legs
         out.append(Structure(
             structure_id=_sid(account, underlying, COVERED_CALL, [l.position_id for l in covered_legs]),
             account=account, underlying=underlying, type=COVERED_CALL, confidence_band=HIGH,
             status="proposed", legs=covered_legs,
             rationale_trace=_trace(
                 {"long_shares": {"value": stock_rem, "source": "EXTRACT:quantity"},
-                 "short_call_shares": {"value": short_call_shares, "source": "computed:|qty|x100"},
-                 "covered_shares": {"value": covered_contracts * _MULT, "source": "computed:min(long,short)"}},
-                f"{covered_contracts} short call(s) cover {covered_contracts * _MULT} of {int(stock_rem)} {underlying} shares",
+                 "short_call_shares": {"value": short_call_shares, "source": "computed:|qty|xmultiplier"},
+                 "covered_shares": {"value": covered_shares, "source": "computed:min(long,short)"}},
+                f"{covered_contracts} short call(s) cover {covered_shares} of {int(stock_rem)} {underlying} shares",
                 f"covered call ({'full' if full else 'partial cover'})"),
             source="detector:covered_call"))
 
-        stock_after = stock_rem - covered_contracts * _MULT
+        stock_after = stock_rem - covered_shares
         if stock_after > 0:
             out.append(Structure(
                 structure_id=_sid(account, underlying, RESIDUAL_LONG, [stock_pid], suffix="residual"),
