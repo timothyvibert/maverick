@@ -181,15 +181,31 @@ def load_portfolio_state(
         bbg_ok = is_bloomberg_available()
 
     global_snapshot = fetch_portfolio_snapshot(positions, bbg_ok)
+
+    # 1Y IV history — ONE BDH across the union of underlyings, fetched here and
+    # shared by BOTH consumers (the legacy signal pass's IV percentile and the
+    # insight engine's B5). The two passes previously issued the same BDH twice
+    # per load. Runs after the snapshot so venue-recovered tickers are final.
+    iv_histories: dict = {}
+    if bbg_ok:
+        tickers = _underlying_ticker_union(positions)
+        if tickers:
+            try:
+                from pm.core.bloomberg_client import fetch_iv_history
+                iv_histories = fetch_iv_history(sorted(tickers), lookback_days=365) or {}
+            except Exception as exc:
+                logger.warning("IV-history prefetch failed: %s", exc)
+
     global_signals = compute_per_underlying_signals(
         global_snapshot.underlyings, bloomberg_available=bbg_ok,
+        iv_histories=iv_histories,
     )
 
-    # Pre-fetch BBG inputs the insight engine consumes (V1: IV history
-    # for B5; analyst override for D1; analyst-note dates for D3;
-    # forward dividend forecast for the ex-div fire).
+    # Pre-fetch the remaining BBG inputs the insight engine consumes (analyst
+    # override for D1; analyst-note dates for D3; forward dividend forecast for
+    # the ex-div fire). The IV histories fetched above pass through unchanged.
     iv_histories, analyst_data, analyst_note_dates, projected_dividends = _prefetch_insight_inputs(
-        positions, bbg_ok,
+        positions, bbg_ok, iv_histories=iv_histories,
     )
 
     # Treasury curve for the carry fire (one BDP round trip). Empty offline →
@@ -304,6 +320,45 @@ def load_portfolio_state(
     return state
 
 
+def reapply_thresholds(state: PortfolioState) -> PortfolioState:
+    """Re-evaluate the alert set over ALREADY-LOADED state under the currently
+    persisted threshold overrides — the recompute-only Apply path. No extract
+    re-read, no Bloomberg call: a threshold edit changes which fires the engine
+    PRODUCES, so the fires must be re-derived, but every input the engine reads
+    (snapshot, IV histories, analyst data, dividends, curve) is already on the
+    state and is unchanged by a dial edit.
+
+    Re-runs exactly the passes whose output depends on PatternConfig or on the
+    fire set it produces, in load-path order:
+      1. ``run_insight_engine(state, build_pattern_config())`` — replaces each
+         account's signals / fires / position_signals wholesale (the engine
+         resets them per account; it never appends to a prior run's output).
+      2. ``run_structure_fires(state)`` — P16–P20 read module constants, not
+         PatternConfig, but they live in ``acc.fires`` which the engine just
+         reset, so they are re-derived and the structure-leg annotations
+         re-attached (both idempotent by design).
+      3. ``apply_suppressions`` + ``apply_material_change`` — the re-run
+         produces fresh, unmarked Fire objects; the marking passes re-flag
+         them from the persisted store, same as a load.
+    Structure detection, exposure, tier-2 economics and the client profile do
+    NOT re-run: none reads PatternConfig, and each lives on its own
+    AccountState field untouched by the engine. ``state.all_warnings`` is left
+    as loaded — this path adds no load events to warn about.
+
+    Mutates and returns the same state object.
+    """
+    from pm.insight.engine import run_insight_engine
+    from pm.insight.structure_fires import run_structure_fires
+    from pm.store.settings_store import build_pattern_config
+    from pm.store.suppression_store import apply_material_change, apply_suppressions
+
+    run_insight_engine(state, build_pattern_config())
+    run_structure_fires(state)
+    apply_suppressions(state)
+    apply_material_change(state)
+    return state
+
+
 def refresh_portfolio_state(
     current: PortfolioState | None,
     data_dir: Path,
@@ -339,11 +394,27 @@ def refresh_portfolio_state(
 # Insight-input pre-fetch (BBG I/O happens here, not in the engine)
 # ---------------------------------------------------------------------------
 
+def _underlying_ticker_union(positions: list[Position]) -> set[str]:
+    """Unique underlying BBG tickers across the book: equity/fund rows by their
+    own ticker, option rows by their underlier. The set every whole-book
+    prefetch (IV history, analyst data, note dates, dividends) runs over."""
+    tickers: set[str] = set()
+    for p in positions:
+        if p.asset_class in ("equity", "fund_etf") and p.bbg_ticker:
+            tickers.add(p.bbg_ticker)
+        elif p.asset_class == "option" and p.underlying_bbg_ticker:
+            tickers.add(p.underlying_bbg_ticker)
+    return tickers
+
+
 def _prefetch_insight_inputs(
     positions: list[Position], bbg_ok: bool,
+    iv_histories: Optional[dict] = None,
 ) -> tuple[dict, dict, dict, dict]:
     """Fetch the BBG-derived inputs the insight engine needs:
-      - 1Y IV history per unique underlying BBG ticker (B5)
+      - 1Y IV history per unique underlying BBG ticker (B5) — or, when the
+        caller already fetched it (the load path shares one BDH with the
+        legacy signal pass), passed through unchanged via ``iv_histories``
       - provider-overridden analyst data per unique underlying (D1)
       - analyst-note dates per unique underlying (D3)
       - forward dividend forecast per unique underlying (ex-div fire / P7)
@@ -351,41 +422,34 @@ def _prefetch_insight_inputs(
     projected_dividends_by_ticker). All four are empty when ``bbg_ok`` is False
     or no underlyings are present.
     """
-    iv_histories: dict = {}
     analyst_data: dict = {}
     analyst_note_dates: dict = {}
     projected_dividends: dict = {}
     if not bbg_ok:
-        return iv_histories, analyst_data, analyst_note_dates, projected_dividends
+        return iv_histories or {}, analyst_data, analyst_note_dates, projected_dividends
 
-    tickers: set[str] = set()
-    for p in positions:
-        if p.asset_class in ("equity", "fund_etf") and p.bbg_ticker:
-            tickers.add(p.bbg_ticker)
-        elif p.asset_class == "option" and p.underlying_bbg_ticker:
-            tickers.add(p.underlying_bbg_ticker)
-
+    tickers = _underlying_ticker_union(positions)
     if not tickers:
-        return iv_histories, analyst_data, analyst_note_dates, projected_dividends
+        return iv_histories or {}, analyst_data, analyst_note_dates, projected_dividends
 
-    # IV histories — one BDH call across all tickers
-    try:
-        from pm.core.bloomberg_client import fetch_iv_history
-        iv_histories = fetch_iv_history(sorted(tickers), lookback_days=365) or {}
-    except Exception as exc:
-        logger.warning("Insight prefetch: IV history failed: %s", exc)
+    # IV histories — one BDH call across all tickers, unless already fetched
+    if iv_histories is None:
+        iv_histories = {}
+        try:
+            from pm.core.bloomberg_client import fetch_iv_history
+            iv_histories = fetch_iv_history(sorted(tickers), lookback_days=365) or {}
+        except Exception as exc:
+            logger.warning("Insight prefetch: IV history failed: %s", exc)
 
-    # Analyst data — one single-ticker BDP per name (no internal batching)
+    # Analyst data — ONE batched BDP with the provider override across all
+    # names (was one single-ticker call per name; measured on the live book:
+    # ~13s of serial round trips -> ~3s). Fails closed to per-ticker {}.
     try:
-        from pm.core.bloomberg_client import fetch_analyst_data
-        for t in sorted(tickers):
-            try:
-                analyst_data[t] = fetch_analyst_data(t) or {}
-            except Exception as exc:
-                logger.warning("Insight prefetch: analyst data for %s failed: %s", t, exc)
-                analyst_data[t] = {}
+        from pm.core.bloomberg_client import fetch_analyst_data_batch
+        analyst_data = fetch_analyst_data_batch(sorted(tickers))
     except Exception as exc:
-        logger.warning("Insight prefetch: analyst data fetch wrapper failed: %s", exc)
+        logger.warning("Insight prefetch: analyst data fetch failed: %s", exc)
+        analyst_data = {t: {} for t in tickers}
 
     # Analyst-note dates (D3) — one batched BDP with the override pair
     try:
@@ -402,20 +466,16 @@ def _prefetch_insight_inputs(
     except Exception as exc:
         logger.warning("Insight prefetch: analyst-note dates failed: %s", exc)
 
-    # Forward dividend forecast — one fetch_projected_dividend per ticker. The
-    # call is currently cheap (the BDS bulk parse lands with the terminal probe);
-    # if polars_bloomberg gains a multi-security BDS path, batch this — the
-    # per-ticker serial cost grows with the underlying count (~20-30 names).
+    # Forward dividend forecast — ONE batched BDP on the bulk BDVD field across
+    # all names (was one call per ticker; measured on the live book: ~8s of
+    # serial round trips -> ~1.4s). A failed batch degrades every name to the
+    # empty shape, matching the singular fetcher's per-name degradation.
     try:
-        from pm.core.bloomberg_client import fetch_projected_dividend
-        for t in sorted(tickers):
-            try:
-                projected_dividends[t] = fetch_projected_dividend(t) or {}
-            except Exception as exc:
-                logger.warning("Insight prefetch: projected dividend for %s failed: %s", t, exc)
-                projected_dividends[t] = {}
+        from pm.core.bloomberg_client import fetch_projected_dividends
+        projected_dividends = fetch_projected_dividends(sorted(tickers))
     except Exception as exc:
-        logger.warning("Insight prefetch: projected dividend fetch wrapper failed: %s", exc)
+        logger.warning("Insight prefetch: projected dividends fetch failed: %s", exc)
+        projected_dividends = {t: {} for t in tickers}
 
     return iv_histories, analyst_data, analyst_note_dates, projected_dividends
 

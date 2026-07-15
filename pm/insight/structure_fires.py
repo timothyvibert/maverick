@@ -170,7 +170,7 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                      f"based on {rate_phrase}). Carry favours early assignment — "
                      f"plan to roll down/out or accept the stock rather than rely on time decay."),
                     _trace({"spot": {"value": spot, "source": "BBG:PX_LAST"},
-                            "put_mark": {"value": mark, "source": "computed:|MV|/(qty×100)"},
+                            "put_mark": {"value": mark, "source": "computed:|MV|/(qty×multiplier)"},
                             "strike": {"value": strike, "source": "EXTRACT:option_strike"},
                             "extrinsic": {"value": round(extrinsic, 2), "source": "computed:mark−intrinsic"},
                             "carry": {"value": round(carry, 2), "source": "computed:strike×r×t"},
@@ -251,7 +251,7 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                      f"rolling it down to lock the hedge gain rather than carrying a near-zero-extrinsic "
                      f"insurance leg to expiry."),
                     _trace({"spot": {"value": spot, "source": "BBG:PX_LAST"},
-                            "put_mark": {"value": mark, "source": "computed:|MV|/(qty×100)"},
+                            "put_mark": {"value": mark, "source": "computed:|MV|/(qty×multiplier)"},
                             "put_strike": {"value": strike, "source": "EXTRACT:option_strike"},
                             "intrinsic": {"value": round(intrinsic, 2), "source": "computed:strike−spot"},
                             "extrinsic": {"value": round(extrinsic, 2), "source": "computed:mark−intrinsic"}},

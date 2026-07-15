@@ -8,9 +8,11 @@ only the headline). All are dense ``html.Table``s — not a second AG-Grid —
 matching the signal-sheet / trace design language. Restore here uses the *same*
 ``state_access.restore_alert`` as the modal's Muted footer; there is no second
 mechanism. The Thresholds tab edits the persisted overrides via ``settings_store``
-and applies them with a persist-then-reload (write the override, re-run the engine
-on the current book) — a deliberate reload, not a UI-layer recompute. See
-``pm/insight/threshold_catalog.py`` for the dials.
+and applies them with a persist-then-recompute (write the override, then
+``state_access.recompute_thresholds`` re-derives the alert set over the
+already-loaded book — engine + structure fires + suppression marking, no
+Bloomberg call, no extract re-read). The recompute lives in the single state
+owner, not the UI layer. See ``pm/insight/threshold_catalog.py`` for the dials.
 
 Days-active (today − created_at) is the deliberate staleness cue; a muted alert
 whose condition moves materially is re-surfaced by the load-path material-change
@@ -131,7 +133,7 @@ def render_thresholds_tab() -> html.Div:
     """The editable alert-sensitivity dials, grouped by pattern. Each row seeds
     its input from the persisted override (if any) else the PatternConfig default; the
     Default column always shows the default so 'set vs default' is legible. Apply persists
-    the dirty rows and re-runs the engine (persist-then-reload); Reset clears an override.
+    the dirty rows and re-runs the engine (persist-then-recompute); Reset clears an override.
 
     Pure read — ``settings_store.get_overrides`` never materializes the DB when nothing is
     persisted yet, so opening the tab on a clean store is side-effect-free."""

@@ -180,7 +180,68 @@ def build_positions(extract: PortfolioExtract) -> list[Position]:
 
         positions.append(position)
 
-    return positions
+    return _consolidate_duplicate_ids(positions, warnings)
+
+
+def _consolidate_duplicate_ids(positions: list[Position],
+                               warnings: list[str]) -> list[Position]:
+    """Merge Holdings rows that collide on ``(account, position_id)`` — the
+    multi-lot shape (two tax-lot rows for one ticker or one option contract).
+
+    Every keyed consumer downstream (AG-Grid rowIds, ``by_id`` position maps,
+    the structure-allocation ledger, per-position greeks) assumes the key is
+    unique; a collision silently drops one lot from those maps while detection
+    sums the quantities — inflating slice economics against a half-sized
+    position. Consolidating at ingest makes the invariant true by
+    construction: quantities, market values, cost bases and P&L sum; the P&L
+    percent is recomputed from the sums; identity/contract fields and the
+    trade-history join (both lots join the same contract history) come from
+    the first lot. Cash/other rows never reach here — they are de-collided
+    with a per-account suffix at build time.
+
+    Emits one warning per merged key naming the lot count, so a multi-lot
+    extract is visible in the load notes rather than silently reshaped.
+    """
+    by_key: dict[tuple[str, str], Position] = {}
+    lots: dict[tuple[str, str], int] = {}
+    out: list[Position] = []
+    for p in positions:
+        key = (p.account, p.position_id)
+        first = by_key.get(key)
+        if first is None:
+            by_key[key] = p
+            lots[key] = 1
+            out.append(p)
+            continue
+        lots[key] += 1
+        for field_name in ("quantity", "market_value", "cost_basis", "unrealized_pnl"):
+            a = getattr(first, field_name)
+            b = getattr(p, field_name)
+            # Sum when both lots carry the value; a lot with the value missing
+            # makes the merged value honestly unknown (None), never a half-sum
+            # presented as a whole. market_value is builder-defaulted to 0.0,
+            # so it always sums.
+            setattr(first, field_name,
+                    (a + b) if (a is not None and b is not None) else None)
+        pnl, cb = first.unrealized_pnl, first.cost_basis
+        # The extract quotes the percent as a fraction of |cost basis|
+        # (verified against the live sample: pct == pnl / |cb|, no x100).
+        first.unrealized_pnl_pct = (
+            pnl / abs(cb) if (pnl is not None and cb) else None)
+        first.pct_pnl = first.unrealized_pnl_pct
+
+    for key, n in lots.items():
+        if n > 1:
+            account, pid = key
+            merged = by_key[key]
+            qty = merged.quantity
+            warnings.append(
+                f"Holdings: {n} rows for {account}/{pid} (multi-lot extract) "
+                f"consolidated into one position"
+                + (f" of {qty:g}" if qty is not None else "")
+                + "; quantities, market value, cost basis and P&L summed."
+            )
+    return out
 
 
 # ---------------------------------------------------------------------------

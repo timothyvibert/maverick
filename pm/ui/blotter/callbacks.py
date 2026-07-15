@@ -526,12 +526,15 @@ def register_callbacks(app: dash.Dash) -> None:
         dd_rows = _dd_grid_rows(state, dd_account, pos_view, expanded)
         return body, blotter_rows, dd_rows
 
-    # ---- Thresholds tab: edit dials -> persist -> reload -> re-paint --
+    # ---- Thresholds tab: edit dials -> persist -> recompute -> re-paint --
     # Apply / Reset all / per-row Reset all flow through one callback. Each MUTATES the
-    # persisted overrides (settings_store) then re-runs the engine on the current book via
-    # reload_state — the persist-then-reload apply path. This is a deliberate reload (the
-    # same route the Refresh buttons use), NOT a UI-layer recompute: changing a threshold
-    # changes which fires the engine PRODUCES, so it cannot be applied by re-marking.
+    # persisted overrides (settings_store) then re-derives the alert set over the
+    # already-loaded book via state_access.recompute_thresholds — the persist-then-
+    # recompute apply path. The recompute happens in the single state owner (engine +
+    # structure fires + suppression marking re-run over loaded data), NOT in the UI
+    # layer, and it makes no Bloomberg call: a dial edit changes which fires the engine
+    # PRODUCES, not the market data they read — so the old full-reload route (a complete
+    # BBG re-pull per dial change) is reserved for the no-state-loaded fallback.
     # Outputs target only always-present components (the manager body/tabs, the status
     # host, the blotter store, the deep-dive refresh tick, the load sentinel). The
     # deep-dive grid is NOT written directly: dcc.Tabs only mounts the active tab, so on
@@ -586,9 +589,13 @@ def register_callbacks(app: dash.Dash) -> None:
         else:
             return noop
 
-        # Persist-then-reload: re-evaluate the current book under the new thresholds.
+        # Persist-then-recompute: re-evaluate the current book under the new
+        # thresholds over already-loaded state (no Bloomberg). Only when nothing
+        # is loaded yet does Apply fall back to the full reload route.
         try:
-            new_state = sa.reload_state(reuse_extract=True)
+            new_state = sa.recompute_thresholds()
+            if new_state is None:
+                new_state = sa.reload_state(reuse_extract=True)
         except Exception as exc:
             return (no_update, no_update, no_update, no_update,
                     html.Div(f"Apply failed: {exc}", className="status-left status-empty"),
@@ -646,6 +653,14 @@ def register_callbacks(app: dash.Dash) -> None:
         State("deepdive-account-picker", "value"),
         State("deepdive-refresh-tick", "data"),
         prevent_initial_call=True,
+        # Both Refresh buttons are disabled for the duration of a load — the
+        # visible in-flight cue beside the spinner, and the first line of
+        # defense against a double-clicked refresh (the state owner's reload
+        # serialization is the backstop for requests that still overlap).
+        running=[
+            (Output("refresh-button", "disabled"), True, False),
+            (Output("refresh-acct-button", "disabled"), True, False),
+        ],
     )
     def _load_or_refresh(_n_intervals, _n_clicks_bbg, _n_clicks_acct, picker_value, tick):
         # Refresh BBG re-pulls market data on the current extract; Refresh Acct Data

@@ -53,28 +53,6 @@ def _load() -> dict:
     return out
 
 
-def _save(data: dict) -> None:
-    """Persist the full resolution mapping, replacing the table contents in one
-    transaction. The mapping is tiny — one row per resolved structure — so a wholesale
-    rewrite keeps the public functions' read-modify-write shape exactly as before."""
-    with db.connection() as conn:
-        conn.execute("DELETE FROM structure_resolutions")
-        conn.executemany(
-            "INSERT INTO structure_resolutions"
-            "(key, resolution, chosen_type, edited_legs, timestamp) VALUES (?, ?, ?, ?, ?)",
-            [
-                (
-                    key,
-                    rec.get("resolution"),
-                    rec.get("chosen_type"),
-                    json.dumps(rec["edited_legs"]) if rec.get("edited_legs") is not None else None,
-                    rec.get("timestamp"),
-                )
-                for key, rec in data.items()
-            ],
-        )
-
-
 # ---------------------------------------------------------------------------
 # Public write/read interface
 # ---------------------------------------------------------------------------
@@ -82,14 +60,30 @@ def save_resolution(account: str, leg_pids, resolution: str,
                     chosen_type: Optional[str] = None,
                     edited_legs: Optional[list] = None,
                     now: Optional[datetime] = None) -> None:
-    data = _load()
-    data[_key(account, leg_pids)] = {
-        "resolution": resolution,            # confirmed | rejected | edited
-        "chosen_type": chosen_type,          # for a contention choice: the picked reading
-        "edited_legs": edited_legs,          # for an edit: the kept leg position_ids
-        "timestamp": (now or datetime.now(timezone.utc)).isoformat(),
-    }
-    _save(data)
+    """Upsert ONE resolution row, keyed on (account, sorted leg-set).
+
+    A single keyed write, not a load-the-mapping / rewrite-the-table cycle:
+    the old wholesale DELETE + reinsert let two overlapping resolutions clobber
+    each other (the later writer re-inserted the mapping it loaded before the
+    earlier one committed — a lost update). The per-row upsert makes each
+    resolution independent, matching the sibling stores' write shape."""
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO structure_resolutions"
+            "(key, resolution, chosen_type, edited_legs, timestamp) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET"
+            " resolution = excluded.resolution,"
+            " chosen_type = excluded.chosen_type,"
+            " edited_legs = excluded.edited_legs,"
+            " timestamp = excluded.timestamp",
+            (
+                _key(account, leg_pids),
+                resolution,                  # confirmed | rejected | edited
+                chosen_type,                 # for a contention choice: the picked reading
+                json.dumps(edited_legs) if edited_legs is not None else None,
+                (now or datetime.now(timezone.utc)).isoformat(),
+            ),
+        )
 
 
 def get_resolution(account: str, leg_pids) -> Optional[dict]:
@@ -101,13 +95,14 @@ def all_resolutions() -> dict:
 
 
 def clear_resolution(account: str, leg_pids) -> None:
-    data = _load()
-    data.pop(_key(account, leg_pids), None)
-    _save(data)
+    with db.connection() as conn:
+        conn.execute("DELETE FROM structure_resolutions WHERE key = ?",
+                     (_key(account, leg_pids),))
 
 
 def clear_all() -> None:
-    _save({})
+    with db.connection() as conn:
+        conn.execute("DELETE FROM structure_resolutions")
 
 
 # ---------------------------------------------------------------------------
