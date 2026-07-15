@@ -418,19 +418,26 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
     vs naked is already resolved in generation), so v1 does not read it."""
     state = sa.get_state()
     pos = sa.position_by_id(state, account, position_id) if state else None
+    # Expand exists only for option rolls: it widens the slice by one expiry
+    # around the HELD contract, and the slice cache is keyed by that window. An
+    # overlay scan (held stock) is spot-anchored at a fixed near-dated window —
+    # its caches ignore the window entirely, so an Expand there used to force a
+    # Bloomberg re-snapshot that returned identical data. No window, no button.
+    head_btns = ([html.Button("Expand ▸", id="scanner-expand", n_clicks=0,
+                              className="scanner-refresh-btn",
+                              title="Pull one more expiry into the slice — bounded, reuses the "
+                                    "enumerated chain (no full-chain pull).")]
+                 if getattr(pos, "asset_class", None) == "option" else []) + [
+        html.Button("Refresh", id="scanner-refresh", n_clicks=0, className="scanner-refresh-btn",
+                    title="Re-pull this name's chain slice and re-rank."),
+    ]
     return html.Div(className="drawer-content scanner-content", children=[
         html.Div(className="scanner-head", children=[
             html.Div(className="scanner-head-left", children=[
                 html.Div(_identity(pos), className="scanner-identity"),
                 html.Span("scanning…", id="scanner-stamp", className="scanner-stamp"),
             ]),
-            html.Div(className="scanner-head-btns", children=[
-                html.Button("Expand ▸", id="scanner-expand", n_clicks=0, className="scanner-refresh-btn",
-                            title="Pull one more expiry into the slice — bounded, reuses the "
-                                  "enumerated chain (no full-chain pull)."),
-                html.Button("Refresh", id="scanner-refresh", n_clicks=0, className="scanner-refresh-btn",
-                            title="Re-pull this name's chain slice and re-rank."),
-            ]),
+            html.Div(className="scanner-head-btns", children=head_btns),
         ]),
         html.Div(id="scanner-pills", className="scanner-pills"),
         # Vol smile over the cached slice — a selectable expiry, the fitted line, and a
@@ -599,7 +606,10 @@ def register_scanner_callbacks(app) -> None:
             return (no_update,) * 6
         return v["stamp"], v["table"], v["pills"], v["smile"], v["exp_opts"], v["exp_val"]
 
-    # Expand → widen the slice by one expiry (bounded), re-pull, and re-fill everything.
+    # Expand → widen the slice by one expiry (bounded), re-pull, and re-fill
+    # everything. Option rolls only — the button is not rendered for overlay
+    # scans (their spot-anchored slice ignores the window; see render_scanner),
+    # and the guard below covers a stale layout that still carries it.
     @app.callback(
         Output("scanner-window", "data"),
         Output("scanner-stamp", "children", allow_duplicate=True),
@@ -618,6 +628,10 @@ def register_scanner_callbacks(app) -> None:
         nop = (no_update,) * 7
         if not ds or ds.get("view") != "scanner" or not n:
             return nop
+        state = sa.get_state()
+        pos = sa.position_by_id(state, ds.get("account"), ds.get("position_id")) if state else None
+        if getattr(pos, "asset_class", None) != "option":
+            return nop      # no held-expiry window to widen on an overlay scan
         wider = min((window or _BASE_EXPIRIES) + 1, _MAX_EXPIRIES)
         if wider == (window or _BASE_EXPIRIES):
             return nop                      # already at the ceiling
