@@ -11,6 +11,7 @@ canonical instance for both the entry point and every callback.
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -88,6 +89,21 @@ POSITION_GROUP = GROUP_E
 
 _RUNTIME: dict = {"state": None, "active_account": None}
 
+# The server is threaded (app.run(threaded=True)) with zero framework-level
+# serialization, so the owner provides its own:
+#   _RELOAD_LOCK serializes the full-load route. A caller that arrives while a
+#   load is in flight (a double-clicked Refresh) queues on the lock and, once
+#   through, sees the sequence number moved and returns the fresh state instead
+#   of starting a second multi-second Bloomberg pull.
+#   _WRITE_LOCK serializes the fast sanctioned write paths (resolve_structure,
+#   suppress_alert / restore_alert, recompute_thresholds) against each other so
+#   two overlapping writes cannot interleave their state mutations. It is never
+#   held across a Bloomberg call, so it cannot stall the UI.
+# The two locks never nest.
+_RELOAD_LOCK = threading.Lock()
+_WRITE_LOCK = threading.Lock()
+_RELOAD_SEQ = 0   # bumped after each completed load; lets a queued caller see one finished while it waited
+
 
 def get_state() -> Optional[PortfolioState]:
     """Return the current global PortfolioState, or None if not loaded."""
@@ -107,13 +123,28 @@ def reload_state(reuse_extract: bool = False) -> Optional[PortfolioState]:
     """Refresh the global PortfolioState in place. Returns the new state.
 
     ``reuse_extract``: re-enrich the current extract file ("Refresh BBG"); when
-    False, read the latest extract in the data dir ("Refresh Acct Data" / first load)."""
+    False, read the latest extract in the data dir ("Refresh Acct Data" / first load).
+
+    Serialized: one full load runs at a time. A caller that arrives while a
+    load is in flight waits for it and returns THAT load's state rather than
+    starting a second Bloomberg pull — so a double-clicked Refresh costs one
+    load, not two. (A cross-button race — e.g. Refresh Acct Data queued behind
+    an in-flight Refresh BBG — also coalesces into the in-flight load; clicking
+    again once it completes runs the intended route.)"""
+    global _RELOAD_SEQ
     from pm.config import EXTRACT_DATA_DIR
     from pm.store.portfolio_state import refresh_portfolio_state
-    prev = _RUNTIME.get("state")
-    new_state = refresh_portfolio_state(prev, EXTRACT_DATA_DIR, reuse_extract=reuse_extract)
-    _RUNTIME["state"] = new_state
-    return new_state
+    seq_at_entry = _RELOAD_SEQ
+    with _RELOAD_LOCK:
+        if _RELOAD_SEQ != seq_at_entry:
+            # A concurrent reload completed while this caller waited on the
+            # lock; its freshly-built state answers this request too.
+            return _RUNTIME.get("state")
+        prev = _RUNTIME.get("state")
+        new_state = refresh_portfolio_state(prev, EXTRACT_DATA_DIR, reuse_extract=reuse_extract)
+        _RUNTIME["state"] = new_state
+        _RELOAD_SEQ += 1
+        return new_state
 
 
 def recompute_thresholds() -> Optional[PortfolioState]:
@@ -130,7 +161,8 @@ def recompute_thresholds() -> Optional[PortfolioState]:
     if state is None:
         return None
     from pm.store.portfolio_state import reapply_thresholds
-    return reapply_thresholds(state)
+    with _WRITE_LOCK:
+        return reapply_thresholds(state)
 
 
 def price_scenario(
@@ -754,32 +786,36 @@ def resolve_structure(
     state = _RUNTIME.get("state")
     if state is None:
         return False
-    acc = state.accounts.get(account)
-    if acc is None:
-        return False
-    target = next((s for s in acc.structures if s.structure_id == structure_id), None)
-    if target is None:
-        return False
-    if chosen_type is None and resolution == structure_store.CONFIRMED:
-        chosen_type = target.type  # the confirmed/chosen reading's type
-    leg_pids = structure_store.decision_leg_pids(acc.structures, target)
-    structure_store.save_resolution(
-        account, leg_pids, resolution, chosen_type=chosen_type, edited_legs=edited_legs)
-    structure_store.apply_resolutions(account, acc.structures)
-    # Swap in the affected structure's fires by structure_id: drop its prior fires,
-    # then append the freshly re-derived set. Unified across confirm and reject — a
-    # reject re-derives too, so the structure's non-confirmation-gated fires survive
-    # exactly as a full reload would produce them while the gated ones drop. Then
-    # rebuild leg-context annotations from each fire's clean base (idempotent).
-    acc.fires = [f for f in acc.fires if f.structure_id != structure_id]
-    acc.fires.extend(rederive_structure_fires(state, acc, target))
-    attach_structure_context(acc)
-    # Re-mark this account's fires so a just-confirmed fire that matches an
-    # active suppression is muted without a reload — same marking logic as the load
-    # path, reading only the persisted suppressions (no recompute).
-    from pm.store import suppression_store
-    suppression_store.remark_account(acc)
-    return True
+    with _WRITE_LOCK:
+        acc = state.accounts.get(account)
+        if acc is None:
+            return False
+        target = next((s for s in acc.structures if s.structure_id == structure_id), None)
+        if target is None:
+            return False
+        if chosen_type is None and resolution == structure_store.CONFIRMED:
+            chosen_type = target.type  # the confirmed/chosen reading's type
+        leg_pids = structure_store.decision_leg_pids(acc.structures, target)
+        structure_store.save_resolution(
+            account, leg_pids, resolution, chosen_type=chosen_type, edited_legs=edited_legs)
+        structure_store.apply_resolutions(account, acc.structures)
+        # Swap in the affected structure's fires by structure_id: drop its prior fires,
+        # then append the freshly re-derived set. Unified across confirm and reject — a
+        # reject re-derives too, so the structure's non-confirmation-gated fires survive
+        # exactly as a full reload would produce them while the gated ones drop. Then
+        # rebuild leg-context annotations from each fire's clean base (idempotent).
+        # Built off to the side and assigned once, so a concurrent render never
+        # sees the list mid-rebuild.
+        fires = [f for f in acc.fires if f.structure_id != structure_id]
+        fires.extend(rederive_structure_fires(state, acc, target))
+        acc.fires = fires
+        attach_structure_context(acc)
+        # Re-mark this account's fires so a just-confirmed fire that matches an
+        # active suppression is muted without a reload — same marking logic as the load
+        # path, reading only the persisted suppressions (no recompute).
+        from pm.store import suppression_store
+        suppression_store.remark_account(acc)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -800,32 +836,34 @@ def suppress_alert(account: str, name: str, pattern_id: str, *,
     only). Re-marks the account so the muted fire drops from the active surfaces at
     once. Returns True on success."""
     from pm.store import suppression_store
-    suppression_store.suppress(account, name, pattern_id,
-                               suppressed_until=suppressed_until,
-                               trace=trace, rationale=rationale)
-    state = _RUNTIME.get("state")
-    if state is None:
-        return False
-    acc = state.accounts.get(account)
-    if acc is None:
-        return False
-    suppression_store.remark_account(acc)
-    return True
+    with _WRITE_LOCK:
+        suppression_store.suppress(account, name, pattern_id,
+                                   suppressed_until=suppressed_until,
+                                   trace=trace, rationale=rationale)
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        acc = state.accounts.get(account)
+        if acc is None:
+            return False
+        suppression_store.remark_account(acc)
+        return True
 
 
 def restore_alert(account: str, name: str, pattern_id: str) -> bool:
     """Remove the suppression and re-mark the account so the alert returns to the
     active surfaces without a reload. Returns True on success."""
     from pm.store import suppression_store
-    suppression_store.restore(account, name, pattern_id)
-    state = _RUNTIME.get("state")
-    if state is None:
-        return False
-    acc = state.accounts.get(account)
-    if acc is None:
-        return False
-    suppression_store.remark_account(acc)
-    return True
+    with _WRITE_LOCK:
+        suppression_store.restore(account, name, pattern_id)
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        acc = state.accounts.get(account)
+        if acc is None:
+            return False
+        suppression_store.remark_account(acc)
+        return True
 
 
 # ---------------------------------------------------------------------------

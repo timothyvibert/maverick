@@ -182,6 +182,10 @@ def connection() -> Iterator[sqlite3.Connection]:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH))
     try:
+        # Wait briefly on a concurrently-held file lock instead of raising
+        # 'database is locked' — the app server is threaded and two write
+        # paths can now legitimately overlap at the SQLite layer.
+        conn.execute("PRAGMA busy_timeout = 5000")
         _ensure_schema(conn)
         _maybe_import_legacy_resolutions(conn)
         yield conn

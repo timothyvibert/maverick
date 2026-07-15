@@ -26,7 +26,12 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
     (state is None) this shows a neutral 'Loading…' line; the async load
     swaps in the populated line when it completes."""
     if state is None:
-        return html.Div("Loading portfolio…", className="status-left status-empty")
+        # Cold start: name what is actually happening and how long it takes, so
+        # a multi-second Bloomberg pull reads as progress, not a hung app.
+        return html.Div(
+            "Loading — reading the latest extract and pulling Bloomberg market "
+            "data (typically well under a minute)…",
+            className="status-left status-empty")
 
     # Active alerts only: a suppressed/snoozed fire is excluded from every
     # headline count, so muting an alert drops the strip's totals exactly as it drops

@@ -653,6 +653,14 @@ def register_callbacks(app: dash.Dash) -> None:
         State("deepdive-account-picker", "value"),
         State("deepdive-refresh-tick", "data"),
         prevent_initial_call=True,
+        # Both Refresh buttons are disabled for the duration of a load — the
+        # visible in-flight cue beside the spinner, and the first line of
+        # defense against a double-clicked refresh (the state owner's reload
+        # serialization is the backstop for requests that still overlap).
+        running=[
+            (Output("refresh-button", "disabled"), True, False),
+            (Output("refresh-acct-button", "disabled"), True, False),
+        ],
     )
     def _load_or_refresh(_n_intervals, _n_clicks_bbg, _n_clicks_acct, picker_value, tick):
         # Refresh BBG re-pulls market data on the current extract; Refresh Acct Data
