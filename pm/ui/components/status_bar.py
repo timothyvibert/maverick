@@ -27,11 +27,19 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
     swaps in the populated line when it completes."""
     if state is None:
         # Cold start: name what is actually happening and how long it takes, so
-        # a multi-second Bloomberg pull reads as progress, not a hung app.
-        return html.Div(
-            "Loading — reading the latest extract and pulling Bloomberg market "
-            "data (typically well under a minute)…",
-            className="status-left status-empty")
+        # a multi-second Bloomberg pull reads as progress, not a hung app. The
+        # two click-target chips ride along hidden so their callback Inputs
+        # resolve even before the first load (see the nonexistent-Input note
+        # below).
+        return html.Div([
+            html.Span(
+                "Loading — reading the latest extract and pulling Bloomberg market "
+                "data (typically well under a minute)…"),
+            html.Button("", id="status-muted-patterns-btn", n_clicks=0,
+                        style={"display": "none"}),
+            html.Button("", id="status-load-notes-btn", n_clicks=0,
+                        style={"display": "none"}),
+        ], className="status-left status-empty")
 
     # Active alerts only: a suppressed/snoozed fire is excluded from every
     # headline count, so muting an alert drops the strip's totals exactly as it drops
@@ -68,6 +76,28 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
                   className="status-item status-muted", id="status-refreshed"),
     ]
 
+    # Pattern-toggle honesty cue: alerts hidden by a persisted per-pattern
+    # off-switch are counted here, never silently dropped. The chip is a click
+    # target opening the Alert Manager's Patterns tab (where each pattern shows
+    # its own muted count and can be turned back on). ALWAYS rendered (hidden
+    # when nothing is off): the open callback takes it as an Input, and a Dash
+    # Input whose component is absent from the layout kills the whole callback
+    # client-side — the component must exist even when it has nothing to say.
+    from pm.store.alert_governance import disabled_fire_counts, disabled_patterns
+    disabled = disabled_patterns()
+    counts = disabled_fire_counts(state) if disabled else {}
+    n_hidden = sum(counts.values())
+    label = (f"{len(disabled)} pattern{'s' if len(disabled) != 1 else ''} off"
+             + (f" · {n_hidden} muted" if n_hidden else "")) if disabled else ""
+    detail = ", ".join(f"{counts.get(p, 0)} muted {p}" for p in sorted(disabled))
+    items.append(html.Button(
+        label, id="status-muted-patterns-btn", n_clicks=0,
+        className="status-item status-muted-patterns",
+        style=({} if disabled else {"display": "none"}),
+        title=(f"{detail}\n\nClick to review or turn patterns back on."
+               if disabled else ""),
+    ))
+
     # Load-time notes (header aliasing, missing/optional columns, skipped rows,
     # market-data + insight warnings). Pure read of state.all_warnings. Urgent
     # notes (the ⚠ prefix — unresolved names with MV, missing load-bearing
@@ -75,10 +105,13 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
     # behind a truncated lead; the whole cluster is a click target that opens
     # the Alert Manager's Load notes tab, where the full list is readable and
     # copyable (the hover title stays as a convenience, not the only access).
+    # ALWAYS rendered, hidden when the load was clean — the open callback takes
+    # it as an Input, and an absent Input component kills the callback (the
+    # same nonexistent-Input hazard the muted-patterns chip hit).
     notes = list(getattr(state, "all_warnings", []) or [])
+    chips: list = []
     if notes:
         urgent = [n for n in notes if n.lstrip().startswith(URGENT_FLAG)]
-        chips: list = []
         shown = 0
         for u in urgent[:_MAX_URGENT_CHIPS]:
             chips.append(html.Span(u, className="status-load-note-chip status-load-urgent"))
@@ -89,10 +122,11 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
         extra = len(notes) - shown
         if extra > 0:
             chips.append(html.Span(f"+{extra} more", className="status-load-more"))
-        items.append(html.Button(
-            chips, id="status-load-notes-btn", n_clicks=0,
-            className="status-item status-load-notes",
-            title="\n".join(notes) + "\n\nClick to open the full, copyable list.",
-        ))
+    items.append(html.Button(
+        chips, id="status-load-notes-btn", n_clicks=0,
+        className="status-item status-load-notes",
+        style=({} if notes else {"display": "none"}),
+        title=("\n".join(notes) + "\n\nClick to open the full, copyable list.") if notes else "",
+    ))
 
     return html.Div(items, className="status-left")

@@ -850,12 +850,16 @@ def suppress_alert(account: str, name: str, pattern_id: str, *,
         return True
 
 
-def restore_alert(account: str, name: str, pattern_id: str) -> bool:
-    """Remove the suppression and re-mark the account so the alert returns to the
-    active surfaces without a reload. Returns True on success."""
-    from pm.store import suppression_store
+def restore_alert(account: str, name: str, pattern_id: str,
+                  fire_key: Optional[str] = None) -> bool:
+    """Remove the suppression — and, when ``fire_key`` is given, any per-fire
+    acknowledgement under the same key — then re-mark the account so the alert
+    returns to the active surfaces without a reload. Returns True on success."""
+    from pm.store import alert_governance, suppression_store
     with _WRITE_LOCK:
         suppression_store.restore(account, name, pattern_id)
+        if fire_key:
+            alert_governance.unacknowledge(account, pattern_id, fire_key)
         state = _RUNTIME.get("state")
         if state is None:
             return False
@@ -863,6 +867,64 @@ def restore_alert(account: str, name: str, pattern_id: str) -> bool:
         if acc is None:
             return False
         suppression_store.remark_account(acc)
+        return True
+
+
+def acknowledge_alert(account: str, position_id: str, pattern_id: str) -> bool:
+    """Acknowledge ONE fire — the per-fire quiet path (distinct from muting the
+    whole pattern on the name). Persists the ack keyed by the fire's
+    structure_id-or-position_id with the fire's trace as the material-change
+    baseline, then re-marks the account in place. A sanctioned write path under
+    the write lock; no reload, no recompute. Returns True on success."""
+    from pm.store import alert_governance, suppression_store
+    with _WRITE_LOCK:
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        acc = state.accounts.get(account)
+        if acc is None:
+            return False
+        fire = next((f for f in acc.fires
+                     if f.position_id == position_id and f.pattern_id == pattern_id), None)
+        if fire is None:
+            return False
+        alert_governance.acknowledge(
+            account, pattern_id, alert_governance.fire_key(fire),
+            trace=fire.trace, rationale=fire.rationale)
+        suppression_store.remark_account(acc)
+        return True
+
+
+def unacknowledge_alert(account: str, pattern_id: str, fire_key: str) -> bool:
+    """Remove one acknowledgement and re-mark the account (the Alert Manager's
+    per-ack Restore). Returns True on success."""
+    from pm.store import alert_governance, suppression_store
+    with _WRITE_LOCK:
+        alert_governance.unacknowledge(account, pattern_id, fire_key)
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        acc = state.accounts.get(account)
+        if acc is None:
+            return False
+        suppression_store.remark_account(acc)
+        return True
+
+
+def set_pattern_enabled(pattern_id: str, enabled: bool) -> bool:
+    """Flip one pattern's persisted on/off toggle and re-mark EVERY account in
+    place — collapse-to-muted, never drop: a toggled-off pattern's fires stay on
+    ``acc.fires`` marked ``disabled`` (counted and recoverable), and toggling
+    back on restores them with no reload and no recompute. A sanctioned write
+    path under the write lock. Returns True on success."""
+    from pm.store import alert_governance, suppression_store
+    with _WRITE_LOCK:
+        alert_governance.set_pattern_enabled(pattern_id, enabled)
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        for acc in state.accounts.values():
+            suppression_store.remark_account(acc)
         return True
 
 

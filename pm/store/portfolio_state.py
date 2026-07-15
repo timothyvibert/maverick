@@ -317,6 +317,15 @@ def load_portfolio_state(
     from pm.store.suppression_store import apply_material_change
     apply_material_change(state)
 
+    # Alert governance, in order: per-fire acknowledgements (with their own
+    # material-change net), then per-pattern disables LAST — an explicit
+    # off-switch is final and overrides even a re-surfaced mark. Both are
+    # marking passes over already-computed fires: nothing is dropped from
+    # acc.fires, so flipping a toggle back restores the alerts in place.
+    from pm.store.alert_governance import apply_acknowledgements, apply_pattern_disables
+    apply_acknowledgements(state)
+    apply_pattern_disables(state)
+
     return state
 
 
@@ -349,6 +358,7 @@ def reapply_thresholds(state: PortfolioState) -> PortfolioState:
     """
     from pm.insight.engine import run_insight_engine
     from pm.insight.structure_fires import run_structure_fires
+    from pm.store.alert_governance import apply_acknowledgements, apply_pattern_disables
     from pm.store.settings_store import build_pattern_config
     from pm.store.suppression_store import apply_material_change, apply_suppressions
 
@@ -356,6 +366,8 @@ def reapply_thresholds(state: PortfolioState) -> PortfolioState:
     run_structure_fires(state)
     apply_suppressions(state)
     apply_material_change(state)
+    apply_acknowledgements(state)
+    apply_pattern_disables(state)
     return state
 
 

@@ -47,11 +47,18 @@ def _ctl_id(kind: str, fire: Fire) -> dict:
 
 
 def _alert_controls(fire: Fire) -> html.Div:
-    """The discrete Mute + Snooze▾ cluster for one active alert, right-aligned in the
-    header next to the tier badge. Muting/snoozing is scoped to this pattern on this
-    name only — every other alert keeps firing."""
+    """The discrete Acknowledge + Mute + Snooze▾ cluster for one active alert,
+    right-aligned in the header next to the tier badge. Acknowledge sets aside
+    THIS one fire (it comes back by itself if its condition moves materially);
+    muting/snoozing is scoped to this pattern on this name — every other alert
+    keeps firing."""
     scope = f"{fire.pattern_name} on {fire.underlying}"
     return html.Div(className="alert-actions", children=[
+        html.Button("Acknowledge", id=_ctl_id("sup-ack", fire), n_clicks=0,
+                    className="alert-action-btn alert-ack-btn",
+                    title=f"Set aside this ONE alert (reviewed, no action needed now). "
+                          f"Unlike Mute it is per-position and it re-surfaces on its own "
+                          f"if the condition moves materially."),
         html.Button("Mute", id=_ctl_id("sup-mute", fire), n_clicks=0,
                     className="alert-action-btn alert-mute-btn",
                     title=f"Mute {scope} — permanently, until you restore it. "
@@ -97,6 +104,10 @@ def _muted_state_text(fire: Fire) -> str:
     sup = fire.suppression
     if sup is not None and sup.kind == "snoozed" and sup.until:
         return f"Snoozed until {sup.until}"
+    if sup is not None and sup.kind == "acknowledged":
+        return "Acknowledged"
+    if sup is not None and sup.kind == "disabled":
+        return "Pattern off (Alert Manager)"
     return "Suppressed"
 
 

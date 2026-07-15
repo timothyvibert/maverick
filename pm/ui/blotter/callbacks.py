@@ -383,6 +383,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("deepdive-positions-grid", "rowData", allow_duplicate=True),
         Input({"type": "sup-mute", "account": ALL, "pid": ALL, "pat": ALL}, "n_clicks"),
         Input({"type": "sup-restore", "account": ALL, "pid": ALL, "pat": ALL}, "n_clicks"),
+        Input({"type": "sup-ack", "account": ALL, "pid": ALL, "pat": ALL}, "n_clicks"),
         Input({"type": "sup-snooze", "account": ALL, "pid": ALL, "pat": ALL}, "value"),
         Input({"type": "sup-date", "account": ALL, "pid": ALL, "pat": ALL}, "date"),
         State("drawer-state", "data"),
@@ -391,7 +392,7 @@ def register_callbacks(app: dash.Dash) -> None:
         State("struct-expanded", "data"),
         prevent_initial_call=True,
     )
-    def _on_suppress_action(_m, _r, _snz, _dt, drawer_state, dd_account, pos_view, expanded):
+    def _on_suppress_action(_m, _r, _a, _snz, _dt, drawer_state, dd_account, pos_view, expanded):
         trig = ctx.triggered_id
         state = sa.get_state()
         if not isinstance(trig, dict) or state is None:
@@ -413,7 +414,13 @@ def register_callbacks(app: dash.Dash) -> None:
         if ttype == "sup-mute":
             sa.suppress_alert(account, name, pat, trace=fire.trace, rationale=fire.rationale)
         elif ttype == "sup-restore":
-            sa.restore_alert(account, name, pat)
+            # Restore clears the name-wide suppression AND this fire's per-fire
+            # acknowledgement (either may be holding it inactive; both are no-ops
+            # when absent).
+            from pm.store.alert_governance import fire_key
+            sa.restore_alert(account, name, pat, fire_key=fire_key(fire))
+        elif ttype == "sup-ack":
+            sa.acknowledge_alert(account, pid, pat)
         elif ttype == "sup-snooze":
             if trigval == "pick":               # reveal handled by _reveal_snooze_date
                 return no_update, no_update, no_update
@@ -456,6 +463,7 @@ def register_callbacks(app: dash.Dash) -> None:
 
     def _am_tab_classes(tab):
         return ("view-toggle-btn" + (" view-toggle-btn-active" if tab == "suppressed" else ""),
+                "view-toggle-btn" + (" view-toggle-btn-active" if tab == "patterns" else ""),
                 "view-toggle-btn" + (" view-toggle-btn-active" if tab == "thresholds" else ""),
                 "view-toggle-btn" + (" view-toggle-btn-active" if tab == "loadnotes" else ""))
 
@@ -463,20 +471,23 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("alert-manager-root", "className"),
         Output("alert-manager-body", "children"),
         Output("am-tab-suppressed", "className"),
+        Output("am-tab-patterns", "className"),
         Output("am-tab-thresholds", "className"),
         Output("am-tab-loadnotes", "className"),
         Input("alert-manager-open-btn", "n_clicks"),
         Input("status-load-notes-btn", "n_clicks"),
+        Input("status-muted-patterns-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _open_alert_manager(_n, _notes_n):
+    def _open_alert_manager(_n, _notes_n, _pat_n):
         # The status-bar host is re-rendered on every load, recreating the notes
         # button with n_clicks=0 — guard the spurious (re)creation fire.
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
-            return (no_update,) * 5
-        tab = "loadnotes" if ctx.triggered_id == "status-load-notes-btn" else "suppressed"
-        s_cls, t_cls, n_cls = _am_tab_classes(tab)
-        return _AM_OPEN, render_alert_manager_body(tab), s_cls, t_cls, n_cls
+            return (no_update,) * 6
+        tab = {"status-load-notes-btn": "loadnotes",
+               "status-muted-patterns-btn": "patterns"}.get(ctx.triggered_id, "suppressed")
+        s_cls, p_cls, t_cls, n_cls = _am_tab_classes(tab)
+        return _AM_OPEN, render_alert_manager_body(tab), s_cls, p_cls, t_cls, n_cls
 
     @app.callback(
         Output("alert-manager-root", "className", allow_duplicate=True),
@@ -490,41 +501,80 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("alert-manager-body", "children", allow_duplicate=True),
         Output("am-tab-suppressed", "className", allow_duplicate=True),
+        Output("am-tab-patterns", "className", allow_duplicate=True),
         Output("am-tab-thresholds", "className", allow_duplicate=True),
         Output("am-tab-loadnotes", "className", allow_duplicate=True),
         Input("am-tab-suppressed", "n_clicks"),
+        Input("am-tab-patterns", "n_clicks"),
         Input("am-tab-thresholds", "n_clicks"),
         Input("am-tab-loadnotes", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _switch_am_tab(_s, _t, _n):
-        tab = {"am-tab-thresholds": "thresholds",
+    def _switch_am_tab(_s, _p, _t, _n):
+        tab = {"am-tab-patterns": "patterns",
+               "am-tab-thresholds": "thresholds",
                "am-tab-loadnotes": "loadnotes"}.get(ctx.triggered_id, "suppressed")
-        s_cls, t_cls, n_cls = _am_tab_classes(tab)
-        return render_alert_manager_body(tab), s_cls, t_cls, n_cls
+        s_cls, p_cls, t_cls, n_cls = _am_tab_classes(tab)
+        return render_alert_manager_body(tab), s_cls, p_cls, t_cls, n_cls
 
     @app.callback(
         Output("alert-manager-body", "children", allow_duplicate=True),
         Output("blotter-all-rows", "data", allow_duplicate=True),
         Output("deepdive-positions-grid", "rowData", allow_duplicate=True),
         Input({"type": "am-restore", "account": ALL, "name": ALL, "pat": ALL}, "n_clicks"),
+        Input({"type": "am-unack", "account": ALL, "pat": ALL, "key": ALL}, "n_clicks"),
         State("deepdive-account-picker", "value"),
         State("pos-view-mode", "data"),
         State("struct-expanded", "data"),
         prevent_initial_call=True,
     )
-    def _restore_from_manager(_n, dd_account, pos_view, expanded):
+    def _restore_from_manager(_n, _u, dd_account, pos_view, expanded):
         trig = ctx.triggered_id
         state = sa.get_state()
         if not isinstance(trig, dict) or state is None:
             return no_update, no_update, no_update
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
             return no_update, no_update, no_update
-        sa.restore_alert(trig["account"], trig["name"], trig["pat"])
+        if trig.get("type") == "am-unack":
+            sa.unacknowledge_alert(trig["account"], trig["pat"], trig["key"])
+        else:
+            sa.restore_alert(trig["account"], trig["name"], trig["pat"])
         body = render_alert_manager_body("suppressed")
         blotter_rows = consolidate_fires_to_rows(sa.all_fires(state), state)
         dd_rows = _dd_grid_rows(state, dd_account, pos_view, expanded)
         return body, blotter_rows, dd_rows
+
+    # ---- Patterns tab: persisted per-pattern on/off toggles ----------------
+    # A toggle is a pure marking flip in the state owner (set_pattern_enabled:
+    # persist + re-mark every account) — collapse-to-muted with a visible count,
+    # never a drop, and instant (no engine re-run, no Bloomberg). The status bar
+    # repaints so its counts (and the muted-patterns chip) stay truthful.
+    @app.callback(
+        Output("alert-manager-body", "children", allow_duplicate=True),
+        Output("blotter-all-rows", "data", allow_duplicate=True),
+        Output("deepdive-positions-grid", "rowData", allow_duplicate=True),
+        Output("status-bar-host", "children", allow_duplicate=True),
+        Input({"type": "am-pat-toggle", "pat": ALL}, "n_clicks"),
+        State("deepdive-account-picker", "value"),
+        State("pos-view-mode", "data"),
+        State("struct-expanded", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_pattern_toggle(_n, dd_account, pos_view, expanded):
+        from pm.store.alert_governance import disabled_patterns
+        trig = ctx.triggered_id
+        state = sa.get_state()
+        if not isinstance(trig, dict) or state is None:
+            return no_update, no_update, no_update, no_update
+        if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
+            return no_update, no_update, no_update, no_update
+        pid = trig.get("pat")
+        # Currently off -> turn on; currently on -> turn off.
+        sa.set_pattern_enabled(pid, enabled=(pid in disabled_patterns()))
+        body = render_alert_manager_body("patterns")
+        blotter_rows = consolidate_fires_to_rows(sa.all_fires(state), state)
+        dd_rows = _dd_grid_rows(state, dd_account, pos_view, expanded)
+        return body, blotter_rows, dd_rows, render_status_bar(state)
 
     # ---- Thresholds tab: edit dials -> persist -> recompute -> re-paint --
     # Apply / Reset all / per-row Reset all flow through one callback. Each MUTATES the
@@ -544,6 +594,7 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("alert-manager-body", "children", allow_duplicate=True),
         Output("am-tab-suppressed", "className", allow_duplicate=True),
+        Output("am-tab-patterns", "className", allow_duplicate=True),
         Output("am-tab-thresholds", "className", allow_duplicate=True),
         Output("am-tab-loadnotes", "className", allow_duplicate=True),
         Output("status-bar-host", "children", allow_duplicate=True),
@@ -559,7 +610,7 @@ def register_callbacks(app: dash.Dash) -> None:
         prevent_initial_call=True,
     )
     def _apply_thresholds(_apply, _reset_all, _row_resets, values, ids, tick):
-        noop = (no_update,) * 8
+        noop = (no_update,) * 9
         trig = ctx.triggered_id
         # Ignore the spurious fire when the inputs/buttons are (re)created with n_clicks 0.
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
@@ -597,13 +648,13 @@ def register_callbacks(app: dash.Dash) -> None:
             if new_state is None:
                 new_state = sa.reload_state(reuse_extract=True)
         except Exception as exc:
-            return (no_update, no_update, no_update, no_update,
+            return (no_update, no_update, no_update, no_update, no_update,
                     html.Div(f"Apply failed: {exc}", className="status-left status-empty"),
                     no_update, no_update, "")
-        s_cls, t_cls, n_cls = _am_tab_classes("thresholds")
+        s_cls, p_cls, t_cls, n_cls = _am_tab_classes("thresholds")
         body = render_alert_manager_body("thresholds")          # reseed inputs from persisted
         rows = consolidate_fires_to_rows(sa.all_fires(new_state), new_state)
-        return (body, s_cls, t_cls, n_cls, render_status_bar(new_state), rows,
+        return (body, s_cls, p_cls, t_cls, n_cls, render_status_bar(new_state), rows,
                 (tick or 0) + 1, "")
 
     # The manager's own Escape listener, bound to its own id (independent of the

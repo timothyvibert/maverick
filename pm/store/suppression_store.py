@@ -179,12 +179,17 @@ def apply_suppressions(state, as_of: Optional[date] = None) -> None:
 
 def remark_account(account_state, as_of: Optional[date] = None) -> None:
     """Re-mark one account's fires — used by ``state_access`` after a structure
-    confirm/reject re-derive and the suppress/restore write paths. Applies the active
-    suppressions then the material-change re-surfacing, so a re-derived account stays
-    consistent with the load path (no reload, no recompute)."""
+    confirm/reject re-derive and the suppress/restore/acknowledge/toggle write paths.
+    Applies the full marking order the load path uses: active suppressions →
+    material-change re-surfacing → per-fire acknowledgements (their own material
+    net) → per-pattern disables last (final — never overridden by a material
+    move). No reload, no recompute."""
+    from pm.store.alert_governance import mark_acknowledged, mark_disabled
     active = active_suppressions(as_of)
     _mark_fires(account_state.account, account_state.fires, active)
     _remark_material(account_state, active)
+    mark_acknowledged(account_state)
+    mark_disabled(account_state)
 
 
 def is_active(fire) -> bool:

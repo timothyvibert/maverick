@@ -1,14 +1,17 @@
 """The per-pattern headline-metric map — data + types only.
 
-For each engine pattern (P1-P15) this names the **single metric whose movement defines
-"materially changed"**: where the value already lives in the fire's ``trace``, the
-``PatternConfig`` threshold it is measured against, and the direction that fires. It is
-the static artifact the *next* item (material-change re-surfacing) consumes to decide
-whether a suppressed alert's condition has moved enough to bring it back — by comparing
-the suppression's captured baseline trace against the current fire's trace at this key.
+For each pattern — the P1-P15 engine patterns AND the P16-P20 structure fires — this
+names the **single metric whose movement defines "materially changed"**: where the value
+already lives in the fire's ``trace``, the ``PatternConfig`` threshold it is measured
+against (None for the structure fires, whose thresholds are module constants), and the
+direction that fires. It is the static artifact material-change re-surfacing consumes to
+decide whether a suppressed or acknowledged alert's condition has moved enough to bring
+it back — by comparing the captured baseline trace against the current fire's trace at
+this key. The P16-P20 entries exist precisely so a muted tier-1 structure fire has a way
+back (they were the one alert family with no re-surface net).
 
-**This item defines the map; it builds no comparison.** Nothing here reads a suppression
-or compares captured-vs-current — that is deliberately deferred.
+**This module defines the map; it builds no comparison.** Nothing here reads a
+suppression or compares captured-vs-current.
 
 Each entry carries a ``metric_type`` describing how the next item should compare it:
 
@@ -204,5 +207,48 @@ HEADLINE_METRICS: dict[str, HeadlineMetric] = {
         "P15", MONOTONIC_NUMERIC,
         Axis(("result", "vol_units"), "p15_vol_multiplier_min", HIGHER_FIRES),
         note="A single-day vol-adjusted move; re-surface on a new, larger move.",
+    ),
+    # ------------------------------------------------------------------
+    # Structure fires (P16–P20). Their thresholds are structure_fires.py
+    # module constants, not PatternConfig dials, so threshold_field is None
+    # throughout; trace values live under ("inputs", <key>, "value") because a
+    # structure fire's trace "result" is a string, not a dict. These entries
+    # exist so a muted/acknowledged tier-1 structure fire has a way back — a
+    # deepening breach or a NEW expiry episode re-surfaces it instead of
+    # staying invisible forever.
+    # ------------------------------------------------------------------
+    "P16": HeadlineMetric(
+        "P16", MONOTONIC_NUMERIC,
+        Axis(("inputs", "naked_excess_contracts", "value"), None, HIGHER_FIRES,
+             "uncovered short-call contracts"),
+        note="A deepening coverage breach (more naked contracts than at mute time) re-surfaces.",
+    ),
+    "P17": HeadlineMetric(
+        "P17", EVENT_RECURRENCE,
+        Axis(("inputs", "extrinsic", "value"), None, LOWER_FIRES, "remaining time value"),
+        note="A carry-risk episode is bounded by its leg's expiry; a NEW expiry "
+             "(rolled or re-struck put back in carry breach) re-surfaces.",
+        event_id_key=("inputs", "leg_expiry", "value"),
+    ),
+    "P18": HeadlineMetric(
+        "P18", EVENT_RECURRENCE,
+        Axis(("inputs", "spot", "value"), None, HIGHER_FIRES, "spot vs cap"),
+        note="At-cap is an episode per short-call expiry; a rolled call capping "
+             "again is a new episode and re-surfaces.",
+        event_id_key=("inputs", "leg_expiry", "value"),
+    ),
+    "P19": HeadlineMetric(
+        "P19", EVENT_RECURRENCE,
+        Axis(("inputs", "dte", "value"), None, LOWER_FIRES, "days to expiry"),
+        note="Pin risk is an expiry-day episode; a NEW expiry pinning again "
+             "re-surfaces (the same episode stays muted through the bell).",
+        event_id_key=("inputs", "leg_expiry", "value"),
+    ),
+    "P20": HeadlineMetric(
+        "P20", EVENT_RECURRENCE,
+        Axis(("inputs", "extrinsic", "value"), None, LOWER_FIRES, "put time value"),
+        note="Monetize-the-put is an episode per put expiry; a rolled protective "
+             "put hollowing out again is a new episode and re-surfaces.",
+        event_id_key=("inputs", "leg_expiry", "value"),
     ),
 }

@@ -34,7 +34,7 @@ from pm.config import DATA_DIR
 # follows.
 _DB_PATH = DATA_DIR / "app_store.db"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Bookkeeping key marking that the one-time pre-SQLite resolutions import has run.
 _LEGACY_RESOLUTIONS_IMPORTED = "structure_resolutions_json_imported"
@@ -102,6 +102,22 @@ CREATE TABLE IF NOT EXISTS settings (
     value      TEXT NOT NULL,   -- JSON-encoded scalar override, in PatternConfig-native units
     updated_at TEXT NOT NULL,   -- ISO-8601 UTC datetime the override was last written
     PRIMARY KEY (scope, name)   -- one row per (scope, threshold)
+);
+CREATE TABLE IF NOT EXISTS pattern_toggles (
+    pattern_id TEXT PRIMARY KEY,   -- P1..P20; a row exists ONLY while the pattern is off
+    enabled    INTEGER NOT NULL,   -- always 0 today (enable deletes the row); kept for audit clarity
+    updated_at TEXT NOT NULL       -- ISO-8601 UTC datetime the toggle was last flipped
+);
+CREATE TABLE IF NOT EXISTS acknowledgements (
+    account            TEXT NOT NULL,   -- the account the fire fired in
+    pattern_id         TEXT NOT NULL,   -- the acknowledged pattern (P1..P20)
+    fire_key           TEXT NOT NULL,   -- structure_id for structure fires, else position_id:
+                                        -- the per-fire grain a name-wide suppression lacks
+    acknowledged_at    TEXT NOT NULL,   -- ISO-8601 UTC datetime
+    captured_trace     TEXT,            -- json.dumps(fire.trace, default=str) at ack time —
+                                        -- the baseline material-change re-surfacing compares
+    captured_rationale TEXT,            -- fire.rationale at ack time (review surface tooltip)
+    PRIMARY KEY (account, pattern_id, fire_key)
 );
 """
 

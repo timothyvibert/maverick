@@ -43,15 +43,22 @@ class SuppressionMark:
     the fire — the fire is never removed from ``acc.fires``, so a restore (or snooze
     expiry) plus a re-apply brings it straight back (the no-recompute contract).
 
-    Three kinds, distinguishing all four states (``is_active`` treats the first as inactive
-    and the last as active, so re-surfaced never looks like a plain snooze-expiry):
-      - ``"suppressed"`` / ``"snoozed"`` — muted (``is_active`` False).
+    Five kinds (``is_active`` = ``None`` or ``"resurfaced"``; everything else inactive —
+    re-surfaced never looks like a plain snooze-expiry):
+      - ``"suppressed"`` / ``"snoozed"`` — muted name-wide (``is_active`` False).
+      - ``"acknowledged"`` — this ONE fire (keyed structure_id-or-position_id) was
+        reviewed and set aside; inactive, but its captured baseline stays under the
+        material-change net, so a materially moved condition flips it back to
+        ``"resurfaced"``. Set by the alert-governance pass.
+      - ``"disabled"`` — the whole pattern is toggled off in the Alert Manager;
+        inactive, counted, recoverable, and FINAL (applied last — material change never
+        overrides an explicit off-switch). Set by the alert-governance pass.
       - ``None`` on ``Fire.suppression`` — active (never muted, or snooze expired).
-      - ``"resurfaced"`` — muted, but the condition moved materially since mute time, so
-        it is **active again** (``is_active`` True) and carries the before→after delta so
-        the surfaces can say *why* it came back. Set by the material-change pass.
+      - ``"resurfaced"`` — muted/acknowledged, but the condition moved materially since
+        the baseline was captured, so it is **active again** (``is_active`` True) and
+        carries the before→after delta so the surfaces can say *why* it came back.
     """
-    kind: str                      # "suppressed" (permanent) | "snoozed" (dated) | "resurfaced"
+    kind: str                      # "suppressed" | "snoozed" | "acknowledged" | "disabled" | "resurfaced"
     until: Optional[str] = None    # 'YYYY-MM-DD' when snoozed; None otherwise
     # Set only when kind == "resurfaced" (material-change re-surfacing). The headline
     # metric and its baseline→current values, so the blotter / Alert Manager can show the

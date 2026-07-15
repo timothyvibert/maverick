@@ -1,22 +1,28 @@
-"""Alert Manager — the book-wide review/reverse surface for suppressed alerts.
+"""Alert Manager — the book-wide review/reverse surface for alert governance.
 
 A discrete modal (separate from the per-alert drawer) opened from the top-right
-control cluster. Three tabs: **Suppressed** (the active suppressions, restorable),
+control cluster. Four tabs: **Suppressed** (active suppressions AND per-fire
+acknowledgements, restorable), **Patterns** (the persisted per-pattern on/off
+toggles — a toggled-off pattern's fires are hidden-but-counted, never dropped),
 **Thresholds** (the editable alert-sensitivity dials), and **Load notes** (every
 load/ingestion/market-data warning, readable and copyable — the status bar shows
 only the headline). All are dense ``html.Table``s — not a second AG-Grid —
 matching the signal-sheet / trace design language. Restore here uses the *same*
-``state_access.restore_alert`` as the modal's Muted footer; there is no second
+``state_access`` write paths as the modal's Muted footer; there is no second
 mechanism. The Thresholds tab edits the persisted overrides via ``settings_store``
 and applies them with a persist-then-recompute (write the override, then
 ``state_access.recompute_thresholds`` re-derives the alert set over the
 already-loaded book — engine + structure fires + suppression marking, no
 Bloomberg call, no extract re-read). The recompute lives in the single state
 owner, not the UI layer. See ``pm/insight/threshold_catalog.py`` for the dials.
+Pattern toggles and acknowledgements are pure marking flips
+(``state_access.set_pattern_enabled`` / ``acknowledge_alert``) — instant, no
+engine re-run at all.
 
-Days-active (today − created_at) is the deliberate staleness cue; a muted alert
-whose condition moves materially is re-surfaced by the load-path material-change
-pass and shows its third state here (see ``suppression_store``).
+Days-active (today − created_at) is the deliberate staleness cue; a muted or
+acknowledged alert whose condition moves materially is re-surfaced by the
+load-path material-change pass and shows that state here (see
+``suppression_store`` / ``alert_governance``).
 """
 from __future__ import annotations
 
@@ -26,8 +32,8 @@ from typing import Optional
 from dash import dcc, html
 
 from pm.insight import threshold_catalog as cat
-from pm.insight.pattern_groups import all_pattern_meta
-from pm.store import settings_store, suppression_store
+from pm.insight.pattern_groups import GROUP_LABELS, PATTERN_GROUP, all_pattern_meta
+from pm.store import alert_governance, settings_store, suppression_store
 from pm.ui import state_access as sa
 
 
@@ -78,14 +84,35 @@ def _restore_id(record: dict) -> dict:
             "name": record["name"], "pat": record["pattern_id"]}
 
 
+def _ack_live_fire(state, rec: dict):
+    """The live fire an acknowledgement record governs, or None."""
+    if state is None:
+        return None
+    acc = state.accounts.get(rec["account"])
+    if acc is None:
+        return None
+    for f in acc.fires:
+        if f.pattern_id == rec["pattern_id"] and alert_governance.fire_key(f) == rec["fire_key"]:
+            return f
+    return None
+
+
+def _unack_id(rec: dict) -> dict:
+    return {"type": "am-unack", "account": rec["account"],
+            "pat": rec["pattern_id"], "key": rec["fire_key"]}
+
+
 def render_suppressed_tab(today: Optional[date] = None) -> html.Div:
-    """The active suppressions, sorted/grouped by account. Empty → a neutral note."""
+    """The active suppressions AND per-fire acknowledgements, sorted/grouped by
+    account. Empty → a neutral note."""
     today = today or date.today()
     meta = all_pattern_meta()
-    state = sa.get_state()      # to read each suppression's live mark (re-surfaced state)
+    state = sa.get_state()      # to read each record's live mark (re-surfaced state)
     records = sorted(suppression_store.active_suppressions(today).values(),
                      key=lambda r: (r["account"], r["name"], r["pattern_id"]))
-    if not records:
+    acks = sorted(alert_governance.acknowledgements().values(),
+                  key=lambda r: (r["account"], r["fire_key"], r["pattern_id"]))
+    if not records and not acks:
         return html.Div("No suppressed alerts", className="am-empty")
 
     header = html.Tr([html.Th(h, className="am-th") for h in
@@ -113,8 +140,81 @@ def render_suppressed_tab(today: Optional[date] = None) -> html.Div:
                                     className="alert-action-btn am-restore-btn")),
             ],
         ))
+    for r in acks:
+        pid = r["pattern_id"]
+        alert_type = meta.get(pid, (pid, None))[0]
+        rationale = (r.get("captured_rationale") or "").strip()
+        fire = _ack_live_fire(state, r)
+        mark = getattr(fire, "suppression", None)
+        resurfaced = getattr(mark, "kind", None) == "resurfaced"
+        state_txt = (_state_text(r, mark) if resurfaced else "Acknowledged")
+        state_cls = "am-state am-state-resurfaced" if resurfaced else "am-state"
+        display_name = getattr(fire, "underlying", None) or r["fire_key"]
+        body_rows.append(html.Tr(
+            className="am-row",
+            title=rationale or None,
+            children=[
+                html.Td(r["account"], className="am-acct"),
+                html.Td(display_name, className="am-name"),
+                html.Td(alert_type, className="am-type"),
+                html.Td(state_txt, className=state_cls),
+                html.Td(str(_days_active(r.get("acknowledged_at"), today)), className="am-days"),
+                html.Td(html.Button("Restore", id=_unack_id(r), n_clicks=0,
+                                    className="alert-action-btn am-restore-btn")),
+            ],
+        ))
     return html.Table(className="am-table", children=[
         html.Thead(header), html.Tbody(body_rows)])
+
+
+def _pat_toggle_id(pattern_id: str) -> dict:
+    return {"type": "am-pat-toggle", "pat": pattern_id}
+
+
+def render_patterns_tab() -> html.Div:
+    """The persisted per-pattern on/off toggles, every P1–P20. A toggled-off
+    pattern's fires are COLLAPSED TO MUTED, not dropped: the row shows the live
+    count of fires currently hidden by the toggle ('3 muted'), and toggling back
+    on restores them in place — a marking flip, no engine re-run, no reload."""
+    meta = all_pattern_meta()
+    disabled = alert_governance.disabled_patterns()
+    state = sa.get_state()
+    counts = alert_governance.disabled_fire_counts(state) if state is not None else {}
+
+    def _pat_sort(pid: str) -> int:
+        try:
+            return int(pid.lstrip("P"))
+        except ValueError:
+            return 999
+
+    header = html.Tr([html.Th(h, className="am-th") for h in
+                      ("Pattern", "Alert type", "Tier", "Group", "Status", "")])
+    body_rows = []
+    for pid in sorted(meta, key=_pat_sort):
+        name, tier = meta[pid]
+        off = pid in disabled
+        n_muted = counts.get(pid, 0)
+        status = (f"Off — {n_muted} muted" if (off and n_muted) else
+                  ("Off" if off else "On"))
+        body_rows.append(html.Tr(className="am-row", children=[
+            html.Td(pid, className="am-acct"),
+            html.Td(name, className="am-type"),
+            html.Td(f"T{tier}", className="am-days"),
+            html.Td(GROUP_LABELS.get(PATTERN_GROUP.get(pid, ""), "—"), className="am-name"),
+            html.Td(status, className=("am-state am-state-off" if off else "am-state")),
+            html.Td(html.Button("Turn on" if off else "Turn off",
+                                id=_pat_toggle_id(pid), n_clicks=0,
+                                className="alert-action-btn am-pat-toggle-btn")),
+        ]))
+    note = html.Div(
+        "Turning a pattern off hides its alerts from every active surface but keeps "
+        "them counted here — nothing is dropped, and turning it back on restores "
+        "them instantly. Off is final until you flip it: a hidden alert does not "
+        "re-surface on a material move while its pattern is off.",
+        className="am-thr-note")
+    table = html.Table(className="am-table am-patterns-table",
+                       children=[html.Thead(header), html.Tbody(body_rows)])
+    return html.Div([note, table])
 
 
 def _thr_input_id(name: str) -> dict:
@@ -219,6 +319,8 @@ def render_alert_manager_body(tab: str = "suppressed",
         inner = render_thresholds_tab()
     elif tab == "loadnotes":
         inner = render_loadnotes_tab()
+    elif tab == "patterns":
+        inner = render_patterns_tab()
     else:
         inner = render_suppressed_tab(today)
     return html.Div(className="am-body-inner", children=[inner])

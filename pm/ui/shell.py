@@ -85,6 +85,8 @@ def _alert_manager_root() -> html.Div:
                 html.Div(className="view-toggle am-tabs", children=[
                     html.Button("Suppressed", id="am-tab-suppressed", n_clicks=0,
                                 className="view-toggle-btn view-toggle-btn-active"),
+                    html.Button("Patterns", id="am-tab-patterns", n_clicks=0,
+                                className="view-toggle-btn"),
                     html.Button("Thresholds", id="am-tab-thresholds", n_clicks=0,
                                 className="view-toggle-btn"),
                     html.Button("Load notes", id="am-tab-loadnotes", n_clicks=0,
