@@ -297,7 +297,9 @@ def _resurfaces(record: dict, fires) -> Optional[SuppressionMark]:
     """A ``resurfaced`` mark (with the headline delta) if this suppression's condition
     moved materially vs its captured baseline, else None. ``fires`` are the currently-marked
     fires under the ``(account, name, pattern_id)`` key. Excludes P8 (proxy headline) and
-    P16-P20 (no map entry); guards a missing/garbled baseline or headline (no re-surface)."""
+    any pattern with no map entry (the structure fires P16-P20 HAVE entries — P16
+    monotonic on the naked-contract count, P17-P20 event-keyed on the leg expiry);
+    guards a missing/garbled baseline or headline (no re-surface)."""
     hm = HEADLINE_METRICS.get(record["pattern_id"])
     if hm is None or hm.metric_type == PROXY_ONLY:
         return None

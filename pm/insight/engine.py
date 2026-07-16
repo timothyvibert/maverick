@@ -115,6 +115,9 @@ def run_insight_engine(
                 legacy_signals=legacy,
                 analyst_note_date=analyst_note,
                 projected_dividend=projected_div,
+                # The one definition of "recent note" every consumer shares —
+                # the editable research-note recency dial.
+                note_recent_window_bd=config.p21_note_window_bd,
             )
             underlying_signals[symbol] = sig_dict
 

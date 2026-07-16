@@ -122,6 +122,9 @@ TEMPLATE_VARIABLE_REGISTRY: dict[str, Callable[[TemplateContext], Any]] = {
     "earnings_implied_move": lambda ctx: _signal_value(ctx, "earnings_implied_move"),
     "ex_div_date": lambda ctx: _signal_trace_input(ctx, "days_to_ex_div", "ex_div_date"),
     "days_to_exdiv": lambda ctx: _signal_value(ctx, "days_to_ex_div"),
+    "analyst_rating": lambda ctx: (
+        _signal_value(ctx, "analyst_rating_and_target") or {}
+    ).get("rating") if isinstance(_signal_value(ctx, "analyst_rating_and_target"), dict) else None,
     "analyst_target": lambda ctx: (
         _signal_value(ctx, "analyst_rating_and_target") or {}
     ).get("target") if isinstance(_signal_value(ctx, "analyst_rating_and_target"), dict) else None,
@@ -529,4 +532,16 @@ P15_RATIONALE_TEMPLATE_NO_RV = (
     "({position_value_signed}). {earnings_context_sentence}"
     "{analyst_note_context_sentence}**Worth flagging to the client** — material "
     "move on a held position is a natural reason for a call."
+)
+
+P21_LABEL_TEMPLATE = (
+    "{symbol} — research note published {note_recency}"
+)
+P21_RATIONALE_TEMPLATE = (
+    "An analyst note on {symbol} is dated {analyst_note_date} ({note_recency}); "
+    "the account holds the name. Current view: {analyst_rating} · target "
+    "${analyst_target:,.2f} · upside {analyst_upside:.0%}. **Review the holding in "
+    "light of the note** — a fresh view is a natural client touchpoint. "
+    "(Whether the rating or target MOVED vs the prior note is not yet tracked; "
+    "this alert fires on recency, not direction.)"
 )

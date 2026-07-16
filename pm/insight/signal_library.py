@@ -892,39 +892,75 @@ def _compute_analyst_rating_and_target(
 
 
 def _compute_street_consensus(snap: dict) -> SignalValue:
-    """V1: returns stale always (BEST_TARGET_PRICE / BEST_ANALYST_REC not in
-    UNDERLYING_FIELDS). Plumbing deferred to V2."""
+    """D2: street-consensus rating score and target from the UN-overridden
+    batched underlying BDP — genuinely the street, with no risk of override
+    contamination (the provider fetch is a separate, overridden request).
+
+    Mnemonics confirmed live on this terminal (2026-07): the plain
+    ``BEST_ANALYST_RATING`` populates as the numeric 1–5 consensus score and
+    ``BEST_TARGET_PRICE`` as the consensus target; the provider-only
+    ``BEST_ANALYST_REC`` returns nothing without its override and is
+    deliberately NOT in the underlying field set. Stale when the snapshot
+    carries neither field (offline / uncovered name)."""
+    score = _coerce_float(snap.get("BEST_ANALYST_RATING"))
+    target = _coerce_float(snap.get("BEST_TARGET_PRICE"))
+    spot = _coerce_float(snap.get("PX_LAST"))
     inputs = {
-        "BEST_ANALYST_REC": {
-            "value": None, "source": "BBG:BEST_ANALYST_REC",
-            "as_of": None, "stale": True,
+        "BEST_ANALYST_RATING": {
+            "value": score, "source": "BBG:BEST_ANALYST_RATING (no override — street)",
+            "as_of": None, "stale": score is None,
         },
         "BEST_TARGET_PRICE": {
-            "value": None, "source": "BBG:BEST_TARGET_PRICE",
-            "as_of": None, "stale": True,
+            "value": target, "source": "BBG:BEST_TARGET_PRICE (no override — street)",
+            "as_of": None, "stale": target is None,
+        },
+        "PX_LAST": {
+            "value": spot, "source": "BBG:PX_LAST",
+            "as_of": None, "stale": spot is None,
         },
     }
+    if score is None and target is None:
+        return _stale("street_consensus_rating_and_target", "BEST_ANALYST_RATING",
+                      reason="street consensus fields returned no data", inputs=inputs)
+    upside_pct = None
+    if target is not None and spot is not None and spot > 0:
+        upside_pct = (target / spot) - 1
+    value = {"rating_score": score, "target": target, "upside_pct": upside_pct}
+    parts = []
+    if score is not None:
+        parts.append(f"consensus {score:.1f}/5")
+    if target is not None:
+        parts.append(f"target ${target:.2f}")
+        parts.append(f"upside {_fmt_pct(upside_pct)}")
+    display = " · ".join(parts) if parts else EM_DASH
     return SignalValue(
         signal_id="street_consensus_rating_and_target",
-        value=None,
-        display=EM_DASH,
-        interpretation=None,
+        value=value,
+        display=display,
+        interpretation="Street consensus (all contributing analysts), for "
+                       "comparison against the provider view above.",
         trace={
             "inputs": inputs,
-            "computation": ("V1 limitation: street consensus requires non-overridden BDP "
-                            "fetch; BEST_TARGET_PRICE / BEST_ANALYST_REC not currently in "
-                            "UNDERLYING_FIELDS. Plumbing deferred to V2."),
+            "computation": ("street consensus from the batched underlying BDP "
+                            "(no override; 1–5 score, 5 = strongest buy); "
+                            "upside = (target/PX_LAST) - 1"),
             "thresholds": {},
-            "result": None,
+            "result": value,
         },
-        stale=True,
+        stale=False,
     )
 
 
-def _compute_analyst_note_recent(analyst_note_date: Optional["pd.Timestamp"]) -> SignalValue:
-    """D3: date of the most recent provider-sourced analyst
-    note for this underlying, and whether it lands today or the previous
-    business day.
+def _compute_analyst_note_recent(analyst_note_date: Optional["pd.Timestamp"],
+                                 recent_window_bd: int = 5) -> SignalValue:
+    """D3: date of the most recent provider-sourced analyst note for this
+    underlying, and whether it lands within the trailing recency window.
+
+    ``recent_window_bd`` is the editable dial (``p21_note_window_bd``,
+    default 5 business days ≈ a calendar week), threaded from PatternConfig by
+    the engine — the one definition of "recent note" every consumer shares
+    (the research-note pattern and the captured+note compound). It replaced a
+    hardcoded today-or-previous-business-day rule.
 
     ``analyst_note_date`` is pre-fetched in ``portfolio_state`` via
     ``fetch_analyst_note_dates`` (INTERVAL_END_VALUE_DATE under the
@@ -961,14 +997,14 @@ def _compute_analyst_note_recent(analyst_note_date: Optional["pd.Timestamp"]) ->
 
     today = _today()
     days_since = _business_days_since(note_d, today)
-    is_recent = days_since in (0, 1)
+    is_recent = 0 <= days_since <= int(recent_window_bd)
     value = {
         "note_date": note_d,
         "is_recent": is_recent,
         "days_since": days_since,
     }
     if is_recent:
-        display = f"Note {note_d.isoformat()} ({days_since} BD)"
+        display = f"Note {note_d.isoformat()} ({_bd_ago_phrase(days_since)})"
         interp = "A new analyst note was published recently — sales catalyst."
     else:
         display = f"Last note {note_d.isoformat()}"
@@ -981,14 +1017,24 @@ def _compute_analyst_note_recent(analyst_note_date: Optional["pd.Timestamp"]) ->
         trace={
             "inputs": inputs,
             "computation": ("INTERVAL_END_VALUE_DATE via BDP[BE998=UBS, "
-                            "PX395=Best Analyst Rating]; is_recent = note_date in "
-                            "{today, prev_business_day}; days_since = business days "
-                            "from note_date to today (pd.bdate_range)"),
-            "thresholds": {"recent_max_bd": 1},
+                            "PX395=Best Analyst Rating]; is_recent = 0 <= days_since "
+                            "<= recency window (editable dial); days_since = business "
+                            "days from note_date to today (pd.bdate_range)"),
+            "thresholds": {"recent_max_bd": int(recent_window_bd)},
             "result": value,
         },
         stale=False,
     )
+
+
+def _bd_ago_phrase(days_since: Optional[int]) -> str:
+    """'today' / '1 BD ago' / 'N BD ago' — the recency annotation the note
+    surfaces render."""
+    if days_since is None:
+        return EM_DASH
+    if days_since == 0:
+        return "today"
+    return f"{days_since} BD ago"
 
 
 # ===========================================================================
@@ -1235,6 +1281,7 @@ def compute_signals_for_underlying(
     legacy_signals: Optional[list] = None,
     analyst_note_date: Optional["pd.Timestamp"] = None,
     projected_dividend: Optional[dict] = None,
+    note_recent_window_bd: int = 5,
 ) -> SignalDict:
     """Compute all underlying-level signals (groups A–D, F) for one
     underlying in one account context.
@@ -1275,7 +1322,8 @@ def compute_signals_for_underlying(
     # Group D
     out["analyst_rating_and_target"] = _wrap(_compute_analyst_rating_and_target, snap, analyst_data)
     out["street_consensus_rating_and_target"] = _wrap(_compute_street_consensus, snap)
-    out["analyst_note_recent"] = _wrap(_compute_analyst_note_recent, analyst_note_date)
+    out["analyst_note_recent"] = _wrap(_compute_analyst_note_recent, analyst_note_date,
+                                       note_recent_window_bd)
 
     # Group F
     out["composite_score"] = _wrap(_compute_composite_score, legacy_signals)

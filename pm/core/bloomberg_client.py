@@ -109,6 +109,12 @@ UNDERLYING_FIELDS = [
                               # populate 1MTH_IMPVOL_100.0%MNY_DF for most US names)
     "BEST_EPS",               # Consensus EPS estimate (next reporting period)
     "VOLATILITY_30D",         # 30-day realized vol (annualized %)
+    # Street consensus (D2) — deliberately UN-overridden on this batched pull, so
+    # these are the whole street, never the provider view (which comes from the
+    # separate overridden fetch). Confirmed live: BEST_ANALYST_RATING = numeric
+    # 1-5 consensus score; the provider-only BEST_ANALYST_REC stays out.
+    "BEST_ANALYST_RATING",
+    "BEST_TARGET_PRICE",
 ]
 DIVIDEND_FIELDS = [
     "DVD_EX_DT",

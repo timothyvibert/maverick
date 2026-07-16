@@ -1,7 +1,7 @@
 """The editable alert-threshold catalog — one source of truth.
 
 The desk tunes how sensitive each alert is ("flag a single name above 35% of NAV, not
-30%"). Every editable dial is a ``PatternConfig`` field (P1-P15); this catalog is the
+30%"). Every editable dial is a ``PatternConfig`` field; this catalog is the
 single place that says, per dial: which pattern it belongs to, the plain-English label
 the desk reads, its unit, and the sane range it is clamped to. It drives three things
 so they can never drift apart:
@@ -17,7 +17,7 @@ a ``sign`` (-1 where the native value is a magnitude-below, e.g. the P3 break an
 P6/P8 loss floors). The UI shows a positive, human number; ``to_stored`` /
 ``to_ui`` convert between that and the native value the detectors read.
 
-**Scope of the catalog.** The 26 editable dials only. Two ``PatternConfig`` fields are
+**Scope of the catalog.** The 27 editable dials only. Two ``PatternConfig`` fields are
 deliberately absent: ``p9_fresh_window_days`` (a calendar-day approximation of "<=10
 business days" — a mechanical convention, not a sensitivity dial, so it stays locked in
 code) and the removed-vestigial ``p4_target_change_window_days``. The structure-fire
@@ -47,7 +47,7 @@ _RAW = 1.0               # native == UI
 class ThresholdSpec:
     """One editable dial. ``min`` / ``max`` are in UI units (what the desk types)."""
     name: str                 # the PatternConfig field
-    pattern_id: str           # P1..P15
+    pattern_id: str           # the owning engine pattern (P1..P15, P21)
     label: str                # plain-English, unit-explicit
     unit: str
     is_int: bool              # native value is an int (day counts)
@@ -57,7 +57,7 @@ class ThresholdSpec:
     sign: int = 1            # -1 where the native value is a magnitude-below (loss / break)
 
 
-# Order follows the pattern number so the UI groups read P1 -> P15 top to bottom.
+# Order follows the pattern number so the UI groups read P1 -> P21 top to bottom.
 _SPECS: tuple[ThresholdSpec, ...] = (
     # --- P1 ---------------------------------------------------------------
     ThresholdSpec("p1_captured_min", "P1",
@@ -152,6 +152,13 @@ _SPECS: tuple[ThresholdSpec, ...] = (
     ThresholdSpec("p15_vol_multiplier_min", "P15",
                   "Notable move: flag a daily move of at least", SIGMA,
                   False, 0, 10),
+    # --- P21 --------------------------------------------------------------
+    # The ONE definition of a "recent" research note: the standalone note
+    # pattern fires within this window, and the captured+note compound (P4)
+    # reads the same window through the D3 signal.
+    ThresholdSpec("p21_note_window_bd", "P21",
+                  "Research note: flag a note within this many business days",
+                  BUSINESS_DAYS, True, 1, 20),
 )
 
 # name -> spec, the lookup every consumer uses.

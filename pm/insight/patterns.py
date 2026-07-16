@@ -1,4 +1,5 @@
-"""V1 pattern detectors — 15 patterns.
+"""Engine pattern detectors — the P1–P15 V1 patterns plus P21 (the
+decoupled research-note alert).
 
 Each detector takes a ``PositionContext``-like bundle and a
 ``PatternConfig`` and returns a ``Fire`` (or None / list[Fire] for
@@ -9,11 +10,13 @@ Convention:
 - ``detect_pN(position, account_state, signals, config) -> Fire | None``
   for per-position patterns.
 - ``detect_pN_account(account_state, config) -> list[Fire]`` for
-  account-level patterns (P8, P11, P12, P14).
+  account-level patterns (P8, P11, P12, P14, P21).
 
-P4 reads D3 ``analyst_note_recent``: it fires when a captured-premium
-short option also has a recent analyst note. Offline (or on names with
-no analyst coverage) D3 is stale, so P4 stays silent there.
+The research-note signal D3 ``analyst_note_recent`` drives two patterns
+sharing ONE recency window (``p21_note_window_bd``): P21 fires on the
+note alone (any held name), P4 on the captured-premium + note compound.
+Offline (or on names with no analyst coverage) D3 is stale, so both
+stay silent there.
 
 Variables that require live option pricing render as
 ``INDICATIVE_PLACEHOLDER`` in V1; the trace records the substitution.
@@ -28,7 +31,7 @@ import pandas as pd
 
 from pm.ingest.position_builder import Position
 from pm.insight import templates as T
-from pm.insight.signal_library import SignalDict, SignalValue
+from pm.insight.signal_library import SignalDict, SignalValue, _bd_ago_phrase
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +151,11 @@ class PatternConfig:
     p14_term_structure_min: float = 2.0
     # P15
     p15_vol_multiplier_min: float = 1.5   # threshold for "Notable price move" alert
+    # P21 — the research-note recency window (business days). ONE definition of
+    # "recent note" for every consumer: the standalone research-note pattern
+    # fires on days_since <= this, and the captured+note compound (P4) reads
+    # the same window through the D3 signal. Default 5 BD ≈ a calendar week.
+    p21_note_window_bd: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +167,7 @@ PATTERN_META: dict[str, tuple[str, int]] = {
     "P1": ("Captured short premium, ready to close", 2),
     "P2": ("Captured + IV elevated → close-and-rewrite", 2),
     "P3": ("Captured + adverse technical break", 1),
-    "P4": ("Captured + analyst rating change", 1),
+    "P4": ("Captured + recent analyst note", 1),
     "P5": ("Roll-due short option (three-roads)", 1),
     "P6": ("Stress position (deep underwater + time pressure)", 1),
     "P7": ("ITM short call + ex-div trap", 1),
@@ -171,6 +179,7 @@ PATTERN_META: dict[str, tuple[str, int]] = {
     "P13": ("Vol-rich covered-call setup", 3),
     "P14": ("Earnings catalyst setup", 3),
     "P15": ("Notable price move", 1),
+    "P21": ("Research note published", 2),
 }
 
 
@@ -462,9 +471,10 @@ def detect_p4(
         signals=signals,
         position=position,
         config=config,
-        thresholds_used={"captured_pct_min": config.p4_captured_min},
-        computation=("captured ≥ 60% AND analyst note is recent "
-                      "(today or previous business day)"),
+        thresholds_used={"captured_pct_min": config.p4_captured_min,
+                         "note_window_bd": config.p21_note_window_bd},
+        computation=("captured ≥ threshold AND analyst note within the recency "
+                     "window (the editable research-note dial)"),
         fire_result={"captured_pct": captured,
                       "days_since_note": note.get("days_since") if isinstance(note, dict) else None,
                       "fired": True},
@@ -1293,6 +1303,81 @@ def detect_p15(
                        label=label, rationale=rationale, trace=trace)
 
 
+# ===========================================================================
+# P21 — Research note published  (account-level; one fire per held underlying)
+# ===========================================================================
+
+def detect_p21_account(account_state, config: PatternConfig) -> list[Fire]:
+    """A research note published within the trailing recency window on ANY held
+    name — standalone, with no premium-capture or position-type gate. This is
+    the decoupled note alert: the captured+note compound (P4) kept missing
+    notes on plain stock holdings and on shorts below its capture gate, so a
+    fresh note on a held name was invisible everywhere.
+
+    One fire per qualifying underlying, anchored to the largest held position
+    (the P14 shape). The copy carries the note's recency ("today / 1 BD ago /
+    N BD ago") and the provider view's LEVEL (rating / target / upside — data
+    already fetched every load). Direction — whether the rating or target
+    MOVED vs the prior note — needs the dated snapshot store (day-over-day
+    diff) and is deliberately not faked from a single-day pull: the trace
+    captures the note date (the event key) and the level, so the direction
+    comparison drops in against a stored baseline when the store lands.
+    """
+    fires: list[Fire] = []
+    by_under: dict[str, list[Position]] = {}
+    for p in account_state.positions:
+        if p.asset_class in ("cash", "other"):
+            continue
+        sym = p.underlying_symbol or p.symbol
+        if not sym:
+            continue
+        by_under.setdefault(sym, []).append(p)
+
+    for under, held in sorted(by_under.items()):
+        signals = account_state.signals.get(under, {}) if hasattr(account_state, "signals") else {}
+        note = _signal_value(signals, "analyst_note_recent")
+        if not isinstance(note, dict):
+            continue                     # D3 stale (offline / no coverage) → skip
+        days_since = note.get("days_since")
+        if days_since is None or not (0 <= days_since <= config.p21_note_window_bd):
+            continue
+
+        anchor = max(held, key=lambda p: abs(p.market_value or 0))
+        extras = {"note_recency": _bd_ago_phrase(days_since)}
+        ctx = T.TemplateContext(position=anchor, account_state=account_state,
+                                signals=signals, config=config)
+        label, lv = T.resolve_variables(T.P21_LABEL_TEMPLATE, ctx, extras)
+        rationale, rv = T.resolve_variables(T.P21_RATIONALE_TEMPLATE, ctx, extras)
+        trace = _build_trace(
+            inputs_from_signals=["analyst_note_recent", "analyst_rating_and_target"],
+            signals=signals,
+            position=anchor,
+            config=config,
+            thresholds_used={"note_window_bd": config.p21_note_window_bd},
+            computation=("a research note dated within the trailing recency "
+                         "window on a held name (no capture gate; direction vs "
+                         "the prior note needs the dated snapshot store)"),
+            fire_result={"days_since_note": days_since, "fired": True},
+            template_variables={**lv, **rv},
+            extras=extras,
+        )
+        name, tier = PATTERN_META["P21"]
+        fires.append(Fire(
+            pattern_id="P21",
+            pattern_name=name,
+            tier=tier,
+            account=account_state.account,
+            position_id=anchor.position_id,
+            underlying=under,
+            asset_class=anchor.asset_class,
+            label=label,
+            rationale=rationale,
+            trace=trace,
+            fired_at=_now(),
+        ))
+    return fires
+
+
 # ---------------------------------------------------------------------------
 # Public registry of detector callables
 # ---------------------------------------------------------------------------
@@ -1316,4 +1401,5 @@ ACCOUNT_LEVEL_DETECTORS = (
     ("P11", detect_p11_account),
     ("P12", detect_p12_account),
     ("P14", detect_p14_account),
+    ("P21", detect_p21_account),
 )

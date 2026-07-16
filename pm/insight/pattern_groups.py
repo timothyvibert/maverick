@@ -5,9 +5,10 @@ kind of action they imply. Deliberately NOT stamped onto the ``Fire`` dataclass
 and not part of fire creation — it is a contained lookup the blotter row-builder
 (and future features) import.
 
-Covers the full live pattern inventory P1-P20: the per-position / account
-patterns P1-P15 (``patterns.PATTERN_META``) and the structure fires P16-P20
-(``structure_fires._META``). ``test_pattern_groups`` asserts this stays exact.
+Covers the full live pattern inventory: the per-position / account engine
+patterns (``patterns.PATTERN_META`` — P1-P15, P21) and the structure fires
+P16-P20 (``structure_fires._META``). ``test_pattern_groups`` asserts this
+stays exact.
 """
 from __future__ import annotations
 
@@ -34,8 +35,9 @@ PATTERN_GROUP: dict[str, str] = {
     "P11": "market",
     "P13": "market",
     "P15": "market",
-    # Catalyst — a calendar/event setup (earnings).
+    # Catalyst — a calendar/event setup (earnings, research notes).
     "P14": "catalyst",
+    "P21": "catalyst",
     # Informational — context, not a direct action.
     "P9": "informational",
     "P12": "informational",
@@ -61,9 +63,10 @@ def group_for(pattern_id: str) -> Optional[str]:
 
 
 def all_pattern_meta() -> dict[str, tuple[str, int]]:
-    """pattern_id -> (display name, tier) across the full live inventory (P1-P20):
-    the engine patterns plus the structure fires. The single place that unions the
-    two metadata sources — used by the inventory guard test."""
+    """pattern_id -> (display name, tier) across the full live inventory (the
+    engine patterns incl. P21, plus the P16-P20 structure fires). The single
+    place that unions the two metadata sources — used by the inventory guard
+    test."""
     from pm.insight.patterns import PATTERN_META
     from pm.insight.structure_fires import _META as STRUCTURE_META
     return {**PATTERN_META, **STRUCTURE_META}

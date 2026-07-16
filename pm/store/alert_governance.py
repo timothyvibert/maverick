@@ -48,9 +48,9 @@ from pm.store import db
 # ---------------------------------------------------------------------------
 
 def togglable_pattern_ids() -> set[str]:
-    """Every pattern the toggle governs — the P1–P15 engine patterns plus the
-    P16–P20 structure fires, from the same union the group-map exhaustiveness
-    oracle uses."""
+    """Every pattern the toggle governs — the engine patterns (P1–P15, P21)
+    plus the P16–P20 structure fires, from the same union the group-map
+    exhaustiveness oracle uses."""
     from pm.insight.pattern_groups import all_pattern_meta
     return set(all_pattern_meta())
 
@@ -94,7 +94,10 @@ def set_pattern_enabled(pattern_id: str, enabled: bool, *,
 
 def fire_key(fire) -> str:
     """The per-fire grain: the originating structure for structure fires, the
-    position for everything else."""
+    position for everything else. For account-level patterns anchored to a
+    proxy position (P14, P21 — the largest holding on the name), the key
+    follows the anchor: if the largest holding changes, the acknowledgement
+    stops matching and the alert returns — acceptable for an episodic ack."""
     return getattr(fire, "structure_id", None) or fire.position_id
 
 

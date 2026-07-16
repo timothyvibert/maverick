@@ -1,6 +1,6 @@
 """The per-pattern headline-metric map — data + types only.
 
-For each pattern — the P1-P15 engine patterns AND the P16-P20 structure fires — this
+For each pattern — the engine patterns (P1-P15, P21) AND the P16-P20 structure fires — this
 names the **single metric whose movement defines "materially changed"**: where the value
 already lives in the fire's ``trace``, the ``PatternConfig`` threshold it is measured
 against (None for the structure fires, whose thresholds are module constants), and the
@@ -207,6 +207,15 @@ HEADLINE_METRICS: dict[str, HeadlineMetric] = {
         "P15", MONOTONIC_NUMERIC,
         Axis(("result", "vol_units"), "p15_vol_multiplier_min", HIGHER_FIRES),
         note="A single-day vol-adjusted move; re-surface on a new, larger move.",
+    ),
+    "P21": HeadlineMetric(
+        "P21", EVENT_RECURRENCE,
+        Axis(("result", "days_since_note"), "p21_note_window_bd", LOWER_FIRES,
+             "business days since the note"),
+        note="The note DATE is the event; a newer note on the name re-surfaces "
+             "a muted alert. Direction (rating/target moved vs the prior note) "
+             "arrives with the dated snapshot store.",
+        event_id_key=("template_variables", "analyst_note_date"),
     ),
     # ------------------------------------------------------------------
     # Structure fires (P16–P20). Their thresholds are structure_fires.py

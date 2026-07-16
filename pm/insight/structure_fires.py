@@ -288,7 +288,7 @@ _ROLE_ACTION = {
 
 
 def attach_structure_context(account_state) -> None:
-    """Annotate leg fires (P1–P15) whose position is a leg of a CONFIRMED structure,
+    """Annotate engine leg fires (every non-structure pattern) whose position is a leg of a CONFIRMED structure,
     so the framing isn't wrong (e.g. P1 'close for margin' on a covered-call short call
     gains 'short leg of your covered call — roll or accept assignment'). The ex-div fire
     (P7) carries its own source-aware dividend copy, so it needs no dividend annotation
