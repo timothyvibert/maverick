@@ -172,7 +172,7 @@ def _pat_toggle_id(pattern_id: str) -> dict:
 
 
 def render_patterns_tab() -> html.Div:
-    """The persisted per-pattern on/off toggles, every P1–P20. A toggled-off
+    """The persisted per-pattern on/off toggles, one per live pattern. A toggled-off
     pattern's fires are COLLAPSED TO MUTED, not dropped: the row shows the live
     count of fires currently hidden by the toggle ('3 muted'), and toggling back
     on restores them in place — a marking flip, no engine re-run, no reload."""

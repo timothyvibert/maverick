@@ -226,6 +226,22 @@ HEADLINE_METRICS: dict[str, HeadlineMetric] = {
              "arrives with the dated snapshot store.",
         event_id_key=("template_variables", "analyst_note_date"),
     ),
+    "P22": HeadlineMetric(
+        "P22", EVENT_RECURRENCE,
+        Axis(("result", "bd_to_expiry"), "p22_expiry_window_bd", LOWER_FIRES,
+             "business days to expiry"),
+        secondary=(
+            Axis(("result", "captured_pct"), "p5_captured_min", LOWER_FIRES,
+                 "band gate: captured below the P5 close-out threshold"),
+            Axis(("result", "pnl_pct"), "p6_pnl_pct_max", HIGHER_FIRES,
+                 "band gate: P&L above the P6 stress threshold"),
+        ),
+        note="An expiry review is an episode bounded by its contract's expiry "
+             "date: muting one silences it through that bell, and a rolled "
+             "position re-entering the window (a NEW expiry, still in the band) "
+             "re-surfaces. The band gates are P5/P6's own dials, not copies.",
+        event_id_key=("template_variables", "expiry"),
+    ),
     # ------------------------------------------------------------------
     # Structure fires (P16–P20). Their thresholds are structure_fires.py
     # module constants, not PatternConfig dials, so threshold_field is None

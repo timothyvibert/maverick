@@ -545,3 +545,25 @@ P21_RATIONALE_TEMPLATE = (
     "(Whether the rating or target MOVED vs the prior note is not yet tracked; "
     "this alert fires on recency, not direction.)"
 )
+
+# ----- P22 -----
+# Copy must read correctly across the whole band — a small winner and a mild
+# loser alike. It is a decide-before-expiry prompt: no "book the premium"
+# (wrong for a loser), no stress language (wrong for a winner).
+P22_LABEL_TEMPLATE = (
+    "{symbol} {right} ${strike} — expires {expiry_phrase} ({captured_pct:.0%} captured)"
+)
+P22_RATIONALE_TEMPLATE = (
+    "{symbol} short {right} ${strike} expires {expiry} — {expiry_phrase} — with "
+    "premium capture at {captured_pct:.0%} and P&L {pnl_pct:.0%}. It sits in the "
+    "band no other premium alert raises: not captured enough to close out, not "
+    "underwater enough to be a stress case. Expiry settles it either way, so "
+    "**review it while every road is still open:**\n"
+    "• **Let it expire** — finishing OTM books the remaining premium at the "
+    "bell; finishing ITM means assignment. Make that an intended outcome, not "
+    "a default.\n"
+    "• **Close it** — take expiry-week assignment and pin risk off the table.\n"
+    "• **Roll it out** — stay in the name on a fresh tenor (price the roll on "
+    "the terminal).\n"
+    "A decision prompt, not a breach — doing nothing is also a decision here."
+)

@@ -160,6 +160,13 @@ _SPECS: tuple[ThresholdSpec, ...] = (
     ThresholdSpec("p21_note_window_bd", "P21",
                   "Research note: flag a note within this many business days",
                   BUSINESS_DAYS, True, 1, 20),
+    # --- P22 --------------------------------------------------------------
+    # The expiry-approach review window. The band itself has no dials of its
+    # own — the detector reads P5's capture gate and both P6 loss gates
+    # directly, so those dials move the band and no gap can silently reopen.
+    ThresholdSpec("p22_expiry_window_bd", "P22",
+                  "Expiry review: flag an otherwise-quiet short option expiring within",
+                  BUSINESS_DAYS, True, 1, 15),
 )
 
 # name -> spec, the lookup every consumer uses.

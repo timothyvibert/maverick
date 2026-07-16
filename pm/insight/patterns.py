@@ -1,5 +1,5 @@
 """Engine pattern detectors — the P1–P15 V1 patterns plus P21 (the
-decoupled research-note alert).
+decoupled research-note alert) and P22 (the expiry-approach review).
 
 Each detector takes a ``PositionContext``-like bundle and a
 ``PatternConfig`` and returns a ``Fire`` (or None / list[Fire] for
@@ -31,7 +31,12 @@ import pandas as pd
 
 from pm.ingest.position_builder import Position
 from pm.insight import templates as T
-from pm.insight.signal_library import SignalDict, SignalValue, _bd_ago_phrase
+from pm.insight.signal_library import (
+    SignalDict,
+    SignalValue,
+    _bd_ago_phrase,
+    _safe_business_days_until,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +161,10 @@ class PatternConfig:
     # fires on days_since <= this, and the captured+note compound (P4) reads
     # the same window through the D3 signal. Default 5 BD ≈ a calendar week.
     p21_note_window_bd: int = 5
+    # P22 — the expiry-approach review window (business days). The band itself
+    # has no dials of its own: the detector reads the P5 capture gate and both
+    # P6 loss gates directly, so moving any of those moves the band with it.
+    p22_expiry_window_bd: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +189,7 @@ PATTERN_META: dict[str, tuple[str, int]] = {
     "P14": ("Earnings catalyst setup", 3),
     "P15": ("Notable price move", 1),
     "P21": ("Research note published", 2),
+    "P22": ("Expiring short option — review", 2),
 }
 
 
@@ -1384,6 +1394,80 @@ def detect_p21_account(account_state, config: PatternConfig) -> list[Fire]:
 
 
 # ---------------------------------------------------------------------------
+# P22 — Expiry-approach review (the band P5 and P6 leave open)
+# ---------------------------------------------------------------------------
+
+def detect_p22(
+    position: Position, account_state, signals: SignalDict, config: PatternConfig,
+) -> Optional[Fire]:
+    """A short option in its final business days that no other premium alert
+    raises: premium captured below the P5 close-out gate, loss short of BOTH
+    P6 stress gates. Nothing else will surface it, yet expiry settles it
+    either way — so it gets a review prompt, not a breach.
+
+    The band reads the P5/P6 dials themselves rather than copies: moving any
+    of those dials moves this band with it, so the coverage hole can never
+    silently reopen — and at every shared boundary the tie goes to the senior
+    pattern (P5 fires at captured >= its gate, P6 at loss <= either of its
+    gates), so a double fire with P5 or P6 is impossible by construction.
+    Inputs are extract-only (captured, P&L, expiry), so the prompt still
+    fires with market data down.
+    """
+    if not _is_short_option(position):
+        return None
+    if position.expiry is None:
+        return None
+    bd_to_expiry = _safe_business_days_until(position.expiry)
+    if bd_to_expiry is None or not (0 <= bd_to_expiry <= config.p22_expiry_window_bd):
+        return None                      # outside the window, or already expired
+    captured = _signal_value(signals, "option_captured_pct")
+    pnl_pct = _signal_value(signals, "position_unrealized_pnl_pct")
+    if captured is None or pnl_pct is None:
+        return None
+    if captured >= config.p5_captured_min:
+        return None                      # P5's band — harvest-ready
+    if pnl_pct <= config.p6_pnl_pct_max or pnl_pct <= config.p6_extreme_pnl_pct_max:
+        return None                      # P6's band — stress, either path
+
+    dte = _signal_value(signals, "option_dte")
+    if bd_to_expiry == 0:
+        expiry_phrase = "today"
+    elif bd_to_expiry == 1:
+        expiry_phrase = "in 1 business day"
+    else:
+        expiry_phrase = f"in {bd_to_expiry} business days"
+
+    extras = {"expiry_phrase": expiry_phrase}
+    ctx = T.TemplateContext(position=position, account_state=account_state,
+                            signals=signals, config=config)
+    label, lv = T.resolve_variables(T.P22_LABEL_TEMPLATE, ctx, extras)
+    rationale, rv = T.resolve_variables(T.P22_RATIONALE_TEMPLATE, ctx, extras)
+    trace = _build_trace(
+        inputs_from_signals=["option_captured_pct", "position_unrealized_pnl_pct",
+                             "option_dte", "option_moneyness"],
+        signals=signals,
+        position=position,
+        position_fields=["right", "expiry", "strike", "quantity"],
+        config=config,
+        thresholds_used={
+            "expiry_window_bd": config.p22_expiry_window_bd,
+            "captured_pct_below": config.p5_captured_min,
+            "pnl_pct_above": config.p6_pnl_pct_max,
+            "extreme_pnl_pct_above": config.p6_extreme_pnl_pct_max,
+        },
+        computation=("short option, 0 <= business days to expiry <= window, "
+                     "captured below the P5 gate AND loss short of both P6 "
+                     "gates — the band neither of them covers"),
+        fire_result={"bd_to_expiry": bd_to_expiry, "dte": dte,
+                     "captured_pct": captured, "pnl_pct": pnl_pct, "fired": True},
+        template_variables={**lv, **rv},
+        extras=extras,
+    )
+    return _make_fire(pattern_id="P22", position=position, account_state=account_state,
+                      label=label, rationale=rationale, trace=trace)
+
+
+# ---------------------------------------------------------------------------
 # Public registry of detector callables
 # ---------------------------------------------------------------------------
 
@@ -1399,6 +1483,7 @@ PER_POSITION_DETECTORS = (
     ("P10", detect_p10),
     ("P13", detect_p13),
     ("P15", detect_p15),
+    ("P22", detect_p22),
 )
 
 ACCOUNT_LEVEL_DETECTORS = (

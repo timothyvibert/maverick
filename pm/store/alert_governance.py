@@ -48,8 +48,8 @@ from pm.store import db
 # ---------------------------------------------------------------------------
 
 def togglable_pattern_ids() -> set[str]:
-    """Every pattern the toggle governs — the engine patterns (P1–P15, P21)
-    plus the P16–P20 structure fires, from the same union the group-map
+    """Every pattern the toggle governs — the engine patterns (P1–P15, P21,
+    P22) plus the P16–P20 structure fires, from the same union the group-map
     exhaustiveness oracle uses."""
     from pm.insight.pattern_groups import all_pattern_meta
     return set(all_pattern_meta())
