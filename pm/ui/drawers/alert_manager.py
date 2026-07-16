@@ -229,11 +229,12 @@ def _fmt_num(ui_value: float, is_int: bool) -> str:
     return str(int(round(ui_value))) if is_int else f"{ui_value:g}"
 
 
-def render_thresholds_tab() -> html.Div:
+def render_thresholds_tab(status: Optional[str] = None) -> html.Div:
     """The editable alert-sensitivity dials, grouped by pattern. Each row seeds
     its input from the persisted override (if any) else the PatternConfig default; the
     Default column always shows the default so 'set vs default' is legible. Apply persists
     the dirty rows and re-runs the engine (persist-then-recompute); Reset clears an override.
+    ``status`` is the per-apply outcome line (rejections) rendered in the actions row.
 
     Pure read — ``settings_store.get_overrides`` never materializes the DB when nothing is
     persisted yet, so opening the tab on a clean store is side-effect-free."""
@@ -251,9 +252,9 @@ def render_thresholds_tab() -> html.Div:
                 html.Td(s.label, className="am-thr-label"),
                 html.Td(className="am-thr-valcell", children=[
                     # No HTML min/max: an out-of-range entry must still commit so the
-                    # server-side catalog can clamp it (a number input with max silently
-                    # refuses out-of-range values, which would look like a no-op). The
-                    # catalog is the authoritative bound.
+                    # server-side catalog can REJECT it with a message (a number input
+                    # with max silently refuses out-of-range values, which would look
+                    # like a no-op). The catalog is the authoritative validator.
                     dcc.Input(
                         id=_thr_input_id(s.name), type="number", value=eff_ui,
                         step=(1 if s.is_int else "any"), debounce=True,
@@ -269,6 +270,7 @@ def render_thresholds_tab() -> html.Div:
     table = html.Table(className="am-table am-thr-table",
                        children=[html.Thead(header), html.Tbody(body_rows)])
     actions = html.Div(className="am-thr-actions", children=[
+        html.Div(status, className="am-thr-status") if status else
         html.Div("Applying re-runs the engine on the current book and re-paints the alerts.",
                  className="am-thr-note"),
         html.Div(className="am-thr-buttons", children=[
@@ -314,9 +316,10 @@ def render_loadnotes_tab() -> html.Div:
 
 
 def render_alert_manager_body(tab: str = "suppressed",
-                              today: Optional[date] = None) -> html.Div:
+                              today: Optional[date] = None,
+                              thr_status: Optional[str] = None) -> html.Div:
     if tab == "thresholds":
-        inner = render_thresholds_tab()
+        inner = render_thresholds_tab(status=thr_status)
     elif tab == "loadnotes":
         inner = render_loadnotes_tab()
     elif tab == "patterns":

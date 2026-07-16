@@ -3,7 +3,8 @@
 The desk tunes how sensitive each alert is ("flag a single name above 35% of NAV, not
 30%"). Every editable dial is a ``PatternConfig`` field; this catalog is the
 single place that says, per dial: which pattern it belongs to, the plain-English label
-the desk reads, its unit, and the sane range it is clamped to. It drives three things
+the desk reads, its unit, and the valid range it is checked against (out-of-range
+is rejected with a message, never silently corrected). It drives three things
 so they can never drift apart:
 
 * validation/coercion in ``settings_store`` (a bad value can never reach the engine),
@@ -51,8 +52,8 @@ class ThresholdSpec:
     label: str                # plain-English, unit-explicit
     unit: str
     is_int: bool              # native value is an int (day counts)
-    min: float                # UI-unit clamp floor (always a positive magnitude)
-    max: float                # UI-unit clamp ceiling
+    min: float                # UI-unit valid-range floor (always a positive magnitude)
+    max: float                # UI-unit valid-range ceiling
     scale: float = _RAW       # native = ui * scale * sign
     sign: int = 1            # -1 where the native value is a magnitude-below (loss / break)
 
@@ -196,17 +197,23 @@ def grouped_by_pattern() -> Iterator[tuple[str, str, list[ThresholdSpec]]]:
 
 
 # ---------------------------------------------------------------------------
-# UI <-> native (stored) transforms + clamping
+# UI <-> native (stored) transforms + validation
 # ---------------------------------------------------------------------------
 def to_stored(name: str, ui_value) -> float | int:
-    """Convert a desk-typed UI value to the PatternConfig-native value, validating and
-    clamping along the way: cast to float (raises ValueError on garbage), clamp to the
-    spec's UI range, apply scale + sign, and round to int for day-count dials. The
-    result is guaranteed in-range, so it can never push the engine outside the catalog's
-    sane bounds."""
+    """Convert a desk-typed UI value to the PatternConfig-native value, validating
+    along the way: cast to float (raises ValueError on garbage), REJECT an
+    out-of-range value (raises ValueError with a desk-readable message — nothing is
+    persisted), apply scale + sign, and round to int for day-count dials.
+
+    Rejection replaced the old silent clamp deliberately: clamping a wrong-sign
+    entry (a typed ``-100`` on a loss dial whose UI floor is 0) landed on the
+    MOST-AGGRESSIVE possible setting (native ``-0.0`` → every losing position
+    fires) while looking accepted — the user must be told, not corrected."""
     s = spec(name)
     v = float(ui_value)                       # ValueError on non-numeric
-    v = max(s.min, min(s.max, v))             # clamp in UI units
+    if not (s.min <= v <= s.max):
+        raise ValueError(
+            f"{s.label}: {v:g} is outside the valid range {s.min:g}–{s.max:g} {s.unit}")
     native = v * s.scale * s.sign
     if s.is_int:
         native = int(round(native))
@@ -220,9 +227,11 @@ def to_ui(name: str, stored_value) -> float:
     return float(stored_value) / (s.scale * s.sign)
 
 
-def clamp_stored(name: str, stored_value) -> float | int:
-    """Re-clamp a native value through the catalog's range (defense in depth: a
-    hand-edited DB value is brought back into bounds before it reaches the engine)."""
+def validate_stored(name: str, stored_value) -> float | int:
+    """Round-trip a native value through the catalog's range check (defense in
+    depth): a hand-edited DB value that is out of range or wrong-signed raises
+    ValueError, and the reader drops the override — reverting that dial to its
+    default — rather than silently adopting the most-aggressive bound."""
     return to_stored(name, to_ui(name, stored_value))
 
 

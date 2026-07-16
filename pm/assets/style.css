@@ -968,6 +968,8 @@ html, body {
     margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--pm-grey-300); gap: 12px;
 }
 .am-thr-note { font-size: 11.5px; color: var(--pm-grey-500); }
+/* Per-apply outcome line: rejections render in the restrained urgency amber. */
+.am-thr-status { font-size: 11.5px; color: var(--pm-urgent); font-weight: 600; }
 .am-thr-buttons { display: flex; gap: 8px; }
 .am-thr-apply-btn { background: var(--pm-accent); color: white; border-color: var(--pm-accent); }
 .am-thr-apply-btn:hover { background: var(--pm-charcoal); color: white; }

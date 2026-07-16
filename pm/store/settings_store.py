@@ -18,7 +18,7 @@ deliberate persist-then-reload (write the override here, then reload state throu
 existing refresh path), which is why this store exposes only persistence +
 ``build_pattern_config``; the engine read happens in ``load_portfolio_state``.
 
-**Validation lives in the catalog.** Every value is coerced/clamped through
+**Validation lives in the catalog.** Every value is coerced/range-checked through
 ``threshold_catalog`` before it is persisted and again when it is read into a config, so
 a bad or stale value can never reach the detectors. An override for an unknown/renamed
 field is ignored, not fatal.
@@ -43,12 +43,14 @@ GLOBAL = "global"
 # ---------------------------------------------------------------------------
 def set_override(name: str, ui_value, *, now: Optional[datetime] = None) -> float | int:
     """Persist an override for one threshold from a desk-typed (UI-unit) value. The
-    value is validated + clamped to the catalog's range and converted to the
+    value is range-checked against the catalog and converted to the
     PatternConfig-native value before storage; the native value is returned. Raises
     ``KeyError`` for a non-editable / unknown ``name`` (a programming error — the UI
-    only ever offers catalog dials) and ``ValueError`` for a non-numeric value.
+    only ever offers catalog dials) and ``ValueError`` for a non-numeric OR
+    out-of-range value — in which case NOTHING is persisted (rejected, not clamped;
+    an existing override is untouched).
     Upserts on ``(scope, name)``, so re-setting refreshes the value and ``updated_at``."""
-    native = cat.to_stored(name, ui_value)             # KeyError / ValueError / clamp
+    native = cat.to_stored(name, ui_value)             # KeyError / ValueError (reject)
     updated_at = (now or datetime.now(timezone.utc)).isoformat()
     with db.connection() as conn:
         conn.execute(
@@ -81,7 +83,9 @@ def clear_all() -> None:
 # ---------------------------------------------------------------------------
 def get_overrides() -> dict[str, float | int]:
     """The persisted overrides as ``{name: native_value}``, for the active scope. Each
-    value is re-clamped through the catalog (defense in depth); an override for a name
+    value is re-validated through the catalog (defense in depth) — a hand-edited
+    out-of-range / wrong-sign DB row is DROPPED so that dial reverts to its default,
+    never silently adopted at the most-aggressive bound; an override for a name
     that is no longer an editable dial is dropped, so a renamed/removed field can never
     reach the engine."""
     if not db.store_exists():
@@ -95,7 +99,7 @@ def get_overrides() -> dict[str, float | int]:
         if not cat.is_editable(name):
             continue                                   # unknown/renamed dial -> ignore
         try:
-            out[name] = cat.clamp_stored(name, json.loads(value))
+            out[name] = cat.validate_stored(name, json.loads(value))
         except (ValueError, TypeError, json.JSONDecodeError):
             continue                                   # corrupt value -> fall back to default
     return out

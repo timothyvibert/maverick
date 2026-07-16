@@ -57,12 +57,16 @@ DIRECTIONS = frozenset({HIGHER_FIRES, LOWER_FIRES, SIGNED, EVENT, NOT_APPLICABLE
 @dataclass(frozen=True)
 class Axis:
     """One condition behind a fire: where its value lives in the trace, the dial it is
-    measured against (or None for a computed/event gate), the firing direction, and a
-    short human label for the secondary/sub-case axes."""
+    measured against (or None for a computed/event gate), the firing direction, a
+    short human label for the secondary/sub-case axes, and — for structurally
+    BOUNDED metrics (captured_pct can never exceed 1.0) — the ceiling, so the
+    material-change margin shrinks to the remaining headroom near it instead of
+    demanding a relative move the metric cannot make."""
     trace_key: tuple
     threshold_field: Optional[str]
     direction: str
     label: str = ""
+    bound: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -85,11 +89,11 @@ class HeadlineMetric:
 HEADLINE_METRICS: dict[str, HeadlineMetric] = {
     "P1": HeadlineMetric(
         "P1", MONOTONIC_NUMERIC,
-        Axis(("result", "captured_pct"), "p1_captured_min", HIGHER_FIRES),
+        Axis(("result", "captured_pct"), "p1_captured_min", HIGHER_FIRES, bound=1.0),
     ),
     "P2": HeadlineMetric(
         "P2", MULTI_AXIS,
-        Axis(("result", "captured_pct"), "p2_captured_min", HIGHER_FIRES),
+        Axis(("result", "captured_pct"), "p2_captured_min", HIGHER_FIRES, bound=1.0),
         secondary=(
             Axis(("result", "iv_pctl"), "p2_iv_pctl_min", HIGHER_FIRES, "IV percentile gate"),
         ),
@@ -119,7 +123,7 @@ HEADLINE_METRICS: dict[str, HeadlineMetric] = {
     ),
     "P5": HeadlineMetric(
         "P5", MULTI_AXIS,
-        Axis(("result", "captured_pct"), "p5_captured_min", HIGHER_FIRES),
+        Axis(("result", "captured_pct"), "p5_captured_min", HIGHER_FIRES, bound=1.0),
         secondary=(
             Axis(("result", "dte"), "p5_dte_max", LOWER_FIRES,
                  "roll window — closer to expiry fires (monotonic time decay)"),
@@ -204,9 +208,14 @@ HEADLINE_METRICS: dict[str, HeadlineMetric] = {
         event_id_key=("template_variables", "earnings_date"),
     ),
     "P15": HeadlineMetric(
-        "P15", MONOTONIC_NUMERIC,
+        "P15", EVENT_RECURRENCE,
         Axis(("result", "vol_units"), "p15_vol_multiplier_min", HIGHER_FIRES),
-        note="A single-day vol-adjusted move; re-surface on a new, larger move.",
+        note="A single-day EVENT, not a drifting number: each new qualifying move "
+             "day is a new episode, so a muted alert re-surfaces on the next one "
+             "(the old monotonic classification compared σ sizes across unrelated "
+             "days — a permanent mute swallowed every future move below the "
+             "baseline's size).",
+        event_id_key=("template_variables", "move_date"),
     ),
     "P21": HeadlineMetric(
         "P21", EVENT_RECURRENCE,

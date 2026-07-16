@@ -616,11 +616,13 @@ def register_callbacks(app: dash.Dash) -> None:
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
             return noop
 
+        thr_status = None
         if trig == "am-thr-reset-all":
             _settings.clear_all()
         elif isinstance(trig, dict) and trig.get("type") == "thr-reset":
             _settings.clear_override(trig["name"])
         elif trig == "am-thr-apply":
+            applied, rejected = 0, []
             for val, cid in zip(values or [], ids or []):
                 name = (cid or {}).get("name")
                 if name is None or not _cat.is_editable(name):
@@ -634,9 +636,16 @@ def register_callbacks(app: dash.Dash) -> None:
                     if abs(float(val) - _cat.default_ui(name)) < 1e-9:
                         _settings.clear_override(name)
                     else:
-                        _settings.set_override(name, val)   # validates + clamps via catalog
-                except (ValueError, TypeError):
-                    continue
+                        _settings.set_override(name, val)   # catalog rejects out-of-range
+                        applied += 1
+                except (ValueError, TypeError) as exc:
+                    # An out-of-range entry is REJECTED, never clamped: nothing is
+                    # persisted for that dial (an existing override stays), the
+                    # message says so, and the reseeded input visibly snaps back.
+                    rejected.append(str(exc))
+            if rejected:
+                thr_status = (f"{len(rejected)} rejected — " + "; ".join(rejected)
+                              + (f" · {applied} applied" if applied else ""))
         else:
             return noop
 
@@ -652,7 +661,8 @@ def register_callbacks(app: dash.Dash) -> None:
                     html.Div(f"Apply failed: {exc}", className="status-left status-empty"),
                     no_update, no_update, "")
         s_cls, p_cls, t_cls, n_cls = _am_tab_classes("thresholds")
-        body = render_alert_manager_body("thresholds")          # reseed inputs from persisted
+        # Reseed inputs from persisted state; a rejected entry snaps back visibly.
+        body = render_alert_manager_body("thresholds", thr_status=thr_status)
         rows = consolidate_fires_to_rows(sa.all_fires(new_state), new_state)
         return (body, s_cls, p_cls, t_cls, n_cls, render_status_bar(new_state), rows,
                 (tick or 0) + 1, "")

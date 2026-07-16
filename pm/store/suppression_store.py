@@ -262,15 +262,28 @@ def _metric_label(hm) -> str:
     return key[-1]
 
 
-def _material_numeric(captured: Optional[float], current: Optional[float], direction: str) -> bool:
+def _material_numeric(captured: Optional[float], current: Optional[float], direction: str,
+                      bound: Optional[float] = None) -> bool:
     """True when ``current`` has moved at least the relative margin further than
     ``captured`` in the firing direction. SIGNED (P3) takes the firing sign from the
-    captured value (a put fired on a negative break, a call on a positive one)."""
+    captured value (a put fired on a negative break, a call on a positive one).
+
+    ``bound`` is the metric's structural ceiling (captured_pct ≤ 1.0): near it the
+    margin shrinks to a fraction of the REMAINING HEADROOM — a baseline of 0.80
+    demanding a 25%-relative move (to 1.0 exactly) was mathematically dead, and any
+    baseline above 0.80 could never re-surface at all. Pinned AT the ceiling there
+    is nothing left to move, so no re-surface."""
     if captured is None or current is None:
         return False
     if abs(captured) < _MATERIAL_ABS_FLOOR:    # can't size a relative move off ~0
         return False
-    need = abs(captured) * _MATERIAL_REL_MARGIN
+    if bound is not None and direction == HIGHER_FIRES:
+        headroom = max(bound - captured, 0.0)
+        if headroom < _MATERIAL_ABS_FLOOR:
+            return False
+        need = _MATERIAL_REL_MARGIN * min(abs(captured), headroom)
+    else:
+        need = abs(captured) * _MATERIAL_REL_MARGIN
     move = current - captured
     if direction == HIGHER_FIRES:
         return move >= need
@@ -291,6 +304,48 @@ def _more_extreme(a: float, b: float, direction: str, captured: float) -> bool:
     if direction == SIGNED:
         return (a < b) if captured < 0 else (a > b)
     return False
+
+
+def pick_baseline_fire(fires, pattern_id: str):
+    """The fire whose trace should anchor a name-wide suppression baseline: the
+    SAME instance the material-change comparison will later measure against — the
+    most-extreme current one on the headline axis (for event metrics, the newest
+    event). The suppression key collapses position identity while the baseline is
+    one fire's trace; anchoring to whichever sibling row the user happened to
+    click meant muting the weaker of two same-name instances flipped straight
+    back to ``resurfaced`` in the same interaction (the comparison found the
+    stronger sibling ≥25% past the weak baseline). Anchored to the extreme
+    instance, the first comparison is value-vs-itself — flip-flop is impossible
+    by construction. Returns None when the pattern has no comparable headline
+    (proxy/unmapped) or no instance carries the metric; the caller then keeps the
+    clicked fire's trace."""
+    hm = HEADLINE_METRICS.get(pattern_id)
+    if hm is None or hm.metric_type == PROXY_ONLY:
+        return None
+    pool = [f for f in fires if getattr(f, "pattern_id", None) == pattern_id]
+    if not pool:
+        return None
+    if hm.metric_type == EVENT_RECURRENCE:
+        if not hm.event_id_key:
+            return None
+        dated = [(f, _to_date(_dig(getattr(f, "trace", {}) or {}, hm.event_id_key)))
+                 for f in pool]
+        dated = [(f, d) for f, d in dated if d is not None]
+        return max(dated, key=lambda t: t[1])[0] if dated else None
+    axis = hm.primary
+    best, best_v = None, None
+    for f in pool:
+        v = _to_float(_dig(getattr(f, "trace", {}) or {}, axis.trace_key))
+        if v is None:
+            continue
+        take = (best_v is None
+                or (axis.direction == HIGHER_FIRES and v > best_v)
+                or (axis.direction == LOWER_FIRES and v < best_v)
+                # SIGNED with no baseline sign to lean on: largest magnitude.
+                or (axis.direction == SIGNED and abs(v) > abs(best_v)))
+        if take:
+            best, best_v = f, v
+    return best
 
 
 def _resurfaces(record: dict, fires) -> Optional[SuppressionMark]:
@@ -330,14 +385,26 @@ def _resurfaces(record: dict, fires) -> Optional[SuppressionMark]:
     cap_v = _to_float(_dig(captured, axis.trace_key))
     if cap_v is None:
         return None
+    current = [v for v in (_to_float(_dig(getattr(f, "trace", {}) or {}, axis.trace_key))
+                           for f in fires) if v is not None]
+    if not current:
+        return None
+    if axis.direction == SIGNED:
+        # A SIGNED metric that flipped side (put-side break muted, call-side break
+        # firing now) is material per se — the value comes from an actual fire, so
+        # the engine already validated the opposite-side condition; the deepening
+        # rule below can never select it (it measures further-in-the-CAPTURED-sign).
+        flipped = [v for v in current
+                   if cap_v * v < 0 and abs(v) > _MATERIAL_ABS_FLOOR]
+        if flipped:
+            best_flip = max(flipped, key=abs)
+            return SuppressionMark(kind="resurfaced", metric=_metric_label(hm),
+                                   captured_value=cap_v, current_value=best_flip)
     best_v = None                              # the most-extreme current value
-    for f in fires:
-        cv = _to_float(_dig(getattr(f, "trace", {}) or {}, axis.trace_key))
-        if cv is None:
-            continue
+    for cv in current:
         if best_v is None or _more_extreme(cv, best_v, axis.direction, cap_v):
             best_v = cv
-    if best_v is None or not _material_numeric(cap_v, best_v, axis.direction):
+    if best_v is None or not _material_numeric(cap_v, best_v, axis.direction, axis.bound):
         return None
     return SuppressionMark(kind="resurfaced", metric=_metric_label(hm),
                            captured_value=cap_v, current_value=best_v)

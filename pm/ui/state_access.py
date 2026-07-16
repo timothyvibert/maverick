@@ -841,18 +841,26 @@ def suppress_alert(account: str, name: str, pattern_id: str, *,
                    trace: Optional[dict] = None,
                    rationale: Optional[str] = None) -> bool:
     """Suppress (``suppressed_until=None``) or snooze the alert ``(account, name,
-    pattern_id)``; ``trace``/``rationale`` capture the acting fire's baseline (store
-    only). Re-marks the account so the muted fire drops from the active surfaces at
-    once. Returns True on success."""
+    pattern_id)``. The captured baseline is anchored to the MOST-EXTREME matching
+    instance on the name — the same instance the material-change comparison
+    measures against — not the clicked row's, so muting the weaker of two
+    same-name instances can never flip straight back to ``resurfaced`` in the
+    same interaction (the passed ``trace``/``rationale`` remain the fallback when
+    no live state or no comparable headline exists). Re-marks the account so the
+    muted fire drops from the active surfaces at once. Returns True on success."""
     from pm.store import suppression_store
     with _WRITE_LOCK:
+        state = _RUNTIME.get("state")
+        acc = state.accounts.get(account) if state is not None else None
+        if acc is not None:
+            matching = [f for f in acc.fires
+                        if f.underlying == name and f.pattern_id == pattern_id]
+            baseline = suppression_store.pick_baseline_fire(matching, pattern_id)
+            if baseline is not None:
+                trace, rationale = baseline.trace, baseline.rationale
         suppression_store.suppress(account, name, pattern_id,
                                    suppressed_until=suppressed_until,
                                    trace=trace, rationale=rationale)
-        state = _RUNTIME.get("state")
-        if state is None:
-            return False
-        acc = state.accounts.get(account)
         if acc is None:
             return False
         suppression_store.remark_account(acc)

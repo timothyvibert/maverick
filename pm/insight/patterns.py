@@ -1295,8 +1295,13 @@ def detect_p15(
         config=config,
         thresholds_used={"p15_vol_multiplier_min": config.p15_vol_multiplier_min},
         computation="vol_adjusted_move >= p15_vol_multiplier_min",
-        fire_result={"vol_units": vol_units, "return_1d": return_1d, "fired": True},
-        template_variables={**lv, **rv},
+        fire_result={"vol_units": vol_units, "return_1d": return_1d,
+                     "move_date": date.today().isoformat(), "fired": True},
+        # move_date stamps WHICH day's move this is — P15 is a single-day event,
+        # and material-change re-surfacing keys on it so a permanent mute never
+        # swallows a NEW notable-move day (the old monotonic classification
+        # compared σ sizes across unrelated days).
+        template_variables={**lv, **rv, "move_date": date.today().isoformat()},
         extras=extras,
     )
     return _make_fire(pattern_id="P15", position=position, account_state=account_state,
