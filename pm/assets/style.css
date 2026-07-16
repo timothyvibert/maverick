@@ -1716,3 +1716,8 @@ html, body {
 .risk-block-error { border-left: 3px solid var(--pm-urgent); }
 
 .risk-footer { margin-top: 10px; border-top: 1px solid var(--pm-grey-300); padding-top: 8px; }
+
+/* Obligations window ladder: label + the four expiry windows. */
+.risk-oblig-ladder .dd-ladder-row { grid-template-columns: 140px repeat(4, 1fr); }
+.risk-oblig-ladder .dd-ladder-head span:not(:first-child),
+.risk-oblig-ladder .dd-ladder-count { text-align: right; }
