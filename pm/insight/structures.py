@@ -427,6 +427,58 @@ def _detect_for_underlying(
         for o in short_puts:
             opt_rem[o.position_id] = 0.0
 
+    # ---- 6) Naked short call: short calls no pass above could claim ------------
+    # The uncovered sweep of last resort. No coverable stock reaches here: when
+    # long shares exist the covered-call pass consumed every short call (covered
+    # or excess), so what arrives is a short call on a stock-less name or the
+    # leftover a collar / contention left behind. Unclaimed LONG calls still
+    # offset it — a ratio spread's short side has bounded upside, not naked — but
+    # only same-or-later expiry counts (an earlier-expiry long call dies first
+    # and covers nothing beyond its own life). Only the remainder is naked.
+    # Reuses NAKED_EXCESS_SHORT_CALL so every downstream surface (P16/P19, the
+    # By-Structure grid, tier-2 pricing, the exposure rollup, resolve/rederive)
+    # works unchanged.
+    naked_shorts = sorted(calls_short(), key=lambda o: (str(o.expiry), o.strike or 0))
+    if naked_shorts:
+        lc_pool = [[o.expiry, opt_rem[o.position_id] * _opt_mult(o)] for o in calls_long()]
+        naked_legs: list[StructureLeg] = []
+        for o in naked_shorts:
+            mult = _opt_mult(o)
+            have = int(abs(opt_rem[o.position_id]))
+            need = have * mult
+            for slot in lc_pool:
+                if need <= 0:
+                    break
+                if o.expiry is not None and slot[0] is not None and slot[0] < o.expiry:
+                    continue
+                take = min(need, slot[1])
+                slot[1] -= take
+                need -= take
+            # A contract counts covered only when fully covered — the remainder
+            # rounds UP to whole naked contracts (a partially-covered contract
+            # cannot deliver).
+            naked = min(have, -(-int(need) // mult)) if need > 0 else 0
+            opt_rem[o.position_id] = 0.0
+            if naked > 0:
+                naked_legs.append(StructureLeg(o.position_id, -naked, "naked_excess_short_call"))
+        if naked_legs:
+            contracts = sum(int(abs(l.allocated_qty)) for l in naked_legs)
+            no_stock = not stock_legs
+            out.append(Structure(
+                structure_id=_sid(account, underlying, NAKED_EXCESS_SHORT_CALL,
+                                  [l.position_id for l in naked_legs], suffix="naked"),
+                account=account, underlying=underlying, type=NAKED_EXCESS_SHORT_CALL,
+                confidence_band=HIGH, status="proposed", legs=naked_legs,
+                rationale_trace=_trace(
+                    {"naked_excess_contracts": {"value": contracts,
+                                                "source": "computed:short calls − available cover"},
+                     "stock_held": {"value": not no_stock, "source": "EXTRACT:quantity"}},
+                    f"short {contracts} {underlying} call(s) with "
+                    + ("no covering shares held on the name"
+                       if no_stock else "no shares left to cover them"),
+                    "naked short call (no cover on the name)"),
+                source="detector:naked_call"))
+
     return out
 
 

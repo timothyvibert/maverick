@@ -40,6 +40,14 @@ _CONFIRMED = ("confirmed", "edited")
 # make these editable too — not built this increment.
 _PIN_NEAR = 0.02            # |spot-strike|/spot within 2% = near the money
 _PIN_DTE = 1               # expiry-day (or last day)
+_PIN_DTE_MIN = 0           # never on an already-expired leg (a stale extract row)
+# Every structure type carrying a short leg that can pin: the original covered
+# call / collar / vertical plus the canonical pin cases the first cut omitted —
+# short straddles/strangles, covered / cash-secured short puts, and the naked
+# short call itself (the position P16 declares most dangerous).
+_PIN_TYPES = (S.COVERED_CALL, S.COLLAR, S.VERTICAL, S.STRADDLE, S.STRANGLE,
+              S.COVERED_PUT, S.CASH_SECURED_PUT, S.NAKED_EXCESS_SHORT_CALL)
+_PIN_SHORT_ROLES = ("short_call", "short_put", "naked_excess_short_call")
 _MONETIZE_EXTRINSIC_FRAC = 0.05   # put extrinsic <= 5% of intrinsic (owner threshold)
 
 
@@ -98,7 +106,26 @@ def _money(v) -> str:
 def _struct_word(typ: str) -> str:
     return {S.COVERED_CALL: "covered call", S.COLLAR: "collar", S.VERTICAL: "vertical",
             S.COVERED_PUT: "covered put", S.CASH_SECURED_PUT: "cash-secured put",
-            S.STRADDLE: "straddle", S.STRANGLE: "strangle"}.get(typ, typ)
+            S.STRADDLE: "straddle", S.STRANGLE: "strangle",
+            S.NAKED_EXCESS_SHORT_CALL: "naked short call"}.get(typ, typ)
+
+
+def _group_representative(account_state, st) -> bool:
+    """One voice per contention group: ranked alternatives share the same short
+    leg, so an ungated per-structure fire (P19) would flag the same pin event once
+    per reading — inflating the T1 tier counts. The group speaks through ONE
+    member: the confirmed one if any, else the lowest-structure_id non-rejected
+    member, else the lowest overall. Pure function of the account's current
+    structures, so the load pass and the confirm/reject re-derive agree."""
+    group = getattr(st, "contention_group", None)
+    if not group:
+        return True
+    members = [s for s in account_state.structures
+               if getattr(s, "contention_group", None) == group]
+    pool = ([s for s in members if s.status in _CONFIRMED]
+            or [s for s in members if s.status != "rejected"]
+            or members)
+    return st.structure_id == min(pool, key=lambda s: s.structure_id).structure_id
 
 
 def _fire(pattern_id, account, position, underlying, label, rationale, trace, fired_at) -> Fire:
@@ -118,20 +145,37 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
     out: list[Fire] = []
 
     # --- P16 coverage breach (T1, holdings-only) ---------------------------
+    # One fire per naked LEG position (blotter rows are per (account, position);
+    # a single fire on legs[0] would leave every other naked leg alert-less).
     if st.type == S.NAKED_EXCESS_SHORT_CALL:
-        leg = st.legs[0]
-        pos = by_id.get(leg.position_id)
-        if pos is not None:
+        outright_naked = st.source == "detector:naked_call"
+        for leg in st.legs:
+            pos = by_id.get(leg.position_id)
+            if pos is None:
+                continue
             n = int(abs(leg.allocated_qty))
-            out.append(_fire("P16", account, pos, u,
-                f"{u} over-write — {n} naked-excess short call(s)",
-                (f"Your {u} over-write writes {n} more call(s) than the shares held cover. "
-                 f"The excess behaves like a naked short call — assignment there delivers short "
-                 f"stock, exposure the client likely did not intend. Bring coverage back to 1:1 "
-                 f"or close the excess."),
+            if n <= 0:
+                continue
+            if outright_naked:
+                label = f"{u} naked short call — {n} uncovered contract(s)"
+                rationale = (
+                    f"Short {u} call(s) with no cover on the name: {n} contract(s) are "
+                    f"outright naked — assignment delivers short stock, unbounded upside "
+                    f"exposure the client likely did not intend. Cover with stock, pair "
+                    f"with a longer-dated long call, or close.")
+                computation = "short call with no available cover on the name → naked"
+            else:
+                label = f"{u} over-write — {n} naked-excess short call(s)"
+                rationale = (
+                    f"Your {u} over-write writes {n} more call(s) than the shares held cover. "
+                    f"The excess behaves like a naked short call — assignment there delivers short "
+                    f"stock, exposure the client likely did not intend. Bring coverage back to 1:1 "
+                    f"or close the excess.")
+                computation = "short-call shares > shares held → the excess is uncovered"
+            out.append(_fire("P16", account, pos, u, label, rationale,
                 _trace({"naked_excess_contracts": {"value": n, "source": "structure:naked_excess_short_call"}},
-                       "short-call shares > shares held → the excess is uncovered",
-                       "coverage breach (naked-excess short call)"),
+                       computation,
+                       "coverage breach (naked short call)"),
                 fired_at))
 
     # --- P17 carry-driven early exercise on a deep-ITM short put (T2) ------
@@ -207,17 +251,23 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                     fired_at))
 
     # --- P19 pin / partial-ITM into expiry (T1) ---------------------------
-    if st.type in (S.COVERED_CALL, S.COLLAR, S.VERTICAL):
+    # Every short-legged type pins (incl. straddles/strangles, short puts and the
+    # naked short call). Lower DTE bound: an already-expired leg still sitting in
+    # the extract must not fire with negative-DTE copy (P17's dte<=0 guard, made
+    # explicit here). Contention alternatives share the short leg — only the
+    # group's representative speaks, or one pin event counts twice in the T1 tier
+    # chips.
+    if st.type in _PIN_TYPES and _group_representative(account_state, st):
         for leg in st.legs:
-            if leg.allocated_qty >= 0 or not leg.role.startswith("short_"):
+            if leg.allocated_qty >= 0 or leg.role not in _PIN_SHORT_ROLES:
                 continue
             pos = by_id.get(leg.position_id)
             if pos is None or pos.asset_class != "option":
                 continue
             spot, strike, dte = _spot(account_state, pos), float(pos.strike or 0), _dte(pos, as_of)
-            if spot is None or strike <= 0 or dte is None:
+            if spot is None or spot <= 0 or strike <= 0 or dte is None:
                 continue
-            if dte <= _PIN_DTE and abs(spot - strike) / spot <= _PIN_NEAR:
+            if _PIN_DTE_MIN <= dte <= _PIN_DTE and abs(spot - strike) / spot <= _PIN_NEAR:
                 out.append(_fire("P19", account, pos, u,
                     f"{u} {_struct_word(st.type)} — pin risk on the short ${strike:g}",
                     (f"Pin risk: the short {strike:g} leg of your {u} {_struct_word(st.type)} sits "
@@ -230,9 +280,9 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                             "dte": {"value": dte, "source": "computed:expiry−as_of"},
                             "leg_expiry": {"value": pos.expiry.isoformat() if pos.expiry else None,
                                            "source": "EXTRACT:option_expiration"}},
-                        "short structure leg AND DTE ≤ 1 AND |spot−strike|/spot ≤ 2%",
+                        "short structure leg AND 0 ≤ DTE ≤ 1 AND |spot−strike|/spot ≤ 2%",
                         "pin / partial-ITM conversion risk into expiry",
-                        {"near_pct": _PIN_NEAR, "dte_max": _PIN_DTE}),
+                        {"near_pct": _PIN_NEAR, "dte_max": _PIN_DTE, "dte_min": _PIN_DTE_MIN}),
                     fired_at))
 
     # --- P20 collar protective-put monetize-after-drop (T2; confirmed) ----

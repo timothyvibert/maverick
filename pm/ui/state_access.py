@@ -802,12 +802,21 @@ def resolve_structure(
         # Swap in the affected structure's fires by structure_id: drop its prior fires,
         # then append the freshly re-derived set. Unified across confirm and reject — a
         # reject re-derives too, so the structure's non-confirmation-gated fires survive
-        # exactly as a full reload would produce them while the gated ones drop. Then
-        # rebuild leg-context annotations from each fire's clean base (idempotent).
-        # Built off to the side and assigned once, so a concurrent render never
-        # sees the list mid-rebuild.
-        fires = [f for f in acc.fires if f.structure_id != structure_id]
-        fires.extend(rederive_structure_fires(state, acc, target))
+        # exactly as a full reload would produce them while the gated ones drop. A
+        # contention choose flips the WHOLE group (winner confirmed, siblings rejected)
+        # and the pin fire speaks through one group representative — so every member is
+        # swapped, not just the target, else a sibling's stale fire lingers until the
+        # next full load. Then rebuild leg-context annotations from each fire's clean
+        # base (idempotent). Built off to the side and assigned once, so a concurrent
+        # render never sees the list mid-rebuild.
+        group = getattr(target, "contention_group", None)
+        members = ([s for s in acc.structures
+                    if getattr(s, "contention_group", None) == group]
+                   if group else [target])
+        member_ids = {s.structure_id for s in members}
+        fires = [f for f in acc.fires if f.structure_id not in member_ids]
+        for m in members:
+            fires.extend(rederive_structure_fires(state, acc, m))
         acc.fires = fires
         attach_structure_context(acc)
         # Re-mark this account's fires so a just-confirmed fire that matches an
