@@ -251,7 +251,10 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
     vol_axis = np.array(GRID_VOL_PTS, dtype=float)
     matrix = np.zeros((len(vol_axis), len(spot_axis)))
 
-    t2 = (today_ts + pd.Timedelta(days=time_days)) if time_days else None
+    # Same business-day roll as _shocked_inputs: a weekend-landing time shock must
+    # re-tenor the grid from the SAME shifted date as the impact table, or the two
+    # surfaces differ by one business day of decay.
+    t2 = _bd(today_ts + pd.Timedelta(days=time_days)) if time_days else None
     for lg in legs:
         beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
         if time_days:
