@@ -196,7 +196,10 @@ def price_scenario(
         "account": {"pnl": impact["account_pnl"], "pnl_pct": impact["account_pnl_pct"],
                     "axes": shock.axes(), "mode": mode, "target": target,
                     "n_priced": impact.get("n_priced"),
-                    "n_skipped": impact.get("n_skipped")},
+                    "n_skipped": impact.get("n_skipped"),
+                    # current-vs-stressed exposure totals (engine-priced both
+                    # sides, account scope) — the reshape view's substrate
+                    "exposures": impact.get("exposures")},
         "positions": impact["rows"],
         "grid": grid,
     }

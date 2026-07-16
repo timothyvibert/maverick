@@ -200,15 +200,27 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     plus the account total. The per-position rows SUM to the account total — the
     total covers the PRICEABLE book only, so the return also carries n_priced /
     n_skipped (whole-book counts) for the coverage cue. Fast on the dial;
-    ``mode='truth'`` for a committed point. Pure, read-only."""
+    ``mode='truth'`` for a committed point. Pure, read-only.
+
+    The return also carries ``exposures`` — the priced scope's exposure totals at
+    the CURRENT state and at the SHOCKED state, engine-priced on both sides through
+    the same shocked-input path (the zero shock IS the current state), so the
+    difference between the two columns is pure shock effect, never a live greek
+    differenced against a recomputed one. Dollar gamma is reported on both bases
+    (engine per-$1, and per-1% via x spot/100 — the exposure section's basis);
+    theta is engine per business day."""
     today_ts = _normalize_today(today)
     legs, equities, skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
-    shifted = _shifted_curve(getattr(state, "risk_free_curve", None) or [], shock.rate_bps)
+    curve = getattr(state, "risk_free_curve", None) or []
+    shifted = _shifted_curve(curve, shock.rate_bps)
     nav = _num(getattr(account_state, "nav", None))
+    zero = ShockSpec("base", "base")
 
     rows: list[dict] = []
     total = 0.0
+    exp_now = _exposure_acc()
+    exp_str = _exposure_acc()
     for lg in legs:
         beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
         S, sigma, r, T, t2 = _shocked_inputs(lg, beta, shock, shifted, today_ts)
@@ -218,6 +230,12 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
         pnl = mult * (px1 - px0)
         total += pnl
         g = _greeks_at(lg, S, sigma, r, T, t2, mode)
+        # Current-state greeks through the SAME input path at the zero shock —
+        # identical tuples at zero shock, so Now == Stressed exactly there.
+        S0, sig0, r0, T0, t0 = _shocked_inputs(lg, beta, zero, curve, today_ts)
+        g0 = _greeks_at(lg, S0, sig0, r0, T0, t0, mode)
+        _accrue_exposure(exp_now, mult, g0, S0, beta)
+        _accrue_exposure(exp_str, mult, g, S, beta)
         rows.append({
             "id": lg.position_id, "label": _leg_label(lg), "kind": "option",
             "underlying": lg.underlying_bbg, "structure_id": _structure_of(account_state, lg.position_id),
@@ -227,6 +245,8 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
         s1 = max(eq["spot"] * (1.0 + eq["beta"] * shock.spot_pct / 100.0), 0.0)
         pnl = eq["qty"] * (s1 - eq["spot"])
         total += pnl
+        _accrue_equity_exposure(exp_now, eq["qty"] * eq["spot"], eq["beta"])
+        _accrue_equity_exposure(exp_str, eq["qty"] * s1, eq["beta"])
         rows.append({
             "id": eq["bbg"], "label": eq["bbg"], "kind": "equity", "underlying": eq["bbg"],
             "structure_id": None, "pnl": pnl, "dd": eq["qty"] * s1,
@@ -235,7 +255,45 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     rows.sort(key=lambda r: r["pnl"])
     n_skipped = skips["n_options_skipped"] + skips["n_equities_skipped"]
     return {"account_pnl": total, "account_pnl_pct": (total / nav if nav else None),
-            "rows": rows, "n_priced": len(legs) + len(equities), "n_skipped": n_skipped}
+            "rows": rows, "n_priced": len(legs) + len(equities), "n_skipped": n_skipped,
+            "exposures": {
+                "now": exp_now, "stressed": exp_str,
+                "n_legs": len(legs) + len(equities), "n_skipped": n_skipped,
+                "basis": {
+                    "gamma": "dollar gamma per 1% spot move (engine gamma x spot/100); "
+                             "dg_native is the engine per-$1 form",
+                    "theta": "engine, per business day",
+                    "beta": f"{BETA_FIELD} (SPX 2y wkly); missing beta prices at "
+                            f"{DEFAULT_BETA:g} (full market participation)",
+                    "pricer": ("truth-CRR" if mode == "truth"
+                               else "fast vectorized BS2002"),
+                }}}
+
+
+def _exposure_acc() -> dict:
+    """One state's exposure totals over the priced scope: dollar delta, beta-$
+    (net market exposure), dollar gamma (per-1% and engine-native per-$1),
+    dollar vega (per vol pt), dollar theta (per business day)."""
+    return {"dd": 0.0, "dbeta": 0.0, "dg_1pct": 0.0, "dg_native": 0.0,
+            "dv": 0.0, "dt_bd": 0.0}
+
+
+def _accrue_exposure(acc: dict, mult, g: dict, S, beta) -> None:
+    dd = mult * g.get("delta", 0.0) * S
+    acc["dd"] += dd
+    acc["dbeta"] += dd * beta
+    dg_native = mult * g.get("gamma", 0.0) * S
+    acc["dg_native"] += dg_native
+    acc["dg_1pct"] += dg_native * S / 100.0
+    acc["dv"] += mult * g.get("vega", 0.0)
+    acc["dt_bd"] += mult * g.get("theta", 0.0)
+
+
+def _accrue_equity_exposure(acc: dict, dd, beta) -> None:
+    # Stock is delta-one and carries no vol/rate/time sensitivity in this model —
+    # its gamma/vega/theta contributions are genuine zeros, not missing data.
+    acc["dd"] += dd
+    acc["dbeta"] += dd * beta
 
 
 def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=None,
