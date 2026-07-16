@@ -45,6 +45,12 @@ BETA_FIELD = "EQY_BETA"          # SPX-adjusted beta (snapshot.underlyings)
 DEFAULT_BETA = 1.0               # full market participation when a name has no beta
 SIGMA_FLOOR = 1e-4
 _T_FLOOR = 1e-6
+# A beta-mapped move past -100% (|beta| x shock, e.g. beta 6 at SPX -20%) would drive
+# the shocked spot negative — NaN through the pricers. A stock cannot be worth less
+# than nothing: option inputs clamp to one cent (the kernels take logs, and the fast
+# greeks' spot bump has an absolute floor of 1e-4 — the clamp must stay above it),
+# equity legs clamp to exactly zero (full loss of value, never more).
+_SPOT_FLOOR = 0.01
 CURVE_SPAN_PCT = 25.0            # +- SPX move spanned by the (v1) P&L curve
 CURVE_POINTS = 101
 PRESET_STEPS = FAST_CRR_STEPS    # leaned preset-table tier (n=200 truth)
@@ -218,12 +224,12 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
             "pnl": pnl, "dd": mult * g.get("delta", 0.0) * S, "dg": mult * g.get("gamma", 0.0) * S,
             "dv": mult * g.get("vega", 0.0), "dt": mult * g.get("theta", 0.0)})
     for eq in equities:
-        d_spot = eq["spot"] * eq["beta"] * shock.spot_pct / 100.0
-        pnl = eq["qty"] * d_spot
+        s1 = max(eq["spot"] * (1.0 + eq["beta"] * shock.spot_pct / 100.0), 0.0)
+        pnl = eq["qty"] * (s1 - eq["spot"])
         total += pnl
         rows.append({
             "id": eq["bbg"], "label": eq["bbg"], "kind": "equity", "underlying": eq["bbg"],
-            "structure_id": None, "pnl": pnl, "dd": eq["qty"] * (eq["spot"] + d_spot),
+            "structure_id": None, "pnl": pnl, "dd": eq["qty"] * s1,
             "dg": 0.0, "dv": 0.0, "dt": 0.0})
 
     rows.sort(key=lambda r: r["pnl"])
@@ -256,7 +262,7 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
             r = _shocked_rate(lg, shifted, lg.today, rate_bps)
         px0 = float(strategy.price_leg(lg.spot, lg.K, lg.T, lg.r, lg.q, lg.sigma,
                                        lg.opt_type, style=lg.style, mode="fast"))  # current state
-        s_arr = lg.spot * (1.0 + beta * spot_axis / 100.0)
+        s_arr = np.maximum(lg.spot * (1.0 + beta * spot_axis / 100.0), _SPOT_FLOOR)
         mult = lg.qty * lg.multiplier
         for vi, vp in enumerate(vol_axis):
             sig = max(lg.sigma + vp / 100.0, SIGMA_FLOOR)
@@ -264,7 +270,8 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
                                                style=lg.style, mode="fast"), dtype=float)
             matrix[vi, :] += mult * (px - px0)
     for eq in equities:                                   # linear, vol-independent
-        matrix += (eq["qty"] * eq["spot"] * eq["beta"] * spot_axis / 100.0)[None, :]
+        s_arr = np.maximum(eq["spot"] * (1.0 + eq["beta"] * spot_axis / 100.0), 0.0)
+        matrix += (eq["qty"] * (s_arr - eq["spot"]))[None, :]
 
     return {"spot_axis": spot_axis.tolist(), "vol_axis": vol_axis.tolist(),
             "pnl_matrix": matrix.tolist(), "pricer": "fast vectorized BS2002"}
@@ -281,7 +288,7 @@ def _bd(ts) -> pd.Timestamp:
 
 
 def _shocked_inputs(leg: EngineLeg, beta, shock: ShockSpec, shifted_curve, today_ts):
-    S = leg.spot * (1.0 + beta * shock.spot_pct / 100.0)
+    S = max(leg.spot * (1.0 + beta * shock.spot_pct / 100.0), _SPOT_FLOOR)
     sigma = max(leg.sigma + shock.vol_pts / 100.0, SIGMA_FLOOR)
     if shock.time_days:
         t2 = _bd(today_ts + pd.Timedelta(days=shock.time_days))
@@ -316,7 +323,8 @@ def _account_pnl(legs, equities, beta_map, base_price, curve_pts, today_ts, shoc
         px = _price_at(lg, S, sigma, r, T, t2, mode, n_steps=n_steps)
         total += lg.qty * lg.multiplier * (px - base_price[lg.position_id])
     for eq in equities:
-        total += eq["qty"] * eq["spot"] * eq["beta"] * shock.spot_pct / 100.0
+        s1 = max(eq["spot"] * (1.0 + eq["beta"] * shock.spot_pct / 100.0), 0.0)
+        total += eq["qty"] * (s1 - eq["spot"])
     return total
 
 
@@ -410,14 +418,15 @@ def _portfolio_curve(legs, equities, beta_map, scenarios, today_ts) -> dict:
     pnl = np.zeros_like(grid)
     for lg in legs:
         beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
-        s_arr = lg.spot * (1.0 + beta * grid / 100.0)
+        s_arr = np.maximum(lg.spot * (1.0 + beta * grid / 100.0), _SPOT_FLOOR)
         p = np.asarray(strategy.price_leg(s_arr, lg.K, lg.T, lg.r, lg.q, lg.sigma,
                                           lg.opt_type, style=lg.style, mode="fast"), dtype=float)
         p0 = float(strategy.price_leg(lg.spot, lg.K, lg.T, lg.r, lg.q, lg.sigma,
                                       lg.opt_type, style=lg.style, mode="fast"))
         pnl += lg.qty * lg.multiplier * (p - p0)
     for eq in equities:
-        pnl += eq["qty"] * eq["spot"] * eq["beta"] * grid / 100.0
+        s_arr = np.maximum(eq["spot"] * (1.0 + eq["beta"] * grid / 100.0), 0.0)
+        pnl += eq["qty"] * (s_arr - eq["spot"])
 
     truth_x, truth_pnl = [], []
     by_name = {s.name: s for s in scenarios}
