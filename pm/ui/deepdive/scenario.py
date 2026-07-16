@@ -1,16 +1,13 @@
-"""Section — Scenario / stress, dense + interactive.
+"""Scenario components for the Risk section (the cockpit composes them).
 
 A shock-control row + preset chips drive the one sanctioned ``price_scenario``
-recompute (fast vectorized BS2002, read-only over loaded state). The centerpiece is
-the spot×vol P&L **heatmap** (token diverging scale around 0, never default plotly;
-its zero-vol row is the P&L-vs-SPX line, and the 2-D surface shows the crash corner);
-beside it a per-position/structure **impact table** (P&L@shock + dollar greeks,
-sign-colored, click-a-row to drill the heatmap to that position's surface).
-
-Layout: controls row over [heatmap | impact-table] — dense, no vertical sprawl. The
-initial (zero-shock) view is computed at render so first paint is correct; dialing /
-presets / drill repaint via the callbacks in ``callbacks.py``. plotly is imported
-lazily in the figure builder. Token-styled throughout (no new palette).
+recompute (fast vectorized BS2002, read-only over loaded state). The spot×vol P&L
+**heatmap** (token diverging scale around 0, never default plotly) and the
+per-position/structure **impact table** (P&L@shock + dollar greeks, sign-colored,
+click-a-row to drill) are the cockpit's drill layer; the total line is its answer
+strip. ``risk_cockpit.render_risk_section`` owns the section shell — this module
+is the component library, shared by that builder and the callbacks. plotly is
+imported lazily in the figure builder. Token-styled throughout (no new palette).
 """
 from __future__ import annotations
 
@@ -18,7 +15,6 @@ from typing import Optional
 
 from dash import dcc, html
 
-from pm.risk.scenario import (GRID_VOL_PTS, ShockSpec, shock_reprice, spot_vol_grid)
 from pm.ui.deepdive.aggregations import _fmt_money
 
 # token hex mirroring assets/style.css (:root) — plotly needs explicit colors.
@@ -64,41 +60,9 @@ _CAPTION = (
     "All numbers here — heatmap, impact table, presets — are fast vectorized "
     "BS2002 (β-mapped SPX × vol shift, P&L vs current); ● current shock, "
     "◆ preset points. Γ$ is engine dollar-gamma per $1 spot move — a different "
-    "basis from the Exposure section's per-1% γ; do not compare. θ is engine "
+    "basis from the current-book panels' per-1% γ; do not compare. θ is engine "
     "per-business-day (diverges from the BBG snapshot θ). Dial recomputes live, "
     "no Bloomberg.")
-
-
-def render_scenario_section(account_state, state) -> html.Div:
-    head = html.Div(className="dd-section-head", children=[
-        html.H2("Scenario & stress", className="dd-section-title"),
-        html.Span("hypothetical-state · engine-priced · dial live", className="dd-section-meta"),
-    ])
-    if account_state is None or state is None:
-        return html.Div(className="dd-section", children=[
-            head, html.Div("Scenario views unavailable (Bloomberg off or no priceable options).",
-                           className="dd-empty")])
-
-    # initial zero-shock view (pure functions; first paint correct without a callback)
-    zero = ShockSpec("base", "base")
-    impact = shock_reprice(state, account_state, zero, mode="fast")
-    grid = spot_vol_grid(state, account_state)
-
-    return html.Div(className="dd-section", children=[
-        head,
-        _controls(account_state, impact["rows"]),
-        html.Div(className="scn-body", children=[
-            html.Div(className="scn-heatmap-wrap", children=[
-                dcc.Graph(id="scn-heatmap", figure=_heatmap_fig(grid, 0.0, 0.0),
-                          config={"displayModeBar": False, "responsive": True},
-                          className="scenario-graph")]),
-            html.Div(className="scn-impact-wrap", children=[
-                html.Div(id="scn-impact", children=_impact_table(impact["rows"], "account")),
-                html.Div(id="scn-total", children=_total_line(impact)),
-            ]),
-        ]),
-        html.Div(className="scenario-caption", children=[_CAPTION]),
-    ])
 
 
 # --------------------------------------------------------------------------
@@ -194,7 +158,7 @@ def _impact_table(rows, target):
     head = html.Tr(className="scn-impact-head", children=[
         html.Th("Position / structure"), html.Th("P&L"), html.Th("Δ$"),
         html.Th("Γ$", title="engine dollar-gamma per $1 spot move — different basis "
-                            "from the Exposure section's per-1% γ"),
+                            "from the current-book panels' per-1% γ"),
         html.Th("ν$"), html.Th("θ$")])
     body = []
     for r in rows:                               # already ranked worst-first

@@ -66,7 +66,9 @@ def _tier_chips(account_state) -> html.Div:
 
 
 def render_kpis(account_state) -> html.Div:
-    """The one-glance KPI strip for the selected account."""
+    """The one-glance KPI strip for the selected account. The Net Greeks KPI is
+    the entry point into the Risk section — a plain anchor to the section host
+    (browser-native scroll, no callback)."""
     bs = book_summary(account_state)
     g = net_greeks_summary(account_state)
     cash_pct = bs["cash_pct"]
@@ -74,6 +76,9 @@ def render_kpis(account_state) -> html.Div:
         _kpi("NAV", _fmt_money(bs["nav"])),
         _kpi("Cash", "—" if cash_pct is None else f"{cash_pct * 100:.1f}%"),
         _kpi("Positions", str(bs["n_positions"]), f"{bs['n_options']} options"),
-        _kpi("Net Greeks", g["headline"], g["interpretation"], cls="dd-kpi-greeks"),
+        html.A(_kpi("Net Greeks", g["headline"], g["interpretation"],
+                    cls="dd-kpi-greeks"),
+               href="#deepdive-risk", className="dd-kpi-anchor",
+               title="Open the Risk section"),
         _tier_chips(account_state),
     ])

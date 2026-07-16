@@ -1,12 +1,12 @@
-"""Section — Portfolio exposure (the risk view).
+"""Current-book exposure panels for the Risk section (the cockpit composes them).
 
 Renders the precomputed account exposure (``acc.exposure`` from pm.risk.exposure):
 the net market exposure (beta-adjusted dollar delta) headline, net dollar greeks,
 market value vs economic exposure, both SPX betas, vega by tenor, and the
 position -> structure -> account rollup. A pure read of ``acc.exposure`` — no
-compute, no Bloomberg, no recompute. This section absorbs the old net-greeks panel
-(those stats are the headline here); the one-glance "Net Greeks" KPI in the header
-stays as the separate glance.
+compute, no Bloomberg, no recompute. ``risk_cockpit.render_risk_section`` owns the
+section shell — this module is the panel library; the one-glance "Net Greeks" KPI
+in the header stays as the separate glance (and the click-through into the section).
 """
 from __future__ import annotations
 
@@ -19,9 +19,7 @@ from pm.ui.deepdive.aggregations import _fmt_money
 _BETA_NOTE = (
     "Adjusted (Blume) is the default — name betas converge toward 1.0 in a selloff "
     "(crash correlation), so it is the steadier downside proxy; raw is the current "
-    "empirical sensitivity. Both vs SPX, 2y weekly — distinct from the holdings "
-    "'Weighted β' chip, which uses each name's default index (they agree for US "
-    "names, differ for non-US)."
+    "empirical sensitivity. Both vs SPX, 2y weekly, per name."
 )
 
 
@@ -258,26 +256,3 @@ def _provenance(e) -> str:
     return base
 
 
-# ---- section --------------------------------------------------------------
-
-def render_exposure_section(account_state) -> html.Div:
-    e = getattr(account_state, "exposure", None)
-    head = html.Div(className="dd-section-head", children=[
-        html.H2("Exposure", className="dd-section-title"),
-        html.Span("current-state · beta-adjusted",
-                  className="dd-section-meta"),
-    ])
-    if e is None:
-        return html.Div(className="dd-section", children=[
-            head, html.Div("Exposure unavailable for this account.", className="dd-empty"),
-        ])
-    return html.Div(className="dd-section", children=[
-        head,
-        html.Div(className="dd-analytics-grid", children=[
-            _headline_panel(e),
-            _mv_vs_econ_panel(e),
-            _beta_panel(e),
-            _vega_tenor_row(e),
-        ]),
-        _rollup_table(e),
-    ])

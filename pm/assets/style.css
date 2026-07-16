@@ -1667,3 +1667,52 @@ html, body {
 .scanner-loading { padding: 34px 10px; text-align: center; color: var(--pm-grey-500);
     font-size: 13px; font-style: italic; }
 .scanner-footer { margin-top: 12px; font-size: 11px; color: var(--pm-grey-500); line-height: 1.5; }
+
+/* ---- Risk section (the consolidated cockpit) ------------------------------ */
+
+/* The header Net Greeks KPI doubles as the anchor into the Risk section. */
+.dd-kpi-anchor { text-decoration: none; color: inherit; display: block; flex: 1 1 280px; }
+.dd-kpi-anchor .dd-kpi-greeks { cursor: pointer; }
+.dd-kpi-anchor:hover .dd-kpi-label { color: var(--pm-accent); text-decoration: underline; }
+
+/* Answer strip — the stressed P&L, directly under the scenario controls. */
+.risk-answer { margin: 10px 0 4px; padding: 8px 12px; background: var(--pm-grey-100, #FAFAFA);
+    border: 1px solid var(--pm-grey-300); border-radius: 3px; }
+.risk-answer .scn-total { margin: 0; }
+.risk-answer .scn-total-val { font-size: 16px; }
+
+/* Reshape table — current vs stressed exposure profile. */
+.risk-reshape { margin: 8px 0 14px; }
+.risk-reshape-table { width: 100%; }
+.risk-reshape-table td, .risk-reshape-table th { padding: 5px 10px; }
+.risk-reshape-colhead { text-align: right; }
+.risk-reshape-metric { text-align: left; white-space: nowrap; }
+.risk-reshape-basis { display: block; font-size: 10px; color: var(--pm-grey-500); }
+.risk-reshape-cell { text-align: right; white-space: nowrap; }
+.risk-reshape-num { font-family: "Consolas", monospace; font-weight: 600; }
+.risk-reshape-num.scenario-pos { color: var(--pos); }
+.risk-reshape-num.scenario-neg { color: var(--neg); }
+.risk-reshape-pct { font-size: 10.5px; color: var(--pm-grey-700); }
+.risk-reshape-coverage { font-weight: 600; }
+
+/* Obligations */
+.risk-oblig-table { width: 100%; }
+.risk-oblig-table td, .risk-oblig-table th { padding: 5px 10px; text-align: right;
+    white-space: nowrap; }
+.risk-oblig-side { text-align: left !important; white-space: normal; }
+.risk-oblig-sub { font-size: 10.5px; color: var(--pm-grey-700); }
+.risk-oblig-ladder { margin-top: 10px; }
+
+/* Concentration + asset-class split */
+.risk-conc-table, .risk-split-table { width: 100%; }
+.risk-conc-table td, .risk-conc-table th,
+.risk-split-table td, .risk-split-table th { padding: 4px 8px; text-align: right;
+    white-space: nowrap; }
+.risk-conc-name { text-align: left !important; font-weight: 600; }
+.risk-conc-others td { color: var(--pm-grey-700); font-style: italic; }
+.risk-conc-others .risk-conc-name { font-weight: 400; }
+
+/* A failed block degrades to an honest panel, never a blank Tab 2. */
+.risk-block-error { border-left: 3px solid var(--pm-urgent); }
+
+.risk-footer { margin-top: 10px; border-top: 1px solid var(--pm-grey-300); padding-top: 8px; }

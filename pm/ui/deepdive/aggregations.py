@@ -14,13 +14,12 @@ Decisions (confirmed with the desk):
 - Premium split uses **entry premium** (``cost_basis``), not current mark — the
   truest "collected vs paid" income-posture framing. Falls back to
   ``market_value`` when ``cost_basis`` is missing.
-- Expiry-ladder notional is **strike notional** (``|qty| × multiplier × strike``)
-  — the strike obligation, the meaningful exposure for an options book. Labeled
-  "Notional (strike)" in the UI so the number is never ambiguous.
+- Strike-notional aggregation moved to ``pm.risk.obligations`` (short legs only,
+  put/call sides separated) — the old expiry ladder counted long options' strikes
+  as obligations, which they are not.
 """
 from __future__ import annotations
 
-from datetime import date
 from typing import Optional
 
 
@@ -217,64 +216,6 @@ def long_short_premium_split(account_state) -> dict:
         "posture": posture,
         "interpretation": interpretation,
     }
-
-
-# ---------------------------------------------------------------------------
-# 3) Expiry ladder (options bucketed by time to expiry)
-# ---------------------------------------------------------------------------
-
-_LADDER_BUCKETS = [
-    ("≤30d", lambda d: d <= 30),
-    ("31–60d", lambda d: 31 <= d <= 60),
-    ("61–90d", lambda d: 61 <= d <= 90),
-    (">90d", lambda d: d > 90),
-]
-
-
-def expiry_ladder(account_state, as_of: Optional[date] = None) -> tuple[list[dict], int]:
-    """Option positions bucketed by days-to-expiry window with the count and
-    summed **strike** notional (``|qty| × multiplier × strike``) per bucket,
-    plus the count of EXPIRED options excluded from the ladder.
-
-    Returns ``(buckets, n_expired)`` — always the four buckets in order (zeros
-    if empty). An expired option (negative DTE, e.g. from a stale extract — a
-    designed-for operating mode) is a dead obligation, not an imminent one: it
-    must never inflate the ≤30d window or its strike notional, so it is counted
-    separately for the panel's "expired (n)" cue. DTE is computed from
-    ``position.expiry`` against ``as_of`` (default today) — matching the
-    blotter's DTE column. Positions without an expiry or strike are skipped.
-
-    ``as_of`` is exposed only so tests can pin a reference date; runtime uses
-    today, identical to the DTE shown in the positions grid.
-    """
-    ref = as_of or date.today()
-    buckets = [{"label": lbl, "count": 0, "notional": 0.0} for lbl, _ in _LADDER_BUCKETS]
-    n_expired = 0
-
-    for p in getattr(account_state, "positions", []) or []:
-        if not _is_option(p):
-            continue
-        expiry = getattr(p, "expiry", None)
-        strike = _coerce_float(getattr(p, "strike", None))
-        qty = _coerce_float(getattr(p, "quantity", None))
-        mult = _coerce_float(getattr(p, "multiplier", None)) or 100.0
-        if expiry is None or strike is None or qty is None:
-            continue
-        try:
-            dte = (expiry - ref).days
-        except Exception:
-            continue
-        if dte < 0:
-            n_expired += 1
-            continue
-        notional = abs(qty) * mult * strike
-        for i, (_lbl, pred) in enumerate(_LADDER_BUCKETS):
-            if pred(dte):
-                buckets[i]["count"] += 1
-                buckets[i]["notional"] += notional
-                break
-
-    return buckets, n_expired
 
 
 # ---------------------------------------------------------------------------

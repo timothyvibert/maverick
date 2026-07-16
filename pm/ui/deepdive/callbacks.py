@@ -23,9 +23,8 @@ from pm.ui.deepdive.structures_panel import build_structure_rows, render_structu
 from pm.ui.drawers.payoff import render_payoff
 
 _DD_HOST_IDS = [
-    "deepdive-kpi", "deepdive-positions", "deepdive-exposure",
-    "deepdive-scenario", "deepdive-analytics", "deepdive-trades",
-    "deepdive-trade-insights",
+    "deepdive-kpi", "deepdive-positions", "deepdive-risk",
+    "deepdive-trades", "deepdive-trade-insights",
 ]
 
 
@@ -123,9 +122,7 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("deepdive-kpi", "children"),
         Output("deepdive-positions", "children"),
-        Output("deepdive-exposure", "children"),
-        Output("deepdive-scenario", "children"),
-        Output("deepdive-analytics", "children"),
+        Output("deepdive-risk", "children"),
         Output("deepdive-trades", "children"),
         Output("deepdive-trade-insights", "children"),
         Input("deepdive-account-picker", "value"),
@@ -312,6 +309,7 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         Output("scn-heatmap", "figure"),
         Output("scn-impact", "children"),
         Output("scn-total", "children"),
+        Output("risk-reshape", "children"),
         Input("scn-spx", "value"),
         Input("scn-vol", "value"),
         Input("scn-rate", "value"),
@@ -324,13 +322,14 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         state = sa.get_state()
         acct = _resolve_account(state, picker)
         if state is None or acct is None:
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
         tgt, tlabel = _scn_target(state, acct, target)
         out = sa.price_scenario(acct, spot_pct=spx or 0, vol_pts=vol or 0,
                                 rate_bps=rate or 0, time_days=int(time_days or 0),
                                 target=tgt, mode="fast")
         if out is None:
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
+        from pm.ui.deepdive.risk_cockpit import _reshape_table
         from pm.ui.deepdive.scenario import _heatmap_fig, _impact_table, _total_line
         fig = _heatmap_fig(out["grid"], spx or 0, vol or 0, target_label=tlabel)
         table = _impact_table(out["positions"], target)
@@ -338,7 +337,10 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
                              "account_pnl_pct": out["account"]["pnl_pct"],
                              "n_priced": out["account"].get("n_priced"),
                              "n_skipped": out["account"].get("n_skipped")})
-        return fig, table, total
+        acc = state.accounts.get(acct)
+        reshape = _reshape_table(out["account"].get("exposures"),
+                                 getattr(acc, "nav", None))
+        return fig, table, total, reshape
 
     # ---- Preset chips set the controls (which then drive the recompute) ------
     # Both halves of every dial are written — slider AND its paired numeric entry —
