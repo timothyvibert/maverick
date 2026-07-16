@@ -115,20 +115,35 @@ def _controls(account_state, rows) -> html.Div:
 
     def _slider(_id, lo, hi, step, suffix):
         marks = {int(v): f"{int(v)}{suffix}" for v in (lo, lo / 2, 0, hi / 2, hi)}
+        # allow_direct_input=False: the slider's built-in entry box moves the thumb
+        # on Enter WITHOUT committing the value to the server — a typed shock would
+        # render as applied while the book never repriced, and text left in the box
+        # survives a preset reset and re-commits on the next blur (a phantom shock).
+        # The paired dcc.Input in _dial below is the committed typed gesture instead.
         return dcc.Slider(id=_id, min=lo, max=hi, step=step, value=0, marks=marks,
                           tooltip={"placement": "bottom", "always_visible": False},
-                          className="scn-slider")
+                          allow_direct_input=False, className="scn-slider")
+
+    def _dial(label, _id, lo, hi, step, suffix=""):
+        # Slider + explicit numeric entry, kept in lockstep by the per-dial sync
+        # callback. debounce=False is load-bearing: every keystroke commits, the
+        # slider visibly tracks the typed value, and NO uncommitted text can ever
+        # sit in the box — which is what made a blur after a preset reset silently
+        # reprice a shock the user believed cleared.
+        return html.Div(className="scn-ctrl", children=[
+            html.Label(label, className="scn-ctrl-lbl"),
+            html.Div(className="scn-dial", children=[
+                _slider(_id, lo, hi, step, suffix),
+                dcc.Input(id=f"{_id}-num", type="number", value=0, step=step,
+                          debounce=False, className="scn-num"),
+            ]),
+        ])
 
     return html.Div(className="scn-controls", children=[
-        html.Div(className="scn-ctrl", children=[html.Label("SPX / spot %", className="scn-ctrl-lbl"),
-                                                 _slider("scn-spx", -20, 20, 1, "")]),
-        html.Div(className="scn-ctrl", children=[html.Label("Vol shift (pts)", className="scn-ctrl-lbl"),
-                                                 _slider("scn-vol", -10, 10, 0.5, "")]),
-        html.Div(className="scn-ctrl", children=[html.Label("Rate shift (bps)", className="scn-ctrl-lbl"),
-                                                 _slider("scn-rate", -50, 50, 5, "")]),
-        html.Div(className="scn-ctrl", children=[
-            html.Label("Time (days fwd)", className="scn-ctrl-lbl"),
-            _slider("scn-time", 0, 90, 1, "d")]),
+        _dial("SPX / spot %", "scn-spx", -20, 20, 1),
+        _dial("Vol shift (pts)", "scn-vol", -10, 10, 0.5),
+        _dial("Rate shift (bps)", "scn-rate", -50, 50, 5),
+        _dial("Time (days fwd)", "scn-time", 0, 90, 1, "d"),
         html.Div(className="scn-ctrl scn-ctrl-narrow", children=[
             html.Label("Target", className="scn-ctrl-lbl"),
             dcc.Dropdown(id="scn-target", options=targets, value="account", clearable=False,

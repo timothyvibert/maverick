@@ -16,6 +16,7 @@ from pm.ui import state_access as sa
 from pm.ui.blotter.callbacks import _OPEN_CLS, _render_body, _underlying_for
 from pm.ui.blotter.grid import consolidate_fires_to_rows
 from pm.ui.deepdive.header import account_options, default_account
+from pm.ui.dial_sync import register_dial_sync
 from pm.ui.deepdive.layout import render_deepdive_sections
 from pm.ui.deepdive.positions import build_positions_rows, render_positions_section
 from pm.ui.deepdive.structures_panel import build_structure_rows, render_structure_detail
@@ -340,21 +341,37 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         return fig, table, total
 
     # ---- Preset chips set the controls (which then drive the recompute) ------
+    # Both halves of every dial are written — slider AND its paired numeric entry —
+    # so a preset/reset also clears any value sitting uncommitted in the entry box
+    # (otherwise that text would re-commit on the next blur: a shock the user
+    # believes cleared, silently repriced).
     @app.callback(
         Output("scn-spx", "value"),
         Output("scn-vol", "value"),
         Output("scn-rate", "value"),
         Output("scn-time", "value"),
+        Output("scn-spx-num", "value"),
+        Output("scn-vol-num", "value"),
+        Output("scn-rate-num", "value"),
+        Output("scn-time-num", "value"),
         Input({"type": "scn-preset", "name": ALL}, "n_clicks"),
         prevent_initial_call=True,
     )
     def _scn_preset(_clicks):
         trig = ctx.triggered_id
         if not isinstance(trig, dict) or not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
-            return no_update, no_update, no_update, no_update
+            return (no_update,) * 8
         from pm.ui.deepdive.scenario import PRESET_AXES
         sp, vp, rb, td = PRESET_AXES.get(trig.get("name"), (0.0, 0.0, 0.0, 0))
-        return sp, vp, rb, td
+        return sp, vp, rb, td, sp, vp, rb, td
+
+    # ---- Paired numeric entry <-> slider sync (the committed typed gesture) --
+    # The slider's built-in entry box is disabled (it moves the thumb on Enter
+    # without committing the value — see scenario._slider). Each dial instead
+    # carries an explicit dcc.Input: a typed value commits on Enter/blur, the sync
+    # writes it onto the slider clamped to the dial's own bounds, and that write
+    # chains into _scn_recompute exactly like a drag; a drag writes the box back.
+    register_dial_sync(app, ("scn-spx", "scn-vol", "scn-rate", "scn-time"))
 
     # ---- Click an impact row -> drill the heatmap to that position ----------
     @app.callback(

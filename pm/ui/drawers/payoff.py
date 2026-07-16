@@ -278,9 +278,27 @@ def greeks_block(result) -> html.Div:
 
 def _slider(_id, lo, hi, step, val):
     marks = {int(lo): str(int(lo)), 0: "0", int(hi): str(int(hi))}
+    # allow_direct_input=False: the slider's built-in entry box moves the thumb on
+    # Enter without committing the value (see pm.ui.dial_sync) — at drawer widths
+    # the component auto-hides it anyway, but a wider layout would surface it.
+    # The paired dcc.Input in _dial_row is the committed typed gesture.
     return dcc.Slider(id=_id, min=lo, max=hi, step=step, value=val or 0, marks=marks,
                       tooltip={"placement": "bottom", "always_visible": False},
-                      className="payoff-slider")
+                      allow_direct_input=False, className="payoff-slider")
+
+
+def _dial_row(label, _id, lo, hi, step, val):
+    # Slider + explicit numeric entry kept in lockstep by dial_sync. debounce=False
+    # is load-bearing: every keystroke commits and the slider tracks it, so no
+    # uncommitted text can survive to re-commit later (see pm.ui.dial_sync).
+    return html.Div(className="payoff-ctrl", children=[
+        html.Label(label, className="payoff-ctrl-lbl"),
+        html.Div(className="payoff-dialrow", children=[
+            _slider(_id, lo, hi, step, val),
+            dcc.Input(id=f"{_id}-num", type="number", value=val or 0, step=step,
+                      debounce=False, className="payoff-num"),
+        ]),
+    ])
 
 
 def _is_overlay(result) -> bool:
@@ -297,18 +315,11 @@ def _dial(result, shock) -> html.Div:
     tmax = int(dte) if (dte and dte > 0) else 30   # the drawer can't decay past expiry
     overlay = _is_overlay(result)
     return html.Div(className="payoff-dial", children=[
-        html.Div(className="payoff-ctrl", children=[
-            html.Label(f"{result.underlying or 'spot'} move %", className="payoff-ctrl-lbl"),
-            _slider("payoff-spot", -30, 30, 1, sp.get("spot_pct", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Vol shift (pts)", className="payoff-ctrl-lbl"),
-            _slider("payoff-vol", -10, 10, 0.5, sp.get("vol_pts", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Rate shift (bps)", className="payoff-ctrl-lbl"),
-            _slider("payoff-rate", -50, 50, 5, sp.get("rate_bps", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Time to expiry (days)", className="payoff-ctrl-lbl"),
-            _slider("payoff-time", 0, tmax, 1, sp.get("time_days", 0))]),
+        _dial_row(f"{result.underlying or 'spot'} move %", "payoff-spot",
+                  -30, 30, 1, sp.get("spot_pct", 0)),
+        _dial_row("Vol shift (pts)", "payoff-vol", -10, 10, 0.5, sp.get("vol_pts", 0)),
+        _dial_row("Rate shift (bps)", "payoff-rate", -50, 50, 5, sp.get("rate_bps", 0)),
+        _dial_row("Time to expiry (days)", "payoff-time", 0, tmax, 1, sp.get("time_days", 0)),
         html.Div(className="payoff-ctrl payoff-ctrl-narrow", children=[
             html.Label("Compare", className="payoff-ctrl-lbl"),
             dcc.Checklist(id="payoff-components",
@@ -355,6 +366,11 @@ def render_payoff(account: str, *, structure_id: Optional[str] = None,
 def register_payoff_callbacks(app) -> None:
     """Wire the dial -> live repaint of the figure + economics + greeks. Reads the target
     (account + structure_id/position_id) from ``drawer-state``; recomputes read-only."""
+    from pm.ui.dial_sync import register_dial_sync
+
+    # Typed values commit via the paired entry boxes (see dial_sync) and chain
+    # into _recompute through the slider write, exactly like a drag.
+    register_dial_sync(app, ("payoff-spot", "payoff-vol", "payoff-rate", "payoff-time"))
 
     @app.callback(
         Output("payoff-graph", "figure"),

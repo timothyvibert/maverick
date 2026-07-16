@@ -1414,6 +1414,16 @@ html, body {
 }
 .scn-ctrl { flex: 1 1 180px; min-width: 150px; }
 .scn-ctrl-narrow { flex: 0 0 auto; min-width: 0; }
+/* Slider + paired numeric entry (the committed typed gesture — see pm/ui/dial_sync.py) */
+.scn-dial, .payoff-dialrow { display: flex; align-items: center; gap: 8px; }
+.scn-dial .scn-slider, .payoff-dialrow .payoff-slider { flex: 1 1 auto; min-width: 0; }
+.scn-num, .payoff-num {
+    flex: 0 0 58px; width: 58px; font-size: 12px; padding: 2px 4px;
+    font-family: "Consolas", monospace; font-variant-numeric: tabular-nums;
+    color: var(--pm-grey-700); border: 1px solid var(--pm-grey-300); border-radius: 3px;
+    background: white; text-align: right;
+}
+.scn-num:focus, .payoff-num:focus { outline: none; border-color: var(--pm-accent); }
 .scn-ctrl-lbl {
     display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--pm-grey-500); margin-bottom: 2px;
