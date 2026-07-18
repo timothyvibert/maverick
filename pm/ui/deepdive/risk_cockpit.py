@@ -1,43 +1,52 @@
-"""Section — Risk. The account's one risk destination.
+"""Section — Risk. The account's one risk destination, in the terminal idiom.
 
-Consolidates what used to live across the Exposure, Scenario and Analytics
-sections into a single full-width section whose top-to-bottom order is the
-client conversation: pick the scenario → the stressed P&L → how every exposure
-changes (the reshape table) → the standing book facts it draws on (current
-exposures, carry, obligations, concentration) → the drill layer (heatmap +
-impact table) and the structure→account rollup.
+Presentation follows the Morning Blotter's system, not a card dashboard: a
+block is an 11px uppercase band label over a 1px rule with content sitting
+directly on the page — no bordered containers. Four type sizes only (19px
+headline numbers, 15px secondary numbers, 13px grid data, 11px labels).
+Sentences don't render: every qualifier is a badge whose full text lives in a
+native ``title`` tooltip; the only visible words are labels, values and
+inline coverage cues.
 
-Numbers only. Every caption here is definitional (what a basis or a denominator
-IS) — no interpretation, no recommendations, no generated summaries. The reshape
-table shows the current and stressed exposure profiles side by side; the reader
-draws the conclusion.
+Page order: posture band → scenario dials (fenced) → the P&L ribbon → the
+change-first convexity strip → heatmap | per-position impact → the
+what's-coming event timeline (Plotly, Python-stacked) | event detail grid →
+concentration | standing obligations.
 
-Reads state and calls pure aggregations at render; the only recompute behind the
-dials is the sanctioned read-only ``price_scenario`` (no Bloomberg, no reload).
-Each block renders independently: one block's failure degrades to an honest
-error panel, never a blank Tab 2.
+Reads state and calls pure aggregations at render; the only recompute behind
+the dials is the sanctioned read-only ``price_scenario`` (no Bloomberg, no
+reload). Each block renders independently: one block's failure degrades to an
+honest error line, never a blank Tab 2.
 """
 from __future__ import annotations
 
+import math
+from datetime import timedelta
 from typing import Optional
 
+import dash_ag_grid as dag
 from dash import html
 
 from pm.risk.concentration import concentration_lenses
 from pm.risk.obligations import assignment_obligations
 from pm.risk.scenario import ShockSpec, shock_reprice, spot_vol_grid
-from pm.ui.deepdive.aggregations import _fmt_money, long_short_premium_split
-from pm.ui.deepdive.bars import bar_row
-from pm.ui.deepdive.exposure import (
-    _beta_panel,
-    _headline_panel,
-    _mv_vs_econ_panel,
-    _rollup_table,
-    _vega_tenor_row,
+from pm.risk.upcoming import upcoming_events
+from pm.ui.deepdive.aggregations import _fmt_money
+from pm.ui.deepdive.exposure import _BETA_NOTE, _bucket_cell, _provenance
+from pm.ui.deepdive.formatters import (
+    MONEY_FULL_FMT,
+    PCT_ABS_FMT,
+    PCT_SIGNED_1DP_FMT,
+    SIGNED_COLOR_STYLE,
+    pct_of_nav,
 )
-from pm.ui.deepdive.formatters import pct_of_nav
 from pm.ui.deepdive.scenario import (
+    _AMBER,
     _CAPTION,
+    _CHARCOAL,
+    _FONT,
+    _GRID,
+    _MUTED,
     _controls,
     _heatmap_fig,
     _impact_table,
@@ -45,345 +54,679 @@ from pm.ui.deepdive.scenario import (
     _total_line,
 )
 
-# The reshape table's metric rows: (label, exposures key, basis sub-label,
-# %-of-NAV decimal places — the second-order greeks read in hundredths).
+# The convexity strip's cells: (label, exposures key, basis sub-label).
 _RESHAPE_ROWS = [
-    ("Net Δ$", "dd", "economic (delta-$)", 1),
-    ("Net market exposure (β-$)", "dbeta", "SPX beta-mapped", 1),
-    ("Net Γ$", "dg_1pct", "Δ$ per 1% spot move", 2),
-    ("Net ν$", "dv", "per 1 vol pt", 2),
-    ("Net θ$", "dt_bd", "per business day", 2),
+    ("Net Δ$", "dd", "economic (delta-$)"),
+    ("Net Γ$", "dg_1pct", "Δ$ per 1% spot move"),
+    ("Net ν$", "dv", "per 1 vol pt"),
+    ("Net θ$", "dt_bd", "per business day"),
 ]
 
 _RESHAPE_CAPTION = (
-    "Both columns are engine-priced through the same repricer (fast BS2002) — the "
-    "zero shock is the current state, so Change is the shock's effect, never a "
-    "live greek differenced against a recomputed one. Γ$ per 1% spot move; θ per "
-    "business day; a name with no SPX beta prices at β = 1. Account scope — the "
-    "Target drill moves the heatmap, not this table. The snapshot panels below "
-    "read the Bloomberg greeks and differ by the engine reconciliation (~1–2% "
-    "on Δ/ν).")
+    "Change @ shock, then the current and stressed levels it moves between. "
+    "Both states are engine-priced through the same repricer (fast BS2002) — "
+    "the zero shock is the current state, so Change is the shock's effect, "
+    "never a live greek differenced against a recomputed one. Γ$ per 1% spot "
+    "move; θ per business day; a name with no SPX beta prices at β = 1. "
+    "Account scope — the Target drill moves the heatmap, not this strip. The "
+    "posture band reads the Bloomberg snapshot greeks and differs by the "
+    "engine reconciliation (~1–2% on Δ/ν).")
+
+_NAV_TIP = ("% of NAV = value ÷ |net asset value| — one denominator on every "
+            "risk surface, the account's signed net asset value from the "
+            "extract, taken absolute.")
 
 
-def _stat(label: str, value: str, sub: Optional[str] = None, cls: str = "") -> html.Div:
-    children = [html.Div(label, className="dd-stat-label"),
-                html.Div(value, className="dd-stat-value")]
-    if sub:
-        children.append(html.Div(sub, className="dd-stat-sub"))
-    return html.Div(className=f"dd-stat {cls}".strip(), children=children)
+# ---------------------------------------------------------------------------
+# The band idiom: label + ⓘ + right-aligned badges over a 1px rule
+# ---------------------------------------------------------------------------
+
+def _info(tip: str) -> html.Span:
+    """The ⓘ affordance: a plain span with a native title tooltip."""
+    return html.Span("ⓘ", className="risk-info", title=tip)
 
 
-def _num_cls(v: Optional[float]) -> str:
-    base = "exposure-num"
-    if v is None or v == 0:
-        return base
-    return f"{base} {'exposure-pos' if v > 0 else 'exposure-neg'}"
+def _badge(text: str, tip: str, warn: bool = False) -> html.Span:
+    """A qualifier as a badge — the sentence lives in the title, not the page."""
+    cls = "risk-badge risk-badge-warn" if warn else "risk-badge"
+    return html.Span(text, className=cls, title=tip)
+
+
+def _band(label: str, tip: Optional[str] = None, badges: Optional[list] = None) -> html.Div:
+    children: list = [html.Span(label, className="risk-band-label")]
+    if tip:
+        children.append(_info(tip))
+    if badges:
+        children.append(html.Div(className="risk-badges", children=badges))
+    return html.Div(className="risk-band", children=children)
+
+
+def _cols(left: list, right: list) -> html.Div:
+    """One two-column row — the section's rhythm below the strips."""
+    return html.Div(className="risk-cols", children=[
+        html.Div(className="risk-col", children=left),
+        html.Div(className="risk-col", children=right),
+    ])
 
 
 def _safe(build, label: str):
-    """Per-block isolation: a failed block renders an honest error panel instead
+    """Per-block isolation: a failed block renders an honest error line instead
     of freezing the whole populate callback (Tab 2 is one all-or-nothing repaint)."""
     try:
         return build()
     except Exception as exc:  # noqa: BLE001
-        return html.Div(className="dd-panel risk-block-error", children=[
-            html.H3(label, className="dd-panel-title"),
-            html.Div(f"{label} failed to render — see Load notes. ({type(exc).__name__})",
-                     className="dd-empty"),
-        ])
+        return html.Div(
+            f"{label} failed to render — see Load notes. ({type(exc).__name__})",
+            className="dd-empty risk-block-error")
 
 
 # ---------------------------------------------------------------------------
-# The reshape table (block 3) — also rebuilt by the dial callback
+# 1 — the posture band (standing book in four numbers)
 # ---------------------------------------------------------------------------
 
-def _reshape_cell(v: Optional[float], nav, dp: int, signed_cls: bool = False) -> html.Td:
-    pct = pct_of_nav(v, nav, dp=dp)
-    children = [html.Span(_fmt_money(v),
-                          className=("risk-reshape-num " + _sign_cls(v)) if signed_cls
-                          else "risk-reshape-num")]
-    if pct is not None:
-        children.append(html.Span(f" ({pct})", className="risk-reshape-pct"))
-    return html.Td(children, className="risk-reshape-cell")
+_DIRECTION_TIP = (
+    "Net market exposure: Σ position dollar-delta × the name's SPX beta — the "
+    "book's SPX-equivalent dollars. β shown = net β-$ ÷ net Δ$, the delta "
+    "book's exposure-weighted SPX beta (adjusted). " + _BETA_NOTE)
+_LEVERAGE_TIP = (
+    "Economic exposure ÷ market value. Market value is what the book is marked "
+    "at; economic exposure is its delta-equivalent exposure to the underlyings — "
+    "they diverge where an option's premium understates its directional "
+    "exposure.")
+_VOL_TIP = (
+    "Net dollar vega per 1 vol point (Bloomberg snapshot greeks), with its term "
+    "structure by days to expiry. A dashed bucket holds no options — or only "
+    "options missing vega.")
+_DECAY_TIP = (
+    "Net dollar theta per calendar day (Bloomberg snapshot greeks); the monthly "
+    "figure is 30 calendar days as % of |NAV|.")
 
 
-def _reshape_table(exposures: Optional[dict], nav) -> html.Div:
-    """Current vs stressed exposure profile, side by side. Data only — the gap
-    between the columns is the reader's to act on."""
-    title = html.H3("Exposure profile — current vs stressed", className="dd-panel-title")
+def _posture_cell(label: str, value: str, subs: list, tip: str,
+                  cls: str = "") -> html.Div:
+    children = [html.Div([html.Span(label), _info(tip)], className="dd-stat-label"),
+                html.Div(value, className="dd-stat-value")]
+    children += [html.Div(s, className="dd-stat-sub") for s in subs if s]
+    return html.Div(className=f"dd-stat {cls}".strip(), children=children)
+
+
+def _stat_sign_cls(v: Optional[float]) -> str:
+    if v is None or v == 0:
+        return ""
+    return "dd-stat-pos" if v > 0 else "dd-stat-neg"
+
+
+def _posture_strip(e, nav) -> html.Div:
+    t = e.total
+    nme = e.net_market_exposure
+    econ = e.economic_exposure
+    mv = t.market_value
+
+    direction = ("—" if nme is None
+                 else "net long" if nme > 0 else "net short" if nme < 0 else "flat")
+    beta = (nme / econ) if (nme is not None and econ) else None
+    dir_sub = direction if beta is None else f"{direction} · β {beta:.2f}"
+
+    ratio = (econ / mv) if (econ is not None and mv) else None
+    lev_val = f"{ratio:.2f}×" if ratio is not None else "—"
+
+    tenor = " · ".join(f"{b.label} {_bucket_cell(b)}" for b in e.vega_by_tenor)
+
+    theta_mo = pct_of_nav(t.dollar_theta * 30 if t.dollar_theta is not None else None,
+                          nav, dp=2)
+
+    return html.Div(className="risk-posture", children=[
+        _posture_cell("Direction", _fmt_money(nme),
+                      [pct_of_nav(nme, nav), dir_sub, "β SPX 2y wkly · adjusted"],
+                      _DIRECTION_TIP, cls=_stat_sign_cls(nme)),
+        _posture_cell("Leverage", lev_val,
+                      [f"{_fmt_money(econ)} economic vs {_fmt_money(mv)} MV"],
+                      _LEVERAGE_TIP),
+        _posture_cell("Volatility", _fmt_money(t.dollar_vega),
+                      ["per 1 vol pt", tenor],
+                      _VOL_TIP, cls=_stat_sign_cls(t.dollar_vega)),
+        _posture_cell("Decay", _fmt_money(t.dollar_theta),
+                      ["per calendar day",
+                       f"{theta_mo}/mo" if theta_mo else None],
+                      _DECAY_TIP, cls=_stat_sign_cls(t.dollar_theta)),
+    ])
+
+
+def _posture_badges(e) -> list:
+    """The posture band's qualifiers: provenance always, missing-data marks
+    only when something is actually missing. Sentences live in the titles."""
+    badges = [_badge("source", _provenance(e) + " " + _NAV_TIP)]
+    missing_beta = (e.trace or {}).get("inputs", {}).get("names_missing_beta", []) or []
+    if missing_beta:
+        badges.append(_badge(
+            f"⚠ {len(missing_beta)} no β",
+            f"{len(missing_beta)} name(s) had no SPX beta and are excluded "
+            f"from dollar-beta: {', '.join(missing_beta)}", warn=True))
+    missing_greeks = getattr(e, "missing_greeks", []) or []
+    if missing_greeks:
+        badges.append(_badge(
+            f"⚠ {len(missing_greeks)} no greeks",
+            f"Greeks missing on {len(missing_greeks)} name(s) — totals "
+            f"understate: {', '.join(missing_greeks)}", warn=True))
+    n_missing_v = sum(getattr(b, "n_missing_vega", 0) or 0 for b in e.vega_by_tenor)
+    n_opts = sum(b.n_options for b in e.vega_by_tenor)
+    if n_missing_v:
+        badges.append(_badge(
+            f"⚠ vega {n_opts - n_missing_v}/{n_opts}",
+            f"Vega missing on {n_missing_v} of {n_opts} option(s) — the tenor "
+            "buckets understate by those positions.", warn=True))
+    n_expired = getattr(e, "n_expired_options", 0) or 0
+    if n_expired:
+        badges.append(_badge(
+            f"{n_expired} expired",
+            f"Expired ({n_expired}) — dead contract(s) still on the book "
+            "(stale extract); excluded from every figure here."))
+    return badges
+
+
+# ---------------------------------------------------------------------------
+# 4 — the convexity strip (change-first; rebuilt by the dial callback)
+# ---------------------------------------------------------------------------
+
+def _reshape_table(exposures: Optional[dict], nav, shocked: bool = True) -> html.Div:
+    """The convexity strip: four cells, the CHANGE @ shock leading, the
+    current → stressed levels beneath. ``shocked=False`` (the resting page)
+    dashes the change — a wall of $0 reads as a bug, not a zero shock. Keeps
+    its historical name: it is the ``risk-reshape`` callback target."""
     if not exposures or not exposures.get("n_legs"):
-        return html.Div(className="dd-panel risk-reshape", children=[
-            title,
-            html.Div("Reshape unavailable — no priceable legs (market data missing).",
-                     className="dd-empty")])
+        return html.Div("Convexity unavailable — no priceable legs "
+                        "(market data missing).", className="dd-empty")
     now, stressed = exposures["now"], exposures["stressed"]
-    head = html.Tr([html.Th("", className="am-th"),
-                    html.Th("Now", className="am-th risk-reshape-colhead"),
-                    html.Th("Stressed", className="am-th risk-reshape-colhead"),
-                    html.Th("Change", className="am-th risk-reshape-colhead")])
-    body = []
-    for label, key, basis, dp in _RESHAPE_ROWS:
+    cells = []
+    for label, key, basis in _RESHAPE_ROWS:
         v0, v1 = now.get(key), stressed.get(key)
         change = (v1 - v0) if (v0 is not None and v1 is not None) else None
-        body.append(html.Tr(className="am-row", children=[
-            html.Td([html.Span(label), html.Span(basis, className="risk-reshape-basis")],
-                    className="risk-reshape-metric"),
-            _reshape_cell(v0, nav, dp),
-            _reshape_cell(v1, nav, dp),
-            _reshape_cell(change, nav, dp, signed_cls=True),
+        if shocked:
+            value = _fmt_money(change)
+            val_cls = _sign_cls(change)
+            pct = pct_of_nav(change, nav, dp=2)
+            subs = [pct,
+                    f"{_fmt_money(v0)} → {_fmt_money(v1)}"]
+        else:
+            value = "—"
+            val_cls = ""
+            subs = [f"now {_fmt_money(v0)}"]
+        cells.append(html.Div(className="dd-stat", children=[
+            html.Div([html.Span(label),
+                      html.Span(f" · {basis}", className="risk-convexity-basis")],
+                     className="dd-stat-label"),
+            html.Div(value, className=f"dd-stat-value {val_cls}".strip()),
+            *[html.Div(s, className="dd-stat-sub") for s in subs if s],
         ]))
+    return html.Div(className="risk-convexity", children=cells)
+
+
+def _coverage_badge(exposures: Optional[dict]) -> Optional[html.Span]:
+    if not exposures:
+        return None
     n_legs = exposures.get("n_legs") or 0
     n_skipped = exposures.get("n_skipped") or 0
-    coverage = (f"{n_legs} of {n_legs + n_skipped} legs priced — "
-                f"{n_skipped} skipped (unpriceable)" if n_skipped
-                else f"{n_legs} legs priced")
-    return html.Div(className="dd-panel risk-reshape", children=[
-        title,
-        html.Table(className="am-table risk-reshape-table",
-                   children=[html.Thead(head), html.Tbody(body)]),
-        html.Div(coverage, className="dd-panel-note risk-reshape-coverage"),
-        html.Div(_RESHAPE_CAPTION, className="dd-panel-note"),
-    ])
+    if not n_legs and not n_skipped:
+        return None
+    if n_skipped:
+        return _badge(f"{n_legs}/{n_legs + n_skipped} priced",
+                      f"{n_legs} of {n_legs + n_skipped} legs priced — "
+                      f"{n_skipped} skipped (unpriceable)", warn=True)
+    return _badge(f"{n_legs} legs priced", f"All {n_legs} legs priced.")
 
 
 # ---------------------------------------------------------------------------
-# Carry (block 4, beside the moved exposure panels)
+# 6 — what's coming: the event timeline (Plotly, Python-stacked) + the grid
 # ---------------------------------------------------------------------------
 
-def _premium_panel(account_state) -> html.Div:
-    s = long_short_premium_split(account_state)
-    short_pct = s["short_share"]
-    bar = html.Div(className="dd-split-bar", children=[
-        html.Div(className="dd-split-collected",
-                 style={"width": f"{(short_pct or 0) * 100:.1f}%"}),
-        html.Div(className="dd-split-paid",
-                 style={"width": f"{(1 - (short_pct or 0)) * 100:.1f}%"}),
-    ]) if s["total"] else None
-    return html.Div(className="dd-panel", children=[
-        html.H3("Options premium — collected vs paid", className="dd-panel-title"),
-        html.Div(className="dd-stat-row", children=[
-            _stat("Collected (short)", _fmt_money(s["collected"]),
-                  f"{s['n_short']} legs", cls="dd-stat-pos"),
-            _stat("Paid (long)", _fmt_money(s["paid"]),
-                  f"{s['n_long']} legs", cls="dd-stat-neg"),
-            _stat("Net", _fmt_money(s["net"]), s["posture"]),
-        ]),
-        bar,
-        html.Div(s["interpretation"], className="dd-panel-note"),
-    ])
+_CAL_TIP = (
+    "Every dated event in the next 60 days: short-option expiries with the "
+    "strike value if assigned and the risk-neutral P(assignment), ex-dividend "
+    "dates on optioned names (amber ⚑ when an ITM short call runs into one — "
+    "early-assignment economics), and expected earnings dates where the book "
+    "is net short vol. Bubble size = % of |NAV| at stake; height is a "
+    "collision row only. Standing obligations (all expiries) sit in their own "
+    "block below.")
+
+_CAL_KIND_LABEL = {"expiry": "Expiry", "ex_div": "Ex-div", "earnings": "Earnings"}
+_CAL_SYMBOL = {"expiry": "circle", "ex_div": "diamond", "earnings": "square"}
+
+# Stacking geometry (server-side): the chart renders at roughly half the page,
+# so the plot area is ~620px over the 60-day window. Labels sit middle-right
+# at 12px ≈ 6.8px/char.
+_CHART_PLOT_W = 620.0
+_CHART_CHAR_W = 6.8
+_CHART_PAD = 6.0
+
+
+def _at_stake(r: dict) -> Optional[float]:
+    if r["kind"] == "expiry":
+        return r.get("obligation")
+    if r["kind"] == "earnings":
+        return r.get("vega")
+    return None
+
+
+def _at_stake_str(r: dict) -> str:
+    v = _at_stake(r)
+    if r["kind"] == "earnings" and v is not None:
+        return f"{_fmt_money(v)}/pt"
+    if r["kind"] == "ex_div":
+        dps = r.get("dps")
+        return f"${dps:,.2f}/sh" if dps is not None else ""
+    return _fmt_money(v) if v is not None else ""
+
+
+def _event_points(cal: dict, nav) -> list[dict]:
+    pts = []
+    for r in cal["rows"]:
+        at = _at_stake(r)
+        pct = (abs(at) / abs(nav) * 100.0) if (at is not None and nav) else None
+        detail, tip = _cal_detail(r)
+        line1 = r["underlying"] + (" ⚑" if r.get("urgent") else "")
+        line2 = _at_stake_str(r)
+        p_str = None
+        if r["kind"] == "expiry":
+            p = r.get("p_assign")
+            p_str = f"P(assign) {p * 100:.1f}%" if p is not None else "P(assign) unpriced"
+        hover = "<br>".join(s for s in (
+            f"{r['date'].isoformat()} · in {r['days']}d",
+            f"{_CAL_KIND_LABEL.get(r['kind'])} — {r['underlying']}",
+            detail,
+            (f"at stake {line2} ({pct:.1f}% NAV)" if pct is not None
+             else (f"at stake {line2}" if line2 else None)),
+            p_str,
+            r.get("flag_reason"),
+        ) if s)
+        pts.append({
+            "date": r["date"], "days": r["days"], "kind": r["kind"],
+            "size": 16.0 if pct is None else max(16.0, 16.0 + math.sqrt(pct) * 5.8),
+            "color": _AMBER if r.get("urgent") else (
+                _CHARCOAL if r["kind"] == "expiry" else _MUTED),
+            "text": f"{line1}<br>{line2}" if line2 else line1,
+            "label_w": _CHART_CHAR_W * max(len(line1), len(line2)),
+            # A label near the window's right edge would run off the plot —
+            # those flip to the marker's left (mirrored in the collision model).
+            "flip": r["days"] > 48,
+            "hover": hover,
+        })
+    return pts
+
+
+def _stack_points(pts: list[dict], horizon_days: int) -> int:
+    """Assign each event the lowest collision-free row (marker radii + label
+    width + padding, on whichever side the label sits), computed server-side so
+    Plotly only renders. Returns the row count."""
+    # The rendered axis spans [t0-2d, t0+horizon+2d] — scale the collision
+    # model to that span, not the bare horizon.
+    ppd = _CHART_PLOT_W / max(horizon_days + 4, 1)
+    rows: list[list[tuple[float, float]]] = []
+    for p in sorted(pts, key=lambda q: (q["days"], -q["size"])):
+        x = (p["days"] + 2) * ppd
+        if p.get("flip"):
+            start = x - p["size"] / 2.0 - p["label_w"] - _CHART_PAD
+            end = x + p["size"] / 2.0
+        else:
+            start = x - p["size"] / 2.0
+            end = x + p["size"] / 2.0 + p["label_w"] + _CHART_PAD
+        for i, intervals in enumerate(rows):
+            if all(end <= s or start >= e for s, e in intervals):
+                intervals.append((start, end))
+                p["row"] = i
+                break
+        else:
+            rows.append([(start, end)])
+            p["row"] = len(rows) - 1
+    return max(len(rows), 1)
+
+
+def _event_chart(cal: dict, nav):
+    from dash import dcc
+    import plotly.graph_objects as go          # lazy
+
+    pts = _event_points(cal, nav)
+    n_rows = _stack_points(pts, cal["horizon_days"])
+    t0 = cal["as_of"]
+
+    fig = go.Figure()
+    for kind in ("expiry", "ex_div", "earnings"):
+        # Non-urgent first: plotly styles the legend swatch off the first
+        # point, so an urgent lead event must not turn the category key amber.
+        kp = sorted((p for p in pts if p["kind"] == kind),
+                    key=lambda p: p["color"] == _AMBER)
+        if not kp:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[p["date"] for p in kp], y=[p["row"] for p in kp],
+            mode="markers+text",
+            name=_CAL_KIND_LABEL[kind].lower(),
+            marker=dict(symbol=_CAL_SYMBOL[kind],
+                        size=[p["size"] for p in kp],
+                        color=[p["color"] for p in kp],
+                        line=dict(width=1, color="white")),
+            text=[p["text"] for p in kp],
+            textposition=["middle left" if p.get("flip") else "middle right"
+                          for p in kp],
+            textfont=dict(size=12, color=_CHARCOAL),
+            customdata=[[p["hover"]] for p in kp],
+            hovertemplate="%{customdata[0]}<extra></extra>"))
+
+    ticks = [t0 + timedelta(days=d) for d in (0, 15, 30, 45, 60)]
+    fig.update_layout(
+        height=max(460, 40 + n_rows * 66 + 46),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=_FONT, color=_CHARCOAL, size=11),
+        showlegend=True,
+        legend=dict(orientation="h", x=0, y=1.0, yanchor="bottom",
+                    font=dict(size=11)),
+        margin=dict(l=8, r=8, t=46, b=36),
+        xaxis=dict(
+            range=[t0 - timedelta(days=2), t0 + timedelta(days=62)],
+            tickmode="array", tickvals=ticks,
+            ticktext=["today", "+15d", "+30d", "+45d", "+60d"],
+            showgrid=False,
+            minor=dict(dtick=7 * 24 * 3600 * 1000, showgrid=True,
+                       gridcolor=_GRID),
+        ),
+        # y is a collision row only — no magnitude meaning; row 0 reads from
+        # the top.
+        yaxis=dict(visible=False, range=[n_rows - 0.4, -0.7]),
+    )
+    return dcc.Graph(figure=fig, config={"displayModeBar": False,
+                                         "responsive": True},
+                     className="scenario-graph")
+
+
+def build_calendar_columns() -> list[dict]:
+    return [
+        {"field": "date", "headerName": "Date", "width": 116,
+         "filter": "agDateColumnFilter",
+         "filterParams": {"comparator": {"function": "dagfuncs.ISODateComparator"},
+                          "browserDatePicker": True},
+         "sort": "asc", "sortIndex": 0},
+        {"field": "event", "headerName": "Event", "width": 88,
+         "filter": "agTextColumnFilter"},
+        {"field": "underlying", "headerName": "Ticker", "width": 94,
+         "filter": "agTextColumnFilter", "cellClass": "blotter-ticker-cell"},
+        {"field": "detail", "headerName": "Detail", "flex": 2, "minWidth": 170,
+         "filter": "agTextColumnFilter", "tooltipField": "detail_tip",
+         "cellClass": "dd-cell-ellipsis"},
+        {"field": "at_stake", "headerName": "At stake", "width": 108,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": MONEY_FULL_FMT,
+         "headerTooltip": "Expiry rows: strike value if assigned (cash to fund "
+                          "a short put, delivery at strike on a short call). "
+                          "Earnings rows: the name's net dollar vega per 1 vol "
+                          "pt — negative = short vol into the print."},
+        {"field": "at_stake_pct", "headerName": "% NAV", "width": 88,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_ABS_FMT},
+        {"field": "p_assign", "headerName": "P(assign)", "width": 108,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_ABS_FMT,
+         "headerTooltip": "Risk-neutral probability the short leg finishes in "
+                          "the money at expiry (N(d2) at the leg's own IV). "
+                          "Dash when the leg has no usable IV."},
+    ]
+
+
+def _cal_detail(r: dict) -> tuple[str, str]:
+    """(visible detail, hover detail) per event kind. Data qualifiers only."""
+    kind = r["kind"]
+    if kind == "expiry":
+        right = "Call" if r.get("right") == "CALL" else "Put"
+        detail = f"-{r['contracts']:,.0f} × ${r['strike']:g} {right} short"
+        if r.get("itm"):
+            detail += " · ITM"
+        tip = r.get("flag_reason") or r.get("p_assign_reason") or ""
+        return detail, tip
+    if kind == "ex_div":
+        dps = r.get("dps")
+        detail = f"${dps:,.2f}/sh" if dps is not None else "ex-dividend"
+        if r.get("urgent"):
+            detail += " · ITM short call — early assignment risk"
+        return detail, r.get("flag_reason") or ""
+    return "expected report", ""
+
+
+def build_calendar_rows(cal: dict, nav) -> list[dict]:
+    rows = []
+    for r in cal["rows"]:
+        detail, tip = _cal_detail(r)
+        iso = r["date"].isoformat()
+        at = _at_stake(r)
+        rows.append({
+            "_row_id": f"{r['kind']}::{r.get('underlying_bbg') or r['underlying']}"
+                       f"::{iso}::{r.get('position_id') or ''}",
+            "_urgent": bool(r.get("urgent")),
+            "date": iso,
+            "event": _CAL_KIND_LABEL.get(r["kind"], r["kind"]),
+            "underlying": r["underlying"],
+            "detail": detail,
+            "detail_tip": tip or detail,
+            "at_stake": at,
+            "at_stake_pct": (abs(at) / abs(nav)) if (at is not None and nav) else None,
+            "p_assign": r.get("p_assign"),
+        })
+    return rows
+
+
+def _calendar_grid(rows: list[dict]) -> dag.AgGrid:
+    return dag.AgGrid(
+        id="risk-calendar-grid",
+        columnDefs=build_calendar_columns(),
+        rowData=rows,
+        dashGridOptions={
+            "rowHeight": 28,
+            "headerHeight": 32,
+            "animateRows": False,
+            "enableCellTextSelection": True,
+            "ensureDomOrder": True,
+            "domLayout": "autoHeight",
+            "rowClassRules": {
+                "blotter-row-t1": "params.data && params.data._urgent",
+            },
+            "defaultColDef": {"sortable": True, "resizable": True,
+                              "suppressMovable": False},
+        },
+        className="ag-theme-balham blotter-grid",
+        getRowId={"function": "params.data._row_id"},
+        style={"width": "100%"},
+    )
+
+
+def _events_badges(cal: dict) -> list:
+    badges = []
+    n_total = cal.get("n_assign_total") or 0
+    n_priced = cal.get("n_assign_priced") or 0
+    if n_total and n_priced < n_total:
+        badges.append(_badge(
+            f"P(assign) {n_priced}/{n_total}",
+            f"P(assign) priced on {n_priced} of {n_total} short leg(s) in the "
+            "window — the rest dash (no usable IV).", warn=True))
+    for w in cal.get("warnings") or []:
+        badges.append(_badge("⚠ coverage", w, warn=True))
+    return badges
 
 
 # ---------------------------------------------------------------------------
-# Obligations (block 5)
+# 7 — standing obligations (all expiries; beside concentration)
 # ---------------------------------------------------------------------------
 
-def _oblig_row(label: str, side, nav, sub: Optional[html.Div] = None) -> html.Tr:
+_OBLIG_TIP = (
+    "Strike value of every short option if assigned, across ALL expiries — "
+    "short puts: cash to fund; short calls: shares delivered at strike. A "
+    "long option is a right, not an obligation. Totals are extract-only, so "
+    "they render with Bloomberg off.")
+
+
+def _oblig_total_row(label: str, side, nav, sub=None) -> html.Tr:
     itm_d = side.itm_dollars
     has = bool(side.n_positions)
     pct = pct_of_nav(side.dollars, nav) if has else None
-    cells = [
+    return html.Tr(className="risk-oblig-row", children=[
         html.Td([html.Span(label)] + ([sub] if sub is not None else []),
                 className="risk-oblig-side"),
         html.Td(f"{side.contracts:,.0f}" if has else "—", className="exposure-num"),
         html.Td(_fmt_money(side.dollars) if has else "—", className="exposure-num"),
         html.Td(pct if pct is not None else "—", className="exposure-num"),
-        html.Td("—" if itm_d is None else f"{side.itm_contracts:,.0f}",
-                className="exposure-num"),
         html.Td("—" if itm_d is None else _fmt_money(itm_d), className="exposure-num"),
-    ]
-    return html.Tr(className="am-row", children=cells)
+    ])
 
 
-def _oblig_windows(ob) -> html.Div:
-    header = html.Div(className="dd-ladder-row dd-ladder-head", children=[
-        html.Span("Window"),
-        *[html.Span(w["label"]) for w in ob.puts.by_window]])
-    puts = html.Div(className="dd-ladder-row", children=[
-        html.Span("Puts — cash", className="dd-ladder-bucket"),
-        *[html.Span(_fmt_money(w["dollars"]) if w["dollars"] else "—",
-                    className="dd-ladder-count") for w in ob.puts.by_window]])
-    calls = html.Div(className="dd-ladder-row", children=[
-        html.Span("Calls — at strike", className="dd-ladder-bucket"),
-        *[html.Span(_fmt_money(w["dollars"]) if w["dollars"] else "—",
-                    className="dd-ladder-count") for w in ob.calls.by_window]])
-    return html.Div(className="dd-ladder risk-oblig-ladder", children=[header, puts, calls])
-
-
-def _obligations_panel(account_state, ob, nav) -> html.Div:
-    title = html.H3("Assignment obligations — if assigned", className="dd-panel-title")
+def _oblig_block(ob, nav) -> html.Div:
     if not ob.puts.n_positions and not ob.calls.n_positions:
-        children = [title,
-                    html.Div("No short options on the book — nothing to assign.",
-                             className="dd-empty")]
-        if ob.n_expired:
-            children.append(html.Div(
-                f"Expired ({ob.n_expired}) — dead contract(s) still on the book "
-                "(stale extract); excluded from every figure here.",
-                className="dd-panel-note"))
-        return html.Div(className="dd-panel risk-oblig", children=children)
-
+        return html.Div("No short options on the book — nothing to assign.",
+                        className="dd-empty")
     covered_sub = None
     if ob.calls.n_positions:
         covered_sub = html.Div(
             f"covered {ob.covered_call_contracts:,.0f} · "
             f"uncovered {ob.uncovered_call_contracts:,.0f} (no covering stock)",
             className="risk-oblig-sub")
-    head = html.Tr([html.Th(h, className="am-th") for h in
-                    ("", "Contracts", "Obligation", "% NAV", "ITM", "ITM obligation")])
-    table = html.Table(className="am-table risk-oblig-table", children=[
+    head = html.Tr([html.Th(h) for h in
+                    ("", "Contracts", "Obligation", "% NAV", "ITM oblig.")])
+    return html.Table(className="risk-oblig-table", children=[
         html.Thead(head),
         html.Tbody([
-            _oblig_row("Short puts — cash to fund", ob.puts, nav),
-            _oblig_row("Short calls — deliver at strike", ob.calls, nav, covered_sub),
+            _oblig_total_row("Short puts — cash to fund", ob.puts, nav),
+            _oblig_total_row("Short calls — deliver at strike", ob.calls, nav,
+                             covered_sub),
         ])])
-    children = [
-        title,
-        html.Div("Strike value of every short option if assigned — short legs only; "
-                 "a long option is a right, not an obligation.",
-                 className="dd-panel-subtitle"),
-        table,
-        _oblig_windows(ob),
-    ]
+
+
+def _oblig_badges(ob) -> list:
+    badges = []
     n_unknown = ob.puts.n_unknown_moneyness + ob.calls.n_unknown_moneyness
     if n_unknown:
-        children.append(html.Div(
+        badges.append(_badge(
+            f"⚠ {n_unknown} no spot",
             f"Spot missing on {n_unknown} short option(s) — the ITM subtotal "
-            "excludes them.", className="dd-panel-note"))
+            "excludes them.", warn=True))
     if ob.n_expired:
-        children.append(html.Div(
+        badges.append(_badge(
+            f"{ob.n_expired} expired",
             f"Expired ({ob.n_expired}) — dead contract(s) still on the book "
-            "(stale extract); excluded from every figure here.",
-            className="dd-panel-note"))
-    return html.Div(className="dd-panel risk-oblig", children=children)
+            "(stale extract); excluded from every figure here."))
+    return badges
 
 
 # ---------------------------------------------------------------------------
-# Concentration (block 6)
+# 7 — concentration (every basis as % of |NAV|)
 # ---------------------------------------------------------------------------
 
 _CONC_TOP_N = 10
-_CONC_COLS = ("Name", "Net Δ$", "% NAV", "Gross |Δ$|", "Γ$ (1%)", "ν$",
-              "Put oblig.", "Call oblig.", "MV")
+
+_CONC_TIP = (
+    "Per-name exposure on every basis, as % of |NAV|. Net nets options against "
+    "stock; gross sums per-position absolute deltas — the lens a hedge cannot "
+    "empty (rows sort by it). Obligations are the short-strike dollars. Market "
+    "value by name lives on Holdings.")
 
 
-def _conc_cells(r, nav) -> list:
+def build_concentration_columns() -> list[dict]:
     return [
-        html.Td(_fmt_money(r["net_dollar_delta"]), className=_num_cls(r["net_dollar_delta"])),
-        html.Td(pct_of_nav(r["net_dollar_delta"], nav) or "—", className="exposure-num"),
-        html.Td(_fmt_money(r["gross_dollar_delta"]), className="exposure-num"),
-        html.Td(_fmt_money(r["dollar_gamma"]), className=_num_cls(r["dollar_gamma"])),
-        html.Td(_fmt_money(r["dollar_vega"]), className=_num_cls(r["dollar_vega"])),
-        html.Td(_fmt_money(r["put_obligation"]) if r["put_obligation"] else "—",
-                className="exposure-num"),
-        html.Td(_fmt_money(r["call_obligation"]) if r["call_obligation"] else "—",
-                className="exposure-num"),
-        html.Td(_fmt_money(r["market_value"]), className=_num_cls(r["market_value"])),
+        {"field": "name", "headerName": "Name", "flex": 2, "minWidth": 104,
+         "filter": "agTextColumnFilter", "cellClass": "blotter-ticker-cell"},
+        {"field": "net_delta_pct", "headerName": "Net Δ", "width": 90,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_SIGNED_1DP_FMT, "cellStyle": SIGNED_COLOR_STYLE,
+         "headerTooltip": "Net dollar delta as % of |NAV| — options netted "
+                          "against stock."},
+        {"field": "gross_delta_pct", "headerName": "Gross", "width": 90,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_ABS_FMT,
+         "headerTooltip": "Gross |Δ$| as % of |NAV| — per-position absolute "
+                          "deltas summed; the sort basis."},
+        {"field": "gamma_pct", "headerName": "Γ (1%)", "width": 88,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_SIGNED_1DP_FMT, "cellStyle": SIGNED_COLOR_STYLE,
+         "headerTooltip": "Δ$ change per 1% spot move as % of |NAV| (Bloomberg "
+                          "per-1% basis — not the engine per-$1 Γ)."},
+        {"field": "vega_pct", "headerName": "Vega", "width": 84,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_SIGNED_1DP_FMT, "cellStyle": SIGNED_COLOR_STYLE,
+         "headerTooltip": "Dollar vega per 1 vol pt as % of |NAV|."},
+        {"field": "oblig_pct", "headerName": "Oblig.", "width": 86,
+         "type": "rightAligned", "filter": "agNumberColumnFilter",
+         "valueFormatter": PCT_ABS_FMT,
+         "headerTooltip": "Short-strike dollars if assigned (puts cash + calls "
+                          "delivery) as % of |NAV|."},
     ]
 
 
-def _others_row(rest: list, nav) -> Optional[html.Tr]:
-    if not rest:
-        return None
+def _conc_pcts(r: dict, nav) -> dict:
+    def _pct(v):
+        return (v / nav) if (v is not None and nav) else None
 
-    def _tot(key):
-        vals = [r[key] for r in rest if r[key] is not None]
-        return sum(vals) if vals else None
+    oblig = (r.get("put_obligation") or 0.0) + (r.get("call_obligation") or 0.0)
+    return {
+        "net_delta_pct": _pct(r.get("net_dollar_delta")),
+        "gross_delta_pct": _pct(r.get("gross_dollar_delta")),
+        "gamma_pct": _pct(r.get("dollar_gamma")),
+        "vega_pct": _pct(r.get("dollar_vega")),
+        "oblig_pct": _pct(oblig) if oblig else None,
+    }
 
-    agg = {k: _tot(k) for k in ("net_dollar_delta", "gross_dollar_delta", "dollar_gamma",
-                                "dollar_vega", "put_obligation", "call_obligation",
-                                "market_value")}
-    return html.Tr(className="am-row risk-conc-others", children=[
-        html.Td(f"Other ({len(rest)})", className="risk-conc-name")] + _conc_cells(agg, nav))
 
-
-def _concentration_table(lenses: dict) -> html.Div:
+def build_concentration_rows(lenses: dict) -> tuple[list[dict], list[dict]]:
+    """(rows, pinned Account row). Values are fractions of |NAV|; None dashes."""
     nav = lenses["nav"]
-    rows = lenses["rows"]
-    head = html.Tr([html.Th(c, className="am-th") for c in _CONC_COLS])
-    body = []
-    for r in rows[:_CONC_TOP_N]:
-        body.append(html.Tr(className="am-row", children=[
-            html.Td(r["symbol"], className="risk-conc-name")] + _conc_cells(r, nav)))
-    other = _others_row(rows[_CONC_TOP_N:], nav)
-    if other is not None:
-        body.append(other)
-    acc = dict(lenses["account"])
-    body.append(html.Tr(className="am-row exposure-row-total", children=[
-        html.Td("Account", className="risk-conc-name")] + _conc_cells(acc, nav)))
-    children = [
-        html.H3("Concentration — by name, every basis", className="dd-panel-title"),
-        html.Div("Sorted by gross |Δ$| — the lens a hedge cannot empty. Net nets "
-                 "options against stock; obligations are the short-strike dollars.",
-                 className="dd-panel-subtitle"),
-        html.Table(className="am-table risk-conc-table",
-                   children=[html.Thead(head), html.Tbody(body)]),
-    ]
-    missing = lenses["missing"]
-    if missing["n_rows"]:
-        names = missing["names"]
-        shown = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
-        children.append(html.Div(
-            f"Delta missing on {missing['n_rows']} position(s) across {len(names)} "
-            f"name(s) — their Δ columns dash and the totals understate: {shown}.",
-            className="dd-panel-note"))
+    rows = []
+    for r in lenses["rows"][:_CONC_TOP_N]:
+        rows.append({"_row_id": r["symbol"], "name": r["symbol"],
+                     **_conc_pcts(r, nav)})
+    rest = lenses["rows"][_CONC_TOP_N:]
+    if rest:
+        def _tot(key):
+            vals = [r[key] for r in rest if r.get(key) is not None]
+            return sum(vals) if vals else None
+
+        agg = {k: _tot(k) for k in ("net_dollar_delta", "gross_dollar_delta",
+                                    "dollar_gamma", "dollar_vega",
+                                    "put_obligation", "call_obligation")}
+        rows.append({"_row_id": "__others__", "name": f"Other ({len(rest)})",
+                     **_conc_pcts(agg, nav)})
+    pinned = [{"_row_id": "__account__", "name": "Account",
+               **_conc_pcts(dict(lenses["account"]), nav)}]
+    return rows, pinned
+
+
+def _concentration_grid(lenses: dict):
+    rows, pinned = build_concentration_rows(lenses)
     if not rows:
-        children.append(html.Div("No name exposure to show.", className="dd-empty"))
-    return html.Div(className="dd-panel risk-conc", children=children)
+        return html.Div("No name exposure to show.", className="dd-empty")
+    return dag.AgGrid(
+        id="risk-conc-grid",
+        columnDefs=build_concentration_columns(),
+        rowData=rows,
+        dashGridOptions={
+            "rowHeight": 28,
+            "headerHeight": 32,
+            "animateRows": False,
+            "enableCellTextSelection": True,
+            "ensureDomOrder": True,
+            "domLayout": "autoHeight",
+            "pinnedBottomRowData": pinned,
+            "defaultColDef": {"sortable": True, "resizable": True,
+                              "suppressMovable": False},
+        },
+        className="ag-theme-balham blotter-grid",
+        getRowId={"function": "params.data._row_id"},
+        style={"width": "100%"},
+    )
 
 
-def _asset_class_table(lenses: dict) -> html.Div:
-    nav = lenses["nav"]
-    head = html.Tr([html.Th(c, className="am-th") for c in
-                    ("Class", "MV", "% NAV", "Net Δ$", "Positions")])
-    label = {"equity": "Equity", "fund_etf": "Fund / ETF", "option": "Options",
-             "cash": "Cash", "other": "Other"}
-    body = [html.Tr(className="am-row", children=[
-        html.Td(label.get(s["asset_class"], s["asset_class"]), className="risk-conc-name"),
-        html.Td(_fmt_money(s["market_value"]), className=_num_cls(s["market_value"])),
-        html.Td(pct_of_nav(s["market_value"], nav) or "—", className="exposure-num"),
-        html.Td(_fmt_money(s["net_dollar_delta"]), className=_num_cls(s["net_dollar_delta"])),
-        html.Td(str(s["n_positions"]), className="exposure-num"),
-    ]) for s in lenses["asset_class_split"]]
-    return html.Div(className="dd-panel risk-split", children=[
-        html.H3("Asset-class split", className="dd-panel-title"),
-        html.Div("Fund/ETF is the closest held-instrument read on index exposure; "
-                 "options group under their own class here and under their "
-                 "underlying in the name table.", className="dd-panel-subtitle"),
-        html.Table(className="am-table risk-split-table",
-                   children=[html.Thead(head), html.Tbody(body)]),
-    ])
-
-
-def _missing_delta_note(account_state) -> Optional[html.Div]:
-    from pm.risk.exposure import economic_exposure_missing
-    missing = economic_exposure_missing(account_state)
+def _conc_badges(lenses: dict) -> list:
+    missing = lenses["missing"]
     if not missing["n_rows"]:
-        return None
+        return []
     names = missing["names"]
-    shown = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
-    return html.Div(
+    return [_badge(
+        f"⚠ {missing['n_rows']} unpriced",
         f"Delta missing on {missing['n_rows']} position(s) across "
-        f"{len(names)} name(s) — excluded from these bars: {shown}.",
-        className="dd-panel-note")
-
-
-def _sector_panel(account_state) -> html.Div:
-    from pm.risk.exposure import economic_exposure_by_sector
-    items = economic_exposure_by_sector(account_state)  # sorted by |delta-$| desc
-    max_w = max((abs(r["pct_nav"] or 0) for r in items), default=0)
-    bars = [bar_row(r["sector"], r["pct_nav"], max_w) for r in items]
-    if not bars:
-        bars = [html.Div("No economic exposure to show.", className="dd-empty")]
-    children = [
-        html.H3("Sector breakdown", className="dd-panel-title"),
-        html.Div("Economic exposure (delta-$) by sector, signed % NAV — options "
-                 "included and netted against stock.", className="dd-panel-subtitle"),
-        html.Div(className="dd-bars", children=bars),
-    ]
-    note = _missing_delta_note(account_state)
-    if note is not None:
-        children.append(note)
-    return html.Div(className="dd-panel", children=children)
+        f"{len(names)} name(s) — their Δ columns dash and the totals "
+        f"understate: {', '.join(names)}.", warn=True)]
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +736,7 @@ def _sector_panel(account_state) -> html.Div:
 def render_risk_section(account_state, state) -> html.Div:
     head = html.Div(className="dd-section-head", children=[
         html.H2("Risk", className="dd-section-title"),
-        html.Span("scenario · exposures · obligations · concentration",
+        html.Span("posture · scenario · what's coming · concentration",
                   className="dd-section-meta"),
     ])
     if account_state is None or state is None:
@@ -413,63 +756,71 @@ def render_risk_section(account_state, state) -> html.Div:
 
     ob = assignment_obligations(account_state)
     lenses = concentration_lenses(account_state, obligations=ob)
+    cal = upcoming_events(state, account_state, ob, lenses)
 
-    # 1-3: the scenario row, the answer strip, the reshape table
-    if impact is not None:
-        scenario_blocks = [
-            _controls(account_state, impact["rows"]),
-            html.Div(className="risk-answer", children=[
-                html.Div(id="scn-total", children=_total_line(impact))]),
-            html.Div(id="risk-reshape",
-                     children=_reshape_table(impact.get("exposures"), nav)),
-        ]
-        drill = html.Div(className="scn-body", children=[
-            html.Div(className="scn-heatmap-wrap", children=[
-                _lazy_graph(grid)]),
-            html.Div(className="scn-impact-wrap", children=[
-                html.Div(id="scn-impact", children=_impact_table(impact["rows"], "account")),
-            ]),
-        ])
-        drill_caption = html.Div(className="scenario-caption", children=[_CAPTION])
-    else:
-        scenario_blocks = [html.Div(
-            "Scenario views unavailable (Bloomberg off or no priceable options).",
-            className="dd-empty")]
-        drill = None
-        drill_caption = None
-
-    # 4: the current book (snapshot basis) + carry
+    # 1 — posture
     if e is not None:
-        current_book = html.Div(className="dd-analytics-grid", children=[
-            _safe(lambda: _headline_panel(e), "Net market exposure"),
-            _safe(lambda: _mv_vs_econ_panel(e), "Market value vs economic exposure"),
-            _safe(lambda: _beta_panel(e), "Beta"),
-            _safe(lambda: _vega_tenor_row(e), "Vega by tenor"),
-            _safe(lambda: _premium_panel(account_state), "Options premium"),
-        ])
-        rollup = _safe(lambda: _rollup_table(e), "Exposure rollup")
+        posture = [_band("Posture", badges=_safe(lambda: _posture_badges(e),
+                                                 "Posture badges")),
+                   _safe(lambda: _posture_strip(e, nav), "Posture")]
     else:
-        current_book = html.Div("Exposure unavailable for this account.",
-                                className="dd-empty")
-        rollup = None
+        posture = [_band("Posture"),
+                   html.Div("Exposure unavailable for this account.",
+                            className="dd-empty")]
 
-    children = [head, *scenario_blocks,
-                current_book,
-                _safe(lambda: _obligations_panel(account_state, ob, nav),
-                      "Assignment obligations"),
-                html.Div(className="dd-analytics-grid", children=[
-                    _safe(lambda: _concentration_table(lenses), "Concentration"),
-                    _safe(lambda: _asset_class_table(lenses), "Asset-class split"),
-                    _safe(lambda: _sector_panel(account_state), "Sector breakdown"),
-                ])]
-    if drill is not None:
-        children.extend([drill, drill_caption])
-    if rollup is not None:
-        children.append(rollup)
-    children.append(html.Div(
-        "% of NAV = value ÷ |net asset value|. Current-book panels read the "
-        "Bloomberg snapshot greeks; the reshape table and the drill are "
-        "engine-priced (fast BS2002).", className="dd-panel-note risk-footer"))
+    # 2-5 — dials, ribbon, convexity strip, heatmap | impact
+    if impact is not None:
+        exposures = impact.get("exposures")
+        scenario_blocks = [
+            _band("Scenario"),
+            _controls(account_state, impact["rows"]),
+            html.Div(id="scn-total",
+                     children=_total_line(impact, shocked=False)),
+            _band("Convexity — how the book reshapes", tip=_RESHAPE_CAPTION,
+                  badges=[b for b in (_coverage_badge(exposures),) if b]),
+            html.Div(id="risk-reshape",
+                     children=_reshape_table(exposures, nav, shocked=False)),
+            html.Div(className="scn-body", children=[
+                html.Div(className="scn-heatmap-wrap", children=[
+                    _lazy_graph(grid)]),
+                html.Div(className="scn-impact-wrap", children=[
+                    _band("Per-position impact", tip=_CAPTION),
+                    html.Div(id="scn-impact",
+                             children=_impact_table(impact["rows"], "account",
+                                                    shocked=False)),
+                ]),
+            ]),
+        ]
+    else:
+        scenario_blocks = [
+            _band("Scenario"),
+            html.Div("Scenario views unavailable (Bloomberg off or no "
+                     "priceable options).", className="dd-empty")]
+
+    # 6 — what's coming: chart | event grid
+    cal_rows = build_calendar_rows(cal, nav)
+    left6 = [_band("What's coming — next 60 days", tip=_CAL_TIP,
+                   badges=_events_badges(cal))]
+    right6 = [_band("Event detail")]
+    if cal_rows:
+        left6.append(_safe(lambda: _event_chart(cal, nav), "Event timeline"))
+        right6.append(_safe(lambda: _calendar_grid(cal_rows), "Event detail"))
+    else:
+        left6.append(html.Div("No dated events in the next 60 days.",
+                              className="dd-empty"))
+        right6.append(html.Div("—", className="dd-empty"))
+
+    # 7 — concentration | standing obligations
+    left7 = [_band("Concentration", tip=_CONC_TIP,
+                   badges=_safe(lambda: _conc_badges(lenses), "Concentration badges")),
+             _safe(lambda: _concentration_grid(lenses), "Concentration")]
+    right7 = [_band("Standing obligations", tip=_OBLIG_TIP,
+                    badges=_oblig_badges(ob)),
+              _safe(lambda: _oblig_block(ob, nav), "Standing obligations")]
+
+    children = [head, *posture, *scenario_blocks,
+                _cols(left6, right6),
+                _cols(left7, right7)]
     return html.Div(className="dd-section risk-cockpit", children=children)
 
 

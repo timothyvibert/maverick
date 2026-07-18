@@ -82,6 +82,13 @@ PCT_ABS_FMT = {
     "function": "params.value == null ? '—' : (params.value * 100).toFixed(1) + '%'"
 }
 
+# Signed percent from a fraction, one decimal: +1.8% / -0.4% (the %NAV
+# convention at grid density — pct_of_nav's signed 1dp, client-side).
+PCT_SIGNED_1DP_FMT = {
+    "function": "params.value == null ? '—' : "
+                "(params.value >= 0 ? '+' : '') + (params.value * 100).toFixed(1) + '%'"
+}
+
 
 # ---------------------------------------------------------------------------
 # Conditional cell styles (data-meaning colour only)

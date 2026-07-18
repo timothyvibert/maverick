@@ -1206,7 +1206,7 @@ html, body {
     padding-bottom: 6px; margin-bottom: 10px;
 }
 .dd-section-title { font-size: 16px; font-weight: 600; color: var(--pm-charcoal); margin: 0; }
-.dd-section-meta { font-size: 12px; color: var(--pm-grey-500); }
+.dd-section-meta { font-size: 11px; color: var(--pm-grey-500); }
 .dd-actionables-summary { font-weight: 600; color: var(--pm-grey-700); }
 .dd-empty { color: var(--pm-grey-500); font-style: italic; padding: 16px; }
 
@@ -1290,10 +1290,7 @@ html, body {
 /* multi-expiry evaluation note under the Tier-2 block (mirrors the grid's † tooltip) */
 .struct-t2-note { font-size: 11px; color: var(--pm-grey-500); font-style: italic; margin: 2px 0 4px 0; }
 
-/* Analytics — panel grid */
-.dd-analytics-grid {
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
-}
+/* Panel card — the Trade-history insights section's container */
 .dd-panel {
     background: white; border: 1px solid var(--pm-grey-300); border-radius: 4px;
     padding: 14px 16px;
@@ -1312,100 +1309,35 @@ html, body {
     font-family: "Consolas", monospace;
 }
 
-/* Stat row (greeks / premium) */
+/* Stat row (posture / trade insights) — label/value sizes match the KPI
+   banner (.dd-kpi-label / .dd-kpi-value) so stats read as one system. */
 .dd-stat-row { display: flex; gap: 18px; flex-wrap: wrap; }
 .dd-stat { min-width: 96px; }
 .dd-stat-label {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--pm-grey-500); font-weight: 600;
 }
 .dd-stat-value {
-    font-size: 18px; font-weight: 600; color: var(--pm-charcoal);
+    font-size: 19px; font-weight: 600; color: var(--pm-charcoal);
     font-family: "Consolas", monospace; margin-top: 2px;
 }
 .dd-stat-sub { font-size: 11px; color: var(--pm-grey-500); margin-top: 1px; }
 .dd-stat-pos .dd-stat-value { color: var(--pos); }
 .dd-stat-neg .dd-stat-value { color: var(--neg); }
 
-/* Premium split bar */
-.dd-split-bar {
-    display: flex; height: 10px; border-radius: 3px; overflow: hidden;
-    margin-top: 12px; background: var(--pm-grey-100);
-}
-.dd-split-collected { background: var(--pos); }
-.dd-split-paid { background: var(--neg); }
-
-/* Expiry ladder — aligned three-column rows */
-.dd-ladder { font-size: 13px; }
-.dd-ladder-row {
-    display: grid; grid-template-columns: 1fr 80px 130px; gap: 8px;
-    padding: 5px 0; border-bottom: 1px solid var(--pm-grey-100); align-items: center;
-}
-.dd-ladder-head {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); border-bottom: 1px solid var(--pm-grey-300);
-}
-.dd-ladder-bucket { font-weight: 600; color: var(--pm-charcoal); }
-.dd-ladder-count, .dd-ladder-notional {
-    text-align: right; font-family: "Consolas", monospace;
-}
-
-/* Exposure section — the vega tenor row (six columns) + the structure -> account
-   rollup table. Reuses the dd-panel / am-table look and the --pos / --neg /
-   charcoal / urgent tokens; no new palette. */
-.dd-vega-ladder .dd-ladder-row { grid-template-columns: 104px repeat(5, 1fr); }
-.dd-vega-ladder .dd-ladder-head span:not(:first-child),
-.dd-vega-ladder .dd-ladder-count { text-align: right; }
-
-.dd-exposure-rollup { margin-top: 6px; }
-.exposure-table th, .exposure-table td { white-space: nowrap; }
-.exposure-label { color: var(--pm-charcoal); font-weight: 600; }
+/* Right-aligned monospace numerics shared by the risk tables. */
 .exposure-num {
     text-align: right; font-family: "Consolas", monospace;
     font-variant-numeric: tabular-nums; color: var(--pm-grey-700);
 }
 .exposure-pos { color: var(--pos); }
 .exposure-neg { color: var(--neg); }
-.exposure-row-subtotal td { border-top: 1px solid var(--pm-grey-300); font-weight: 600; }
-.exposure-row-total td { border-top: 2px solid var(--pm-grey-300); font-weight: 700; }
-/* Contention alternatives — de-emphasised (grey) with the urgent edge cue so they
-   read as alternatives, not additive contributors. */
-.exposure-row-contention td { color: var(--pm-grey-500); }
-.exposure-row-contention { box-shadow: inset 3px 0 0 0 var(--pm-urgent); }
-.exposure-row-contention .exposure-label { font-style: italic; font-weight: 500; }
-.exposure-degraded-mark { color: var(--pm-urgent); font-weight: 700; }
-
-/* Rollup accordion — native <details>/<summary>, no callback. The Account
-   total stays visible in the summary; the per-structure rows collapse away by
-   default to reclaim the vertical space. */
-.exposure-rollup-details > .exposure-table { margin-top: 8px; }
-.exposure-rollup-summary {
-    cursor: pointer; list-style: none;
-    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px;
-    padding: 6px 8px; background: var(--pm-grey-50); border-radius: 3px;
-}
-.exposure-rollup-summary::-webkit-details-marker { display: none; }
-.exposure-rollup-summary::marker { content: ""; }
-.exposure-rollup-summary:hover { background: var(--pm-grey-100); }
-.exposure-rollup-details[open] > .exposure-rollup-summary { background: var(--pm-grey-100); }
-.exposure-rollup-acct { font-weight: 700; color: var(--pm-charcoal); }
-.exposure-rollup-stat { display: inline-flex; align-items: baseline; gap: 5px; font-size: 12.5px; }
-.exposure-rollup-stat-lbl {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--pm-grey-500);
-}
-.exposure-rollup-toggle {
-    margin-left: auto; font-size: 11px; color: var(--pm-grey-500); white-space: nowrap;
-}
-.exposure-rollup-details[open] .exposure-rollup-toggle { color: var(--pm-grey-700); }
-.exposure-rollup-caret { display: inline-block; transition: transform 0.12s ease; }
-.exposure-rollup-details[open] .exposure-rollup-caret { transform: rotate(180deg); }
 
 /* ---- Scenario / stress section — reuses the --pm-* / --pos / --neg
    token set; no new palette. ---- */
 .scenario-pos { color: var(--pos); }
 .scenario-neg { color: var(--neg); }
 .scenario-graph { width: 100%; }
-.scenario-caption { font-size: 11px; color: var(--pm-grey-500); margin-top: 6px; line-height: 1.5; }
 
 /* ---- Scenario interactive section (controls row over heatmap | impact table) ---- */
 .scn-controls {
@@ -1440,16 +1372,18 @@ html, body {
 .scn-chip-reset { color: var(--pm-grey-500); }
 .scn-body { display: flex; gap: 16px; align-items: flex-start; }
 .scn-heatmap-wrap { flex: 1 1 58%; min-width: 0; }
-.scn-impact-wrap { flex: 1 1 42%; min-width: 0; max-height: 400px; overflow: auto; }
-.scn-impact-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.scn-impact-wrap { flex: 1 1 42%; min-width: 0; }
+.scn-impact-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .scn-impact-head th {
-    text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
-    color: var(--pm-grey-500); padding: 4px 6px; border-bottom: 1px solid var(--pm-grey-300);
-    position: sticky; top: 0; background: white;
+    text-align: right; font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.3px; color: var(--pm-grey-500); padding: 4px 6px;
+    border-bottom: 1px solid var(--pm-grey-300);
 }
 .scn-impact-head th:first-child { text-align: left; }
 .scn-impact-row { cursor: pointer; border-bottom: 1px solid var(--pm-grey-100); }
 .scn-impact-row:hover { background: var(--pm-grey-50); }
+/* the aggregated tail line — display-only, not a drill target */
+.scn-impact-other { cursor: default; color: var(--pm-grey-700); font-style: italic; }
 .scn-impact-active { background: var(--pm-urgent-bg); }
 .scn-impact-name { text-align: left; color: var(--pm-charcoal); white-space: nowrap; }
 .scn-impact-num {
@@ -1461,7 +1395,7 @@ html, body {
     padding-top: 6px; border-top: 2px solid var(--pm-grey-300);
 }
 .scn-total-lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--pm-grey-700); }
-.scn-total-val { font-family: "Consolas", monospace; font-weight: 700; font-size: 14px; }
+.scn-total-val { font-family: "Consolas", monospace; font-weight: 700; font-size: 19px; }
 .scn-total-val.scenario-pos { color: var(--pos); }
 .scn-total-val.scenario-neg { color: var(--neg); }
 /* pricing-coverage disclosure beside the total ("n of m legs priced") */
@@ -1488,10 +1422,6 @@ html, body {
    exposure numbers use; positive (long) exposure stays neutral charcoal. */
 .dd-bar-fill-neg { background: var(--neg); }
 .dd-bar-val { text-align: right; font-family: "Consolas", monospace; color: var(--pm-grey-700); }
-
-@media (max-width: 1100px) {
-    .dd-analytics-grid { grid-template-columns: 1fr; }
-}
 
 /* ---- Payoff drawer — economics + scenario on the shared drawer.
    Reuses the --pm-*/--pos/--neg tokens; the figure is token-styled in payoff.py. ---- */
@@ -1668,56 +1598,58 @@ html, body {
     font-size: 13px; font-style: italic; }
 .scanner-footer { margin-top: 12px; font-size: 11px; color: var(--pm-grey-500); line-height: 1.5; }
 
-/* ---- Risk section (the consolidated cockpit) ------------------------------ */
+/* ---- Risk section — terminal idiom (bands over rules; no cards) ----------- */
 
 /* The header Net Greeks KPI doubles as the anchor into the Risk section. */
 .dd-kpi-anchor { text-decoration: none; color: inherit; display: block; flex: 1 1 280px; }
 .dd-kpi-anchor .dd-kpi-greeks { cursor: pointer; }
 .dd-kpi-anchor:hover .dd-kpi-label { color: var(--pm-accent); text-decoration: underline; }
 
-/* Answer strip — the stressed P&L, directly under the scenario controls. */
-.risk-answer { margin: 10px 0 4px; padding: 8px 12px; background: var(--pm-grey-100, #FAFAFA);
-    border: 1px solid var(--pm-grey-300); border-radius: 3px; }
-.risk-answer .scn-total { margin: 0; }
-.risk-answer .scn-total-val { font-size: 16px; }
+/* A block = band label + optional ⓘ + right-aligned badges over a 1px rule;
+   content sits directly on the page. */
+.risk-band { display: flex; align-items: baseline; gap: 4px; margin: 16px 0 8px;
+    padding-bottom: 3px; border-bottom: 1px solid var(--pm-grey-300); }
+.risk-band-label { font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--pm-grey-700); }
+.risk-badges { margin-left: auto; display: flex; gap: 6px; align-items: baseline; }
+.risk-badge { font-size: 11px; border: 1px solid var(--pm-grey-300); border-radius: 3px;
+    padding: 1px 7px; color: var(--pm-grey-700); cursor: help; white-space: nowrap; }
+.risk-badge-warn { color: var(--pm-urgent); border-color: var(--pm-urgent); }
 
-/* Reshape table — current vs stressed exposure profile. */
-.risk-reshape { margin: 8px 0 14px; }
-.risk-reshape-table { width: 100%; }
-.risk-reshape-table td, .risk-reshape-table th { padding: 5px 10px; }
-.risk-reshape-colhead { text-align: right; }
-.risk-reshape-metric { text-align: left; white-space: nowrap; }
-.risk-reshape-basis { display: block; font-size: 10px; color: var(--pm-grey-500); }
-.risk-reshape-cell { text-align: right; white-space: nowrap; }
-.risk-reshape-num { font-family: "Consolas", monospace; font-weight: 600; }
-.risk-reshape-num.scenario-pos { color: var(--pos); }
-.risk-reshape-num.scenario-neg { color: var(--neg); }
-.risk-reshape-pct { font-size: 10.5px; color: var(--pm-grey-700); }
-.risk-reshape-coverage { font-weight: 600; }
+/* Two-column rows — the section's rhythm below the strips. */
+.risk-cols { display: flex; gap: 28px; align-items: flex-start; }
+.risk-col { flex: 1 1 0; min-width: 0; }
+@media (max-width: 1100px) {
+    .risk-cols { flex-direction: column; }
+}
 
-/* Obligations */
-.risk-oblig-table { width: 100%; }
-.risk-oblig-table td, .risk-oblig-table th { padding: 5px 10px; text-align: right;
-    white-space: nowrap; }
+/* Posture band (19px stats) + convexity strip (15px stats, change-first). */
+.risk-posture { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 18px; }
+.risk-convexity { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 18px; }
+.risk-convexity .dd-stat-value { font-size: 15px; font-family: "Consolas", monospace; }
+.risk-convexity .dd-stat-value.scenario-pos { color: var(--pos); }
+.risk-convexity .dd-stat-value.scenario-neg { color: var(--neg); }
+.risk-convexity-basis { text-transform: none; letter-spacing: 0; font-weight: 400; }
+@media (max-width: 1100px) {
+    .risk-posture, .risk-convexity { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Standing obligations totals — blotter-style header, 13px data. */
+.risk-oblig-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.risk-oblig-table th { font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.3px; color: var(--pm-grey-500); text-align: right;
+    padding: 5px 10px; border-bottom: 1px solid var(--pm-grey-300); }
+.risk-oblig-table td { padding: 5px 10px; text-align: right; white-space: nowrap; }
+.risk-oblig-row { border-bottom: 1px solid var(--pm-grey-100); }
 .risk-oblig-side { text-align: left !important; white-space: normal; }
-.risk-oblig-sub { font-size: 10.5px; color: var(--pm-grey-700); }
-.risk-oblig-ladder { margin-top: 10px; }
+.risk-oblig-sub { font-size: 11px; color: var(--pm-grey-700); }
 
-/* Concentration + asset-class split */
-.risk-conc-table, .risk-split-table { width: 100%; }
-.risk-conc-table td, .risk-conc-table th,
-.risk-split-table td, .risk-split-table th { padding: 4px 8px; text-align: right;
-    white-space: nowrap; }
-.risk-conc-name { text-align: left !important; font-weight: 600; }
-.risk-conc-others td { color: var(--pm-grey-700); font-style: italic; }
-.risk-conc-others .risk-conc-name { font-weight: 400; }
-
-/* A failed block degrades to an honest panel, never a blank Tab 2. */
+/* A failed block degrades to an honest line, never a blank Tab 2. */
 .risk-block-error { border-left: 3px solid var(--pm-urgent); }
 
-.risk-footer { margin-top: 10px; border-top: 1px solid var(--pm-grey-300); padding-top: 8px; }
+/* The ⓘ affordance — a plain span with a native title tooltip. */
+.risk-info { cursor: help; color: var(--pm-grey-500); font-size: 11px;
+    font-weight: 600; margin-left: 6px; }
 
-/* Obligations window ladder: label + the four expiry windows. */
-.risk-oblig-ladder .dd-ladder-row { grid-template-columns: 140px repeat(4, 1fr); }
-.risk-oblig-ladder .dd-ladder-head span:not(:first-child),
-.risk-oblig-ladder .dd-ladder-count { text-align: right; }
+/* The resting ribbon — no shock applied, so no headline number. */
+.scn-total-rest { font-size: 13px; color: var(--pm-grey-500); font-style: italic; }

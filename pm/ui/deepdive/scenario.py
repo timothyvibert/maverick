@@ -60,7 +60,7 @@ _CAPTION = (
     "All numbers here — heatmap, impact table, presets — are fast vectorized "
     "BS2002 (β-mapped SPX × vol shift, P&L vs current); ● current shock, "
     "◆ preset points. Γ$ is engine dollar-gamma per $1 spot move — a different "
-    "basis from the current-book panels' per-1% γ; do not compare. θ is engine "
+    "basis from the posture band's per-1% γ; do not compare. θ is engine "
     "per-business-day (diverges from the BBG snapshot θ). Dial recomputes live, "
     "no Bloomberg.")
 
@@ -130,8 +130,8 @@ def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
     fig = go.Figure(go.Heatmap(
         z=z, x=x, y=y, zmid=0,
         colorscale=[[0.0, _NEG], [0.5, _NEUTRAL], [1.0, _POS]],
-        colorbar=dict(title=dict(text="P&L $", font=dict(size=10)), thickness=10,
-                      tickfont=dict(size=9), outlinewidth=0),
+        colorbar=dict(title=dict(text="P&L $", font=dict(size=11)), thickness=10,
+                      tickfont=dict(size=11), outlinewidth=0),
         hovertemplate="SPX %{x:.0f}%<br>vol %{y:+.1f}pt<br>P&L %{z:$,.0f}<extra></extra>"))
     # preset diamonds on the spot×vol plane
     fig.add_trace(go.Scatter(
@@ -145,7 +145,7 @@ def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
         name="current", hovertemplate="current shock<br>SPX %{x:.1f}%, vol %{y:+.1f}pt<extra></extra>"))
     title = "P&L surface — " + (target_label or "Account")
     fig.update_layout(
-        title=dict(text=title, font=dict(size=12, color=_CHARCOAL), x=0, xanchor="left"),
+        title=dict(text=title, font=dict(size=13, color=_CHARCOAL), x=0, xanchor="left"),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family=_FONT, color=_CHARCOAL, size=11),
         margin=dict(l=52, r=10, t=30, b=40), height=360, showlegend=False,
@@ -154,47 +154,80 @@ def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
     return fig
 
 
-def _impact_table(rows, target):
+# Beyond this many rows the tail folds into one aggregate line — the page never
+# grows an inner scrollbar and the totals stay conserved.
+_IMPACT_MAX_ROWS = 14
+
+
+def _impact_table(rows, target, shocked: bool = True):
+    """The per-position impact table. ``shocked=False`` (the resting page)
+    dashes the shock-dependent P&L column — a wall of $0 reads as a bug, not a
+    zero shock; the current-state dollar greeks keep their real values."""
     head = html.Tr(className="scn-impact-head", children=[
         html.Th("Position / structure"), html.Th("P&L"), html.Th("Δ$"),
         html.Th("Γ$", title="engine dollar-gamma per $1 spot move — different basis "
-                            "from the current-book panels' per-1% γ"),
+                            "from the posture band's per-1% γ"),
         html.Th("ν$"), html.Th("θ$")])
+
+    def _pnl_cell(v):
+        if not shocked:
+            return html.Td("—", className="scn-impact-num")
+        return html.Td(_fmt_money(v), className=f"scn-impact-num {_sign_cls(v)}")
+
+    shown = rows[:_IMPACT_MAX_ROWS]
+    rest = rows[_IMPACT_MAX_ROWS:]
     body = []
-    for r in rows:                               # already ranked worst-first
+    for r in shown:                              # already ranked worst-first
         active = " scn-impact-active" if (target and target == r["id"]) else ""
         body.append(html.Tr(
             id={"type": "scn-drill", "id": r["id"]}, n_clicks=0,
             className="scn-impact-row" + active, children=[
                 html.Td(r["label"], className="scn-impact-name", title="click to drill the surface"),
-                html.Td(_fmt_money(r["pnl"]), className=f"scn-impact-num {_sign_cls(r['pnl'])}"),
+                _pnl_cell(r["pnl"]),
                 html.Td(_fmt_money(r["dd"]), className="scn-impact-num"),
                 html.Td(_fmt_money(r["dg"]), className="scn-impact-num"),
                 html.Td(_fmt_money(r["dv"]), className="scn-impact-num"),
                 html.Td(_fmt_money(r["dt"]), className="scn-impact-num"),
             ]))
+    if rest:
+        def _tot(key):
+            vals = [r[key] for r in rest if r.get(key) is not None]
+            return sum(vals) if vals else None
+        body.append(html.Tr(className="scn-impact-row scn-impact-other", children=[
+            html.Td(f"Other ({len(rest)})", className="scn-impact-name",
+                    title="the remaining positions, summed — totals stay conserved"),
+            _pnl_cell(_tot("pnl")),
+            html.Td(_fmt_money(_tot("dd")), className="scn-impact-num"),
+            html.Td(_fmt_money(_tot("dg")), className="scn-impact-num"),
+            html.Td(_fmt_money(_tot("dv")), className="scn-impact-num"),
+            html.Td(_fmt_money(_tot("dt")), className="scn-impact-num"),
+        ]))
     return html.Table(className="scn-impact-table", children=[html.Thead(head), html.Tbody(body)])
 
 
-def _total_line(impact) -> html.Div:
+def _total_line(impact, shocked: bool = True) -> html.Div:
     pnl = impact["account_pnl"]
     pct = impact["account_pnl_pct"]
     pct_s = "" if pct is None else f"  ({pct * 100:+.2f}% NAV)"
     # Coverage honesty: the total covers only the priceable book. With nothing
     # priceable the $0 total is vacuous — say so instead of showing it; with a
-    # partial book, disclose the n-of-m coverage beside the number.
+    # partial book, disclose the n-of-m coverage inline beside the number.
     n_priced = impact.get("n_priced")
     n_skipped = impact.get("n_skipped") or 0
     children = [html.Span("Account P&L @ shock", className="scn-total-lbl")]
     if n_skipped and not n_priced:
         children.append(html.Span("— no priceable legs (market data missing)",
                                   className="scn-total-val"))
+    elif not shocked:
+        # The resting page: a headline $0 reads as a bug, not a zero shock.
+        children.append(html.Span("— no shock applied",
+                                  className="scn-total-rest"))
     else:
         children.append(html.Span(_fmt_money(pnl) + pct_s,
                                   className=f"scn-total-val {_sign_cls(pnl)}"))
-        if n_skipped and n_priced:
-            children.append(html.Span(
-                f"{n_priced} of {n_priced + n_skipped} legs priced — "
-                f"{n_skipped} skipped (unpriceable)",
-                className="scn-total-coverage"))
+    if n_skipped and n_priced:
+        children.append(html.Span(
+            f"{n_priced} of {n_priced + n_skipped} legs priced — "
+            f"{n_skipped} skipped (unpriceable)",
+            className="scn-total-coverage"))
     return html.Div(className="scn-total", children=children)

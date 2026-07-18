@@ -89,6 +89,30 @@ def _dte_for(position) -> Optional[int]:
         return None
 
 
+def _entry_breakeven_str(account_state, position) -> Optional[str]:
+    """The position's at-expiry entry-cost breakeven(s), read from the stored
+    assignment records — never recomputed here. None (a dash) unless the record
+    is genuinely anchored on the extract's entry cost basis: an unknown entry
+    price is not a zero entry price, and a mark-derived fallback is not an
+    entry breakeven (the record's ``basis_source`` exists to tell them apart)."""
+    rec = ((getattr(account_state, "assignment", None) or {})
+           .get("positions", {}) or {}).get(position.position_id)
+    if not rec or "breakevens" not in rec:
+        return None
+    if rec.get("basis_source") != "cost_basis":
+        return None
+    bes = rec.get("breakevens")
+    if bes is None:
+        return None
+    if not bes:
+        if rec.get("always_profitable"):
+            return "always profitable"
+        if rec.get("always_loss"):
+            return "always loss"
+        return None
+    return " / ".join(f"${b:,.2f}" for b in bes)
+
+
 def build_positions_columns() -> list[dict]:
     """Institutional column defs for the full-book grid. No Account column
     (the page is already scoped to one account)."""
@@ -122,6 +146,12 @@ def build_positions_columns() -> list[dict]:
         {"field": "dte", "headerName": "DTE", "width": 70,
          "type": "rightAligned", "filter": "agNumberColumnFilter",
          "valueFormatter": {"function": "params.value == null ? '' : params.value"}},
+        {"field": "entry_breakeven", "headerName": "Entry BE", "width": 116,
+         "type": "rightAligned", "filter": "agTextColumnFilter",
+         "headerTooltip": "At-expiry breakeven vs the position's entry cost basis "
+                          "(extract fill), this position alone; dash when the "
+                          "entry basis is missing.",
+         "valueFormatter": {"function": "params.value ? params.value : '—'"}},
         {"field": "alerts", "headerName": "Alerts", "flex": 2, "minWidth": 240,
          "tooltipField": "alerts", "valueFormatter": _ALERT_FMT,
          "cellClass": "dd-cell-ellipsis", "cellStyle": _ALERT_STYLE},
@@ -185,6 +215,7 @@ def build_positions_rows(account_state, state) -> list[dict]:
             "pnl_pct": pnl_pct,
             "strike_expiry": _strike_expiry(p),
             "dte": _dte_for(p),
+            "entry_breakeven": _entry_breakeven_str(account_state, p),
             "alerts": ", ".join(alert_names),
         })
     return rows
