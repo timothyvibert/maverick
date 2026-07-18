@@ -236,17 +236,27 @@ def parse_option_description(description: object) -> Optional[dict]:
 
 def match_option_ticker(
     chain: Sequence[str], expiry: object, strike: object, right: object,
+    constructed: Optional[str] = None,
 ) -> Optional[str]:
     """The canonical option ticker in *chain* matching (*expiry*, *strike*,
     *right*), or ``None`` when no listed contract matches. *chain* is a list of
     'Security Description' strings (see ``pm.core.bloomberg_client.fetch_option_chain``).
     Returns the matched string VERBATIM so it round-trips through the snapshot
-    fetch's reindex."""
+    fetch's reindex.
+
+    A chain can list more than one contract at the same coordinates under
+    different roots — a corporate-action-adjusted line (e.g. an appended-digit
+    root) beside the standard one, with different deliverables. A lone match is
+    returned as before; on a multi-root collision the entry whose root exactly
+    equals *constructed*'s root wins, and anything else returns ``None`` so the
+    caller keeps its honest unresolved warning instead of silently re-keying to
+    the wrong contract."""
     want_expiry = _coerce_expiry_date(expiry)
     want_right = _normalize_put_call(right)
     want_strike = _value_or_none(strike)
     if want_expiry is None or want_right is None or want_strike is None:
         return None
+    matches: list[dict] = []
     for description in chain or []:
         parsed = parse_option_description(description)
         if parsed is None:
@@ -254,7 +264,19 @@ def match_option_ticker(
         if (parsed["right"] == want_right
                 and parsed["expiry"] == want_expiry
                 and abs(parsed["strike"] - want_strike) <= 1e-6):
-            return parsed["ticker"]
+            matches.append(parsed)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]["ticker"]
+    want_root = None
+    if constructed:
+        parsed_constructed = parse_option_description(constructed)
+        if parsed_constructed is not None:
+            want_root = parsed_constructed["root"]
+    root_hits = [m for m in matches if want_root is not None and m["root"] == want_root]
+    if len(root_hits) == 1:
+        return root_hits[0]["ticker"]
     return None
 
 

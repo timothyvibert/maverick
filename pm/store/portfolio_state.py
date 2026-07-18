@@ -161,6 +161,17 @@ class PortfolioState:
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def assemble_load_warnings(extract, global_snapshot, accounts) -> list[str]:
+    """Every load note, in full: parse warnings, fetch warnings, then each
+    account's greeks warnings (account-prefixed). No sampling — the Alert
+    Manager's Load-notes tab is built for volume, and a truncated list reads
+    as the whole story when it isn't."""
+    warnings = list(extract.parse_warnings) + list(global_snapshot.fetch_warnings)
+    for acc in accounts.values():
+        warnings.extend(f"[{acc.account}] {w}" for w in (acc.greeks.warnings or []))
+    return warnings
+
+
 def load_portfolio_state(
     data_dir: Path,
     bbg_ok: Optional[bool] = None,
@@ -237,16 +248,7 @@ def load_portfolio_state(
             global_signals=global_signals,
         )
 
-    all_warnings = list(extract.parse_warnings) + list(global_snapshot.fetch_warnings)
-    for acc in accounts.values():
-        if acc.greeks.warnings:
-            sample = acc.greeks.warnings[:3]
-            rest = len(acc.greeks.warnings) - len(sample)
-            all_warnings.extend(f"[{acc.account}] {w}" for w in sample)
-            if rest > 0:
-                all_warnings.append(
-                    f"[{acc.account}] … and {rest} more greeks warning(s)."
-                )
+    all_warnings = assemble_load_warnings(extract, global_snapshot, accounts)
 
     state = PortfolioState(
         extract=extract,

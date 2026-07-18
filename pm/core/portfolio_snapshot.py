@@ -414,6 +414,7 @@ def _resolve_missing_options(
                 chain_cache[underlier] = fetch_option_chain(underlier)
             canonical = match_option_ticker(
                 chain_cache[underlier], p0.expiry, p0.strike, p0.right,
+                constructed=old_ticker,
             )
         if not canonical or canonical == old_ticker:
             warnings.append(_unresolved_option_warning(p0))

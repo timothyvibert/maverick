@@ -115,6 +115,31 @@ HIGH_IMPACT_OPTIONAL: dict[str, str] = {
     "quantity": "Quantity column missing — position sizes, structures, and P&L unavailable",
 }
 
+# Trades-sheet columns the trade-history join cannot run without. The builder
+# stays deliberately silent when they are absent (see position_builder's
+# _attach_trade_history early returns), so the loader is the one place the
+# consequence gets said out loud.
+TRADES_LOAD_BEARING: dict[str, str] = {
+    "account": ("Trades 'Account' column missing — equity/fund trade history "
+                "cannot be attributed to accounts (join disabled)"),
+    "trade_date": ("Trades 'Trade Date' column missing — open dates, days held, "
+                   "recency and roll reads all blank"),
+    "ticker_final": ("Trades 'Ticker Final' column missing — equity/fund trade "
+                     "history join disabled"),
+    "option_contract_key": ("Trades 'Option Contract Key' column missing — "
+                            "option trade history join disabled"),
+}
+
+# High-impact pair: without both, the open-date derivation (and everything on
+# it: days held, the behaviour profile's lifecycle read) degrades book-wide.
+TRADES_HIGH_IMPACT: dict[str, str] = {
+    "buy_sell": ("Trades 'Buy/Sell' column missing — open-date derivation and "
+                 "the behaviour profile degrade"),
+    "option_lifecycle_action": ("Trades 'Option Lifecycle Action' column missing "
+                                "— open-date derivation and the behaviour "
+                                "profile degrade"),
+}
+
 # Prefix marking a flag the status bar surfaces as urgent (amber): a missing
 # load-bearing column or a high-impact optional.
 URGENT_FLAG = "⚠"  # ⚠
@@ -388,9 +413,10 @@ def _load_sheet(
 def _flag_columns(
     df: pd.DataFrame, sheet_name: str, column_map: dict[str, str], warnings: list[str],
 ) -> None:
-    """Flag canonical columns that did not resolve, by tier. Holdings carries
-    the load-bearing + high-impact tiers (urgent, with an affected-row count);
-    every other absent column is an ordinary optional rolled into a single note.
+    """Flag canonical columns that did not resolve, by tier. Holdings and
+    Trades each carry load-bearing + high-impact tiers (urgent, with an
+    affected-row count where one applies); every other absent column is an
+    ordinary optional rolled into a single note.
     One summary per missing column — never one note per skipped row (the builder
     stays silent on absent columns; see position_builder)."""
     absent = set(column_map.values()) - set(df.columns)
@@ -422,6 +448,16 @@ def _flag_columns(
         for col, message in HIGH_IMPACT_OPTIONAL.items():
             if col in absent and col not in flagged:
                 warnings.append(f"{URGENT_FLAG} {sheet_name}: {message}.")
+                flagged.add(col)
+
+    elif sheet_name == "Trades":
+        for col, message in TRADES_LOAD_BEARING.items():
+            if col in absent:
+                warnings.append(f"{URGENT_FLAG} {message} ({n_rows} trade row(s)).")
+                flagged.add(col)
+        for col, message in TRADES_HIGH_IMPACT.items():
+            if col in absent and col not in flagged:
+                warnings.append(f"{URGENT_FLAG} {message}.")
                 flagged.add(col)
 
     optional_absent = sorted(absent - flagged)
