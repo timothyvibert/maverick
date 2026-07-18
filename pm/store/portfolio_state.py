@@ -108,6 +108,15 @@ class AccountState:
     # in the load path after exposure. The By-Structure grid reads the breakeven
     # from here; the payoff drawer carries the full set. structure_id -> dict.
     structure_tier2: dict = field(default_factory=dict)
+    # Assignment risk + entry-cost economics, precomputed in the load path after
+    # the Tier-2 pass: {"positions": {position_id -> record}, "structures":
+    # {structure_id -> record}}. Position records carry P(assignment) on short
+    # option legs (European N(d2) at the leg's own IV; None with a reason when
+    # unpriceable), the early-exercise qualifier, and the position's entry-cost
+    # breakeven(s) — extract-only, so breakevens fill with Bloomberg off.
+    # Structure records carry the capped short-leg union. The UI reads this and
+    # never recomputes. See pm.risk.assignment.
+    assignment: dict = field(default_factory=dict)
     # Client behavioural profile derived from the account's trade history (strategy
     # posture, direction, tenor, sector lean, sizing, cadence + a coverage band),
     # computed in the load path after the risk runs. The UI reads it and never
@@ -290,6 +299,15 @@ def load_portfolio_state(
     from pm.risk.payoff import run_structure_tier2
     run_structure_tier2(state)
 
+    # Assignment risk — P(assignment) per short option leg (the leg's own IV;
+    # None with a reason when unpriceable), the per-structure short-leg union,
+    # the early-exercise qualifier, and entry-cost breakevens per position,
+    # stored on acc.assignment. Reuses the engine legs + the payoff assembler;
+    # pure/read-only, no Bloomberg call. Runs after the Tier-2 pass so the
+    # structures + snapshot are in place.
+    from pm.risk.assignment import run_account_assignment
+    run_account_assignment(state)
+
     # Client behavioural profile from the trade history — strategy posture,
     # direction, tenor, sector lean, sizing, cadence + a coverage band, per
     # account. Pure read of the already-loaded trades + snapshot + positions (no
@@ -349,10 +367,10 @@ def reapply_thresholds(state: PortfolioState) -> PortfolioState:
       3. ``apply_suppressions`` + ``apply_material_change`` — the re-run
          produces fresh, unmarked Fire objects; the marking passes re-flag
          them from the persisted store, same as a load.
-    Structure detection, exposure, tier-2 economics and the client profile do
-    NOT re-run: none reads PatternConfig, and each lives on its own
-    AccountState field untouched by the engine. ``state.all_warnings`` is left
-    as loaded — this path adds no load events to warn about.
+    Structure detection, exposure, tier-2 economics, assignment risk and the
+    client profile do NOT re-run: none reads PatternConfig, and each lives on
+    its own AccountState field untouched by the engine. ``state.all_warnings``
+    is left as loaded — this path adds no load events to warn about.
 
     Mutates and returns the same state object.
     """
