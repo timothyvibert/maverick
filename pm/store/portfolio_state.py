@@ -22,8 +22,6 @@ import pandas as pd
 
 from pm.config import DEFAULT_RISK_FREE_RATE
 from pm.core.bloomberg_client import is_bloomberg_available
-from pm.core.composite_score import compute_all_composite_scores
-from pm.core.pitch_synthesizer import synthesize_pitch
 from pm.core.portfolio_diagnostics import (
     PortfolioDiagnostics,
     compute_portfolio_diagnostics,
@@ -552,9 +550,6 @@ def _build_account_state(
             p.underlying_bbg_ticker for p in positions if p.asset_class == "option"
         }
     }
-    composite_scores = compute_all_composite_scores(account_signals)
-    pitch_themes = synthesize_pitch(recommendations)
-
     trades = _filter_trades(all_trades, account_id)
     trades_by_underlying = _group_trades_by_underlying(trades, positions)
 
@@ -567,9 +562,12 @@ def _build_account_state(
         recommendations=recommendations,
         diagnostics=diagnostics,
         greeks=greeks,
-        composite_scores=composite_scores,
+        # Retired batch computes: nothing renders them (the F-group signal is
+        # computed per underlying in the signal library; the scanner reads
+        # recommendations). Fields stay so no consumer signature changes.
+        composite_scores={},
         signals_by_ticker=account_signals,
-        pitch_themes=pitch_themes,
+        pitch_themes=[],
         trades=trades,
         trades_by_underlying=trades_by_underlying,
     )

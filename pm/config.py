@@ -20,10 +20,6 @@ PORT = 8062
 # management fire labels the carry as estimated.
 DEFAULT_RISK_FREE_RATE = 0.04
 
-# ---------- Daily-move alert thresholds ----------
-ALERT_MULTIPLIER = 2.0
-TRADING_DAYS_PER_YEAR = 252
-
 # ---------- Option contract multiplier ----------
 # US listed equity options + Eurex single-stock options both use 100. Index
 # options can differ but they don't appear in the holdings file.

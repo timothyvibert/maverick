@@ -105,8 +105,3 @@ def compute_composite_score(signals: Optional[List[Signal]]) -> CompositeScore:
 
     return CompositeScore(total=total, components=components, label=label)
 
-
-def compute_all_composite_scores(signals_by_ticker: dict) -> dict:
-    """{ticker: CompositeScore}"""
-    return {ticker: compute_composite_score(sigs)
-            for ticker, sigs in signals_by_ticker.items()}
