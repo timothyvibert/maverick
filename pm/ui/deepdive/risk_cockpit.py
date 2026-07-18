@@ -826,6 +826,6 @@ def render_risk_section(account_state, state) -> html.Div:
 
 def _lazy_graph(grid):
     from dash import dcc
-    return dcc.Graph(id="scn-heatmap", figure=_heatmap_fig(grid, 0.0, 0.0),
+    return dcc.Graph(id="scn-heatmap", figure=_heatmap_fig(grid, 0.0, 0.0, shocked=False),
                      config={"displayModeBar": False, "responsive": True},
                      className="scenario-graph")

@@ -21,6 +21,7 @@ from dash import Input, Output, State, dcc, html, no_update
 
 from pm.ui import state_access as sa
 from pm.ui.deepdive.aggregations import _fmt_money
+from pm.ui.deepdive.formatters import pct_of_nav
 from pm.ui.deepdive.structures_panel import _TYPE_LABEL as _STRUCT_LABEL
 
 # token hexes mirroring assets/style.css (:root) — plotly needs explicit colours.
@@ -102,7 +103,7 @@ def _y_on(curve, x, s):
         return None
 
 
-def payoff_figure(result, show_components=False):
+def payoff_figure(result, show_components=False, nav=None, shocked=True):
     import plotly.graph_objects as go          # lazy
 
     x = result.grid
@@ -166,10 +167,21 @@ def payoff_figure(result, show_components=False):
             hovertemplate="spot %{x:,.2f}<extra></extra>"))
     sy = _y_on(ref, x, result.shocked_spot)
     if sy is not None:
+        # The dialled-state marker's hover states the P&L at the exact shocked
+        # point — shocked_spot is injected into the chart grid, so sy is the
+        # curve's true value there, not a cell — with %NAV per the house
+        # convention; an all-zero dial reads "no shock applied".
+        if shocked:
+            curve_word = "horizon" if horizon is not None else "expiry"
+            pct_s = pct_of_nav(sy, nav)
+            sh_hover = (f"shocked %{{x:,.2f}}<br>{curve_word} P&L %{{y:$,.0f}}"
+                        + (f" ({pct_s})" if pct_s else "") + "<extra></extra>")
+        else:
+            sh_hover = "no shock applied<br>px %{x:,.2f}<extra></extra>"
         fig.add_trace(go.Scatter(
             x=[result.shocked_spot], y=[sy], mode="markers", name="Shocked",
             marker=dict(symbol="diamond", size=12, color=_AMBER, line=dict(color="white", width=1.5)),
-            hovertemplate="shocked %{x:,.2f}<extra></extra>"))
+            hovertemplate=sh_hover))
     fig.update_layout(
         # No fixed height — the container (.payoff-graph, height:100%) governs the size, so
         # the initial render and every slider recompute produce the same stretched chart.
@@ -334,6 +346,14 @@ def _dial(result, shock) -> html.Div:
 # Body + live recompute callback
 # ---------------------------------------------------------------------------
 
+def _account_nav(account):
+    """The account's NAV for the %NAV hover convention — a pure read of the
+    loaded state; None (renders no %) when the state/account is missing."""
+    state = sa.get_state()
+    acc = state.accounts.get(account) if (state and account) else None
+    return getattr(acc, "nav", None)
+
+
 def render_payoff(account: str, *, structure_id: Optional[str] = None,
                   position_id: Optional[str] = None, shock: Optional[dict] = None) -> html.Div:
     """The drawer body for ``view='payoff'``. Reads the read-only ``price_payoff``
@@ -349,7 +369,9 @@ def render_payoff(account: str, *, structure_id: Optional[str] = None,
         html.Div(className="payoff-body", children=[
             html.Div(className="payoff-graph-wrap", children=[
                 dcc.Graph(id="payoff-graph",
-                          figure=payoff_figure(result, show_components=_is_overlay(result)),
+                          figure=payoff_figure(result, show_components=_is_overlay(result),
+                                               nav=_account_nav(account),
+                                               shocked=bool(shock and any(shock.values()))),
                           config={"displayModeBar": False, "responsive": True},
                           className="payoff-graph")]),
             html.Div(className="payoff-side", children=[
@@ -393,5 +415,7 @@ def register_payoff_callbacks(app) -> None:
                               position_id=ds.get("position_id"), shock=shock)
         if res is None:
             return no_update, no_update, no_update
-        return (payoff_figure(res, show_components=bool(components)),
+        return (payoff_figure(res, show_components=bool(components),
+                              nav=_account_nav(ds.get("account")),
+                              shocked=any(shock.values())),
                 economics_block(res), greeks_block(res))

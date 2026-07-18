@@ -16,6 +16,7 @@ from typing import Optional
 from dash import dcc, html
 
 from pm.ui.deepdive.aggregations import _fmt_money
+from pm.ui.deepdive.formatters import pct_of_nav
 
 # token hex mirroring assets/style.css (:root) — plotly needs explicit colors.
 _CHARCOAL = "#2B2B2B"
@@ -123,7 +124,7 @@ def _controls(account_state, rows) -> html.Div:
 # --------------------------------------------------------------------------
 # Figure + table builders (shared by render + the callbacks)
 # --------------------------------------------------------------------------
-def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
+def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None, nav=None, shocked=True):
     import plotly.graph_objects as go          # lazy
 
     z, x, y = grid["pnl_matrix"], grid["spot_axis"], grid["vol_axis"]
@@ -138,11 +139,21 @@ def _heatmap_fig(grid, spot_pct, vol_pts, target_label=None):
         x=[p[0] for p in _PLANE_PRESETS], y=[p[1] for p in _PLANE_PRESETS], mode="markers",
         marker=dict(symbol="diamond-open", size=8, color=_AMBER, line=dict(width=1)),
         name="presets", hoverinfo="skip"))
-    # current shock point
+    # current shock point — its hover states this surface's P&L AT the dialled
+    # point (spot_vol_grid evaluates it exactly, never the nearest cell) with
+    # %NAV; the resting page reads "no shock applied" (house dash-not-zero).
+    if shocked:
+        pnl = grid.get("point_pnl")
+        pnl_s = _fmt_money(pnl) if pnl is not None else "—"
+        pct_s = pct_of_nav(pnl, nav)
+        cur_hover = ("current shock<br>SPX %{x:.1f}%, vol %{y:+.1f}pt<br>P&L "
+                     + pnl_s + (f" ({pct_s})" if pct_s else "") + "<extra></extra>")
+    else:
+        cur_hover = "no shock applied<br>SPX %{x:.1f}%, vol %{y:+.1f}pt<extra></extra>"
     fig.add_trace(go.Scatter(
         x=[spot_pct], y=[vol_pts], mode="markers",
         marker=dict(symbol="circle", size=13, color=_CHARCOAL, line=dict(color="white", width=1.5)),
-        name="current", hovertemplate="current shock<br>SPX %{x:.1f}%, vol %{y:+.1f}pt<extra></extra>"))
+        name="current", hovertemplate=cur_hover))
     title = "P&L surface — " + (target_label or "Account")
     fig.update_layout(
         title=dict(text=title, font=dict(size=13, color=_CHARCOAL), x=0, xanchor="left"),

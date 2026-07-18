@@ -297,10 +297,15 @@ def _accrue_equity_exposure(acc: dict, dd, beta) -> None:
 
 
 def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=None,
-                  today=None) -> dict:
+                  today=None, point_spot_pct=0.0, point_vol_pts=0.0) -> dict:
     """The spot x vol P&L mesh for the heatmap, fast vectorized BS2002 (never truth).
     Cells are P&L vs the *current* (unshocked) state; rate/time shocks shift the
-    per-leg r / T / today before the sweep. Pure, read-only."""
+    per-leg r / T / today before the sweep. Pure, read-only.
+
+    ``point_spot_pct`` / ``point_vol_pts`` are the dialled shock: the exact point
+    is evaluated through the same per-leg path as the mesh and returned as
+    ``point_pnl`` — the surface's true value at the current-shock marker, never
+    the nearest cell."""
     today_ts = _normalize_today(today)
     legs, equities, _skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
@@ -308,6 +313,7 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
     spot_axis = np.round(np.linspace(-GRID_SPOT_SPAN, GRID_SPOT_SPAN, GRID_SPOT_N), 4)
     vol_axis = np.array(GRID_VOL_PTS, dtype=float)
     matrix = np.zeros((len(vol_axis), len(spot_axis)))
+    point_pnl = 0.0
 
     # Same business-day roll as _shocked_inputs: a weekend-landing time shock must
     # re-tenor the grid from the SAME shifted date as the impact table, or the two
@@ -330,12 +336,20 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
             px = np.asarray(strategy.price_leg(s_arr, lg.K, T, r, lg.q, sig, lg.opt_type,
                                                style=lg.style, mode="fast"), dtype=float)
             matrix[vi, :] += mult * (px - px0)
+        s_pt = max(lg.spot * (1.0 + beta * point_spot_pct / 100.0), _SPOT_FLOOR)
+        sig_pt = max(lg.sigma + point_vol_pts / 100.0, SIGMA_FLOOR)
+        px_pt = float(strategy.price_leg(s_pt, lg.K, T, r, lg.q, sig_pt, lg.opt_type,
+                                         style=lg.style, mode="fast"))
+        point_pnl += mult * (px_pt - px0)
     for eq in equities:                                   # linear, vol-independent
         s_arr = np.maximum(eq["spot"] * (1.0 + eq["beta"] * spot_axis / 100.0), 0.0)
         matrix += (eq["qty"] * (s_arr - eq["spot"]))[None, :]
+        s_pt = max(eq["spot"] * (1.0 + eq["beta"] * point_spot_pct / 100.0), 0.0)
+        point_pnl += eq["qty"] * (s_pt - eq["spot"])
 
     return {"spot_axis": spot_axis.tolist(), "vol_axis": vol_axis.tolist(),
-            "pnl_matrix": matrix.tolist(), "pricer": "fast vectorized BS2002"}
+            "pnl_matrix": matrix.tolist(), "point_pnl": point_pnl,
+            "pricer": "fast vectorized BS2002"}
 
 
 # --------------------------------------------------------------------------

@@ -334,14 +334,15 @@ def register_deepdive_callbacks(app: dash.Dash) -> None:
         # The resting page dashes shock-dependent cells (house dash-not-zero
         # rule) — a zero on every dial is "no shock applied", not a $0 result.
         shocked = bool(spx or vol or rate or time_days)
-        fig = _heatmap_fig(out["grid"], spx or 0, vol or 0, target_label=tlabel)
+        acc = state.accounts.get(acct)
+        fig = _heatmap_fig(out["grid"], spx or 0, vol or 0, target_label=tlabel,
+                           nav=getattr(acc, "nav", None), shocked=shocked)
         table = _impact_table(out["positions"], target, shocked=shocked)
         total = _total_line({"account_pnl": out["account"]["pnl"],
                              "account_pnl_pct": out["account"]["pnl_pct"],
                              "n_priced": out["account"].get("n_priced"),
                              "n_skipped": out["account"].get("n_skipped")},
                             shocked=shocked)
-        acc = state.accounts.get(acct)
         reshape = _reshape_table(out["account"].get("exposures"),
                                  getattr(acc, "nav", None), shocked=shocked)
         return fig, table, total, reshape
