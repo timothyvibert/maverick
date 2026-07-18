@@ -92,23 +92,11 @@ class EngineLeg:
     priceable: bool
     warnings: list = field(default_factory=list)
 
-    # -- engine leg-dict shapes (the two shapes fail SILENTLY on a missing key,
-    #    so both are populated explicitly) ----------------------------------
-    def to_strategy_leg(self) -> dict:
-        """Leg dict for ``strategy.price_strategy`` / ``strategy_greeks`` (T precomputed)."""
-        return {
-            "K": self.K, "T": self.T, "sigma": self.sigma,
-            "opt_type": self.opt_type, "qty": int(self.qty), "style": self.style,
-        }
-
-    def to_payoff_leg(self) -> dict:
-        """Leg dict for ``payoff_risk.*`` (carries ``expiry`` + ``mid``; computes T itself)."""
-        return {
-            "opt_type": self.opt_type, "sigma": self.sigma, "expiry": self.expiry,
-            "K": self.K, "qty": int(self.qty), "style": self.style,
-            "mid": self.mid if self.mid is not None else 0.0,
-        }
-
+    # HAZARD: the two engine leg-dict shapes (strategy.* wants a precomputed T;
+    # payoff_risk.* wants expiry) fail SILENTLY on a missing key. The live
+    # consumers each build complete dicts themselves — pm/risk/payoff.py's leg
+    # assembly and scenario._shocked_inputs — and their field sets are pinned
+    # by tests; build on those, not ad hoc.
     # -- per-share engine price / greeks (the reconciliation + 2b point marks) --
     def price(self, mode: str = "truth", spot: Optional[float] = None,
               sigma: Optional[float] = None) -> Optional[float]:

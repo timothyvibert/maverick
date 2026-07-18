@@ -28,18 +28,22 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 def _fmt_money(v: Optional[float]) -> str:
-    """Compact dollar string: $1.2M / -$340k / $0."""
+    """Compact dollar string: $1.2M / -$340k / $0. Band selection happens on
+    the ROUNDED magnitude so a value that rounds into the next band renders
+    there ($999,600 is $1.0M, never $1000k); a value that rounds to zero is
+    an unsigned $0."""
     if v is None:
         return "—"
     a = abs(v)
     sign = "-" if v < 0 else ""
-    if a >= 1e9:
+    if a >= 999.5e6:
         return f"{sign}${a / 1e9:.1f}B"
-    if a >= 1e6:
+    if a >= 999.5e3:
         return f"{sign}${a / 1e6:.1f}M"
-    if a >= 1e3:
+    if a >= 999.5:
         return f"{sign}${a / 1e3:.0f}k"
-    return f"{sign}${a:.0f}"
+    out = f"{sign}${a:.0f}"
+    return "$0" if out == "-$0" else out
 
 
 def _signed_money(v: Optional[float]) -> str:
@@ -84,8 +88,8 @@ def net_greeks_summary(account_state) -> dict:
     does NOT re-sum positions (the engine already did that with skipna).
 
     Returns keys: dollar_delta, dollar_gamma, dollar_vega, dollar_theta,
-    delta_pct_of_nav, headline (signed compact, for the KPI strip),
-    interpretation (worded, for Analytics).
+    headline (signed compact, for the KPI strip), interpretation (worded,
+    consumed by the KPI tooltip; the Risk section reads acc.exposure).
 
     Honesty rule: a total the engine set to None (every eligible row missing
     that greek) renders "—", never $0, and the interpretation says the data is
@@ -100,7 +104,6 @@ def net_greeks_summary(account_state) -> dict:
     dg = _coerce_float(totals.get("dollar_gamma"))
     dv = _coerce_float(totals.get("dollar_vega"))
     dt = _coerce_float(totals.get("dollar_theta"))
-    delta_pct = _coerce_float(totals.get("delta_pct_of_nav"))
 
     cov = totals.get("greeks_coverage") or {}
 
@@ -135,7 +138,6 @@ def net_greeks_summary(account_state) -> dict:
         "dollar_gamma": dg,
         "dollar_vega": dv,
         "dollar_theta": dt,
-        "delta_pct_of_nav": delta_pct,
         "greeks_coverage": cov,
         "headline": headline,
         "interpretation": interpretation,
@@ -234,7 +236,8 @@ def book_summary(account_state) -> dict:
     cash_mv = 0.0
     for p in positions:
         if getattr(p, "asset_class", None) == "cash":
-            cash_mv += abs(_coerce_float(getattr(p, "market_value", None)) or 0.0)
+            # Signed: a margin debit is negative cash and must read that way.
+            cash_mv += _coerce_float(getattr(p, "market_value", None)) or 0.0
     cash_pct = (cash_mv / nav) if nav else None
     return {
         "nav": _coerce_float(getattr(account_state, "nav", None)),

@@ -39,8 +39,9 @@ def pct(value, dp: int = 1, signed: bool = False) -> str:
 def pct_of_nav(value, nav, dp: int = 1, signed: bool = True):
     """'+1.8% NAV' from a dollar value and the account NAV. ONE %-of-NAV
     convention on the risk surfaces: the denominator is |signed net asset value|
-    (``AccountState.nav``), named in the section footer. None when either side is
-    missing or NAV is zero — the caller renders a dash, never a fake 0%."""
+    (``AccountState.nav``), named in the source badge's hover text. None when
+    either side is missing or NAV is zero — the caller renders a dash, never a
+    fake 0%."""
     if value is None or not nav:
         return None
     v = value / abs(nav) * 100.0

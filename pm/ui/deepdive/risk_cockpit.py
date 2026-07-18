@@ -129,10 +129,10 @@ _DIRECTION_TIP = (
     "book's SPX-equivalent dollars. β shown = net β-$ ÷ net Δ$, the delta "
     "book's exposure-weighted SPX beta (adjusted). " + _BETA_NOTE)
 _LEVERAGE_TIP = (
-    "Economic exposure ÷ market value. Market value is what the book is marked "
-    "at; economic exposure is its delta-equivalent exposure to the underlyings — "
-    "they diverge where an option's premium understates its directional "
-    "exposure.")
+    "Economic exposure ÷ market value of the greek-bearing book (equities + "
+    "options at their marks; cash and unpriced holdings excluded). Economic "
+    "exposure is the delta-equivalent exposure to the underlyings — they "
+    "diverge where an option's premium understates its directional exposure.")
 _VOL_TIP = (
     "Net dollar vega per 1 vol point (Bloomberg snapshot greeks), with its term "
     "structure by days to expiry. A dashed bucket holds no options — or only "

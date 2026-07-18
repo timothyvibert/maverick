@@ -48,7 +48,7 @@ class PortfolioGreeks:
 
     totals: dict
     # keys: dollar_delta, dollar_vega, dollar_theta, dollar_gamma,
-    #       delta_pct_of_nav, net_long_options_count,
+    #       net_long_options_count,
     #       net_short_options_count, coverage_ratio_by_underlying,
     #       greeks_coverage.
     # A dollar-greek total is None (never 0.0) when EVERY eligible row was
@@ -84,19 +84,6 @@ def _spot_from(under_snap: pd.DataFrame, ticker: str) -> float:
         return v
     except (TypeError, ValueError):
         return float("nan")
-
-
-def _safe_position_mv(p: Position) -> float:
-    mv = p.market_value
-    try:
-        if mv is None or pd.isna(mv):
-            return 0.0
-    except (TypeError, ValueError):
-        return 0.0
-    try:
-        return float(mv)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _greek_from(opt_snap: pd.DataFrame, ticker: str, col: str) -> float:
@@ -261,15 +248,6 @@ def compute_portfolio_greeks(
         else:
             totals[col] = float(by_pos[col].sum(skipna=True)) if not by_pos.empty else 0.0
     totals["greeks_coverage"] = greeks_coverage
-
-    # NAV here = sum of |market_value| across all positions handed in. Per-
-    # account NAV is enforced by the caller (load_portfolio_state computes
-    # greeks per account slice).
-    nav = sum(abs(_safe_position_mv(p)) for p in positions)
-    if nav and totals["dollar_delta"] is not None:
-        totals["delta_pct_of_nav"] = totals["dollar_delta"] / float(nav)
-    else:
-        totals["delta_pct_of_nav"] = float("nan")
 
     opts = by_pos[by_pos["instrument_type"] == "option"]
     totals["net_long_options_count"] = int((opts["quantity"] > 0).sum()) if not opts.empty else 0

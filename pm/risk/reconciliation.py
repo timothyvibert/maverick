@@ -210,3 +210,31 @@ def _num(v):
 
 def _finite(v) -> bool:
     return v is not None and isinstance(v, (int, float)) and np.isfinite(v)
+
+
+def main() -> int:
+    """Run the standing diagnostic against the live book: load the latest
+    extract with Bloomberg up, reconcile every account, print the per-leg
+    report + the summary. Exit non-zero when nothing was comparable.
+
+    Invocation: ``python -m pm.risk.reconciliation``
+    """
+    from pm.config import EXTRACT_DATA_DIR
+    from pm.store.portfolio_state import load_portfolio_state
+
+    state = load_portfolio_state(EXTRACT_DATA_DIR)
+    if not state.bloomberg_ok:
+        print("Bloomberg unavailable — the engine-vs-snapshot comparison needs "
+              "live snapshot greeks.")
+        return 2
+    any_rows = False
+    for account_id, account_state in state.accounts.items():
+        df = reconcile_account(state, account_state)
+        print(f"\n=== {account_id} ===")
+        print(format_report(df))
+        any_rows = any_rows or (df is not None and not df.empty)
+    return 0 if any_rows else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
