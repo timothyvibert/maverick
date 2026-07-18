@@ -57,6 +57,7 @@ from pm.pricing import payoff_analytic, payoff_risk
 from pm.pricing.conventions import year_frac
 from pm.pricing.strategy import avg_iv, price_leg
 from pm.risk.pricing_adapter import build_engine_legs
+from pm.core import clock
 
 DEFAULT_N_POINTS = 200
 DEFAULT_RANGE_PCT = 0.5
@@ -126,7 +127,7 @@ def _opt_type_of(pos) -> str:
 
 
 def _today_ts(today) -> pd.Timestamp:
-    return pd.Timestamp.today().normalize() if today is None else pd.Timestamp(today)
+    return pd.Timestamp(clock.today()) if today is None else pd.Timestamp(today)
 
 
 def _underlying_spot(account_state, bbg) -> Optional[float]:

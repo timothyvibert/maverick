@@ -35,6 +35,7 @@ from pm.insight import threshold_catalog as cat
 from pm.insight.pattern_groups import GROUP_LABELS, PATTERN_GROUP, all_pattern_meta
 from pm.store import alert_governance, settings_store, suppression_store
 from pm.ui import state_access as sa
+from pm.core import clock
 
 
 def _days_active(created_at: Optional[str], today: date) -> int:
@@ -105,7 +106,7 @@ def _unack_id(rec: dict) -> dict:
 def render_suppressed_tab(today: Optional[date] = None) -> html.Div:
     """The active suppressions AND per-fire acknowledgements, sorted/grouped by
     account. Empty → a neutral note."""
-    today = today or date.today()
+    today = today or clock.today()
     meta = all_pattern_meta()
     state = sa.get_state()      # to read each record's live mark (re-surfaced state)
     records = sorted(suppression_store.active_suppressions(today).values(),

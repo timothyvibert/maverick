@@ -34,6 +34,7 @@ import pandas as pd
 from pm.core.composite_score import compute_composite_score
 from pm.core.vol_metrics import iv_percentile
 from pm.ingest.position_builder import Position
+from pm.core import clock
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,7 @@ def _computed_input(value: Any, description: str) -> dict:
     return {
         "value": value,
         "source": f"computed:{description}",
-        "as_of": datetime.now().isoformat(timespec="seconds"),
+        "as_of": clock.now().isoformat(timespec="seconds"),
         "stale": False,
     }
 
@@ -161,7 +162,7 @@ def _safe_business_days_until(target: Optional[date]) -> Optional[int]:
         target = target.date()
     if not isinstance(target, date):
         return None
-    today = date.today()
+    today = clock.today()
     if target < today:
         return -int(len(pd.bdate_range(target, today)) - 1)
     return int(len(pd.bdate_range(today, target)) - 1)
@@ -170,7 +171,7 @@ def _safe_business_days_until(target: Optional[date]) -> Optional[int]:
 def _today() -> date:
     """Indirection point for 'today' so tests can pin a deterministic
     reference date (D3 analyst_note_recent business-day math)."""
-    return date.today()
+    return clock.today()
 
 
 def _business_days_since(note_date: date, today: date) -> int:
@@ -804,7 +805,7 @@ def _compute_days_to_ex_div(snap: dict, projected_dividend: Optional[dict] = Non
 
 def _compute_dte_nearest_expiry(positions: list[Position], underlying: str) -> SignalValue:
     """C4: minimum DTE across all option positions on this underlying in the account."""
-    today = date.today()
+    today = clock.today()
     candidates: list[int] = []
     inputs: dict[str, Any] = {
         "positions_scanned": {
@@ -1157,12 +1158,12 @@ def _compute_option_dte(position: Position) -> SignalValue:
     inputs: dict[str, Any] = {
         "asset_class": _extract_input(position.asset_class, "Asset Class"),
         "expiry": _extract_input(position.expiry, "Option Expiration"),
-        "today": _computed_input(date.today().isoformat(), "date.today()"),
+        "today": _computed_input(clock.today().isoformat(), "clock.today()"),
     }
     if position.asset_class != "option" or position.expiry is None:
         return _stale("option_dte", "expiry",
                       reason="not an option / no expiry", inputs=inputs)
-    dte = (position.expiry - date.today()).days
+    dte = (position.expiry - clock.today()).days
     return SignalValue(
         signal_id="option_dte",
         value=dte,

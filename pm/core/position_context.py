@@ -19,6 +19,7 @@ import pandas as pd
 
 from pm.core.portfolio_signals import FIELDS
 from pm.ingest.position_builder import Position
+from pm.core import clock
 
 
 @dataclass
@@ -98,7 +99,7 @@ def _signed_moneyness(spot, strike, right) -> Optional[float]:
 def _dte(expiry, today: Optional[date] = None) -> Optional[int]:
     if expiry is None:
         return None
-    today = today or date.today()
+    today = today or clock.today()
     try:
         return (expiry - today).days
     except Exception:

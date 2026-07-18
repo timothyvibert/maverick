@@ -31,6 +31,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 import pandas as pd
+from pm.core import clock
 
 DEFAULT_HORIZON_DAYS = 60
 
@@ -201,7 +202,7 @@ def upcoming_events(state, account_state, ob, lenses=None, elegs=None,
     ``{"rows", "as_of", "horizon_days", "n_assign_priced",
     "n_assign_total", "warnings"}`` with rows date-sorted.
     """
-    ref = as_of or date.today()
+    ref = as_of or clock.today()
     window_end = ref + timedelta(days=horizon_days)
     warnings: list[str] = []
 

@@ -29,6 +29,7 @@ from datetime import date
 from typing import Optional
 
 import pandas as pd
+from pm.core import clock
 
 # Days-to-expiry windows — the same windows the retired strike-obligation expiry
 # ladder used, so the desk's mental buckets carry over.
@@ -150,7 +151,7 @@ def assignment_obligations(account_state, as_of: Optional[date] = None) -> Assig
     """The account's short-option assignment obligations, both sides. Pure read of
     ``positions`` (+ snapshot spot for the ITM subtotals, structures for the
     covered/uncovered call split)."""
-    ref = as_of or date.today()
+    ref = as_of or clock.today()
     snap = _spot_lookup(account_state)
     sides = {"PUT": ObligationSide(by_window=_empty_windows()),
              "CALL": ObligationSide(by_window=_empty_windows())}

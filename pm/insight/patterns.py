@@ -31,6 +31,7 @@ import pandas as pd
 
 from pm.ingest.position_builder import Position
 from pm.insight import templates as T
+from pm.core import clock
 from pm.insight.signal_library import (
     SignalDict,
     SignalValue,
@@ -266,7 +267,7 @@ def _is_long_option(position: Position) -> bool:
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return clock.now()
 
 
 def _make_fire(
@@ -736,7 +737,7 @@ def detect_p8_account(account_state, config: PatternConfig) -> list[Fire]:
             continue
         by_under.setdefault(p.underlying_symbol, []).append(p)
 
-    today = date.today()
+    today = clock.today()
 
     def _bdays_ago(d: date) -> int:
         # Business days between the trade date and today (weekend-safe): the
@@ -926,7 +927,7 @@ def detect_p10(
 
 def detect_p11_account(account_state, config: PatternConfig) -> list[Fire]:
     trades = account_state.trades
-    today = date.today()
+    today = clock.today()
     if trades is None or trades.empty:
         days_since_trade: Optional[int] = None
         last_trade_dt = None
@@ -1306,12 +1307,12 @@ def detect_p15(
         thresholds_used={"p15_vol_multiplier_min": config.p15_vol_multiplier_min},
         computation="vol_adjusted_move >= p15_vol_multiplier_min",
         fire_result={"vol_units": vol_units, "return_1d": return_1d,
-                     "move_date": date.today().isoformat(), "fired": True},
+                     "move_date": clock.today().isoformat(), "fired": True},
         # move_date stamps WHICH day's move this is — P15 is a single-day event,
         # and material-change re-surfacing keys on it so a permanent mute never
         # swallows a NEW notable-move day (the old monotonic classification
         # compared σ sizes across unrelated days).
-        template_variables={**lv, **rv, "move_date": date.today().isoformat()},
+        template_variables={**lv, **rv, "move_date": clock.today().isoformat()},
         extras=extras,
     )
     return _make_fire(pattern_id="P15", position=position, account_state=account_state,

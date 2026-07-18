@@ -40,6 +40,7 @@ from pm.insight.headline_metrics import (
 )
 from pm.insight.patterns import SuppressionMark
 from pm.store import db
+from pm.core import clock
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,7 @@ def active_suppressions(as_of: Optional[date] = None) -> dict[tuple[str, str, st
     persists. ``as_of`` defaults to today."""
     if not db.store_exists():
         return {}
-    as_of_str = (as_of or date.today()).isoformat()
+    as_of_str = (as_of or clock.today()).isoformat()
     return {
         (r["account"], r["name"], r["pattern_id"]): r
         for r in all_suppressions()

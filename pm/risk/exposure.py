@@ -36,6 +36,7 @@ from typing import Optional
 import pandas as pd
 
 from pm.insight.structures import reconcile_allocations
+from pm.core import clock
 
 # Bloomberg beta fields read from the underlying snapshot. Both are pulled
 # SPX-relative (a single consistent benchmark, so net market exposure is coherent)
@@ -279,7 +280,7 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
     """
     if beta_source not in ("adjusted", "raw"):
         raise ValueError("beta_source must be 'adjusted' or 'raw', got %r" % (beta_source,))
-    today = as_of or date.today()
+    today = as_of or clock.today()
 
     account = getattr(account_state, "account", "")
     positions = list(getattr(account_state, "positions", []) or [])

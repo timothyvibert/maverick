@@ -38,6 +38,7 @@ from pm.pricing import american_crr, european, strategy
 from pm.pricing.american_crr import DEFAULT_CRR_STEPS, FAST_CRR_STEPS
 from pm.pricing.conventions import year_frac
 from pm.risk.pricing_adapter import EngineLeg, build_engine_legs
+from pm.core import clock
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +598,7 @@ def _snap_val(snap, idx, col):
 
 def _normalize_today(today) -> pd.Timestamp:
     if today is None:
-        return pd.Timestamp.today().normalize()
+        return pd.Timestamp(clock.today())
     return pd.Timestamp(today).normalize()
 
 

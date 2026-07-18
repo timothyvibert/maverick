@@ -20,6 +20,7 @@ from typing import Optional
 from pm.core.bloomberg_client import pick_rate_for_dte
 from pm.insight import structures as S
 from pm.insight.patterns import Fire
+from pm.core import clock
 
 T1, T2 = 1, 2
 
@@ -432,7 +433,7 @@ def rederive_structure_fires(state, account_state, structure, as_of: Optional[da
     fetch. Used when a confirm/reject changes which fires a structure unlocks, so the
     change can be reflected without a full reload. Returns the structure's fires, each
     tagged with its structure_id; the caller swaps them in by that id."""
-    as_of = as_of or date.today()
+    as_of = as_of or clock.today()
     rate_curve, rate_fallback, fired_at = _market_inputs(state)
     by_id = {p.position_id: p for p in account_state.positions}
     return _fires_for_structure(
@@ -448,7 +449,7 @@ def run_structure_fires(state, as_of: Optional[date] = None) -> None:
     holdings, the treasury curve (carry fire, per-leg DTE) with the scalar rate as the
     BBG-off fallback, and the as-of date (today in the live app). Mutates state in
     place; the UI reads the fires and never recomputes."""
-    as_of = as_of or date.today()
+    as_of = as_of or clock.today()
     for account_state in state.accounts.values():
         new_fires: list[Fire] = []
         for st in account_state.structures:

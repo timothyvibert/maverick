@@ -15,6 +15,7 @@ import pandas as pd
 
 from pm.core.portfolio_signals import FIELDS
 from pm.ingest.position_builder import Position
+from pm.core import clock
 
 
 _EQUITY_LIKE = ("equity", "fund_etf")
@@ -81,7 +82,7 @@ def compute_portfolio_diagnostics(
                 weighted_beta = float(num / den)
 
     # ---- Earnings calendar (next 30 days) ---------------------------------
-    today = date.today()
+    today = clock.today()
     horizon = today + timedelta(days=30)
     earnings: list[dict] = []
     earn_col = FIELDS["earn_dt"]

@@ -27,6 +27,7 @@ from pm.insight import structures as S
 from pm.store.suppression_store import is_active
 from pm.ui.blotter.grid import format_position_descriptor
 from pm.ui.deepdive.formatters import MONEY_FULL_FMT, QTY_FMT, SIGNED_COLOR_STYLE
+from pm.core import clock
 from pm.ui.deepdive.structure_economics import (
     leg_slice,
     structure_economics,
@@ -159,7 +160,7 @@ def _nearest_dte(expiries):
     if not expiries:
         return None
     try:
-        return (min(expiries) - date.today()).days
+        return (min(expiries) - clock.today()).days
     except Exception:
         return None
 

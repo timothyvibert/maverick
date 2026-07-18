@@ -23,6 +23,7 @@ import pandas as pd
 # Signal lives in pm.core.scanner_models and is re-exported via
 # signal_detector. Import via signal_detector.
 from pm.core.signal_detector import Signal
+from pm.core import clock
 
 
 # Field-name mapping — the BBG field names from the snapshot output.
@@ -481,7 +482,7 @@ def signal_earnings_within_30d(row: pd.Series) -> Signal | None:
         earn_date = pd.to_datetime(earn_dt).date()
     except Exception:
         return None
-    today = pd.Timestamp.today().date()
+    today = clock.today()
     days_to_earnings = (earn_date - today).days
     if days_to_earnings < 0 or days_to_earnings > 60:
         return None

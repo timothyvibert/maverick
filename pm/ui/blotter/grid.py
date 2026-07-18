@@ -21,6 +21,7 @@ from pm.insight.patterns import Fire
 from pm.store.portfolio_state import PortfolioState
 from pm.store.suppression_store import is_active
 from pm.ui import state_access as sa
+from pm.core import clock
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +231,7 @@ def _dte_for(position) -> Optional[int]:
     if position is None or position.asset_class != "option" or position.expiry is None:
         return None
     try:
-        return (position.expiry - date.today()).days
+        return (position.expiry - clock.today()).days
     except Exception:
         return None
 

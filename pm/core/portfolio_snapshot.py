@@ -29,6 +29,7 @@ from pm.ingest.extract_loader import URGENT_FLAG
 # view (sourced via a separate override-aware pull — see bloomberg_client.fetch_spx_betas).
 _SPX_BETA_COLS = ("EQY_BETA", "EQY_RAW_BETA")
 from pm.ingest.position_builder import Position
+from pm.core import clock
 
 
 # Asset classes that have a tradeable underlying we want a BBG row for.
@@ -335,7 +336,7 @@ def _flag_expired_options(
     would burn one chain fetch per name and mis-diagnose the row as a ticker-
     resolution failure ('unresolved after OPT_CHAIN'). Emit an honest expired
     tag instead. Returns the still-live missing tickers."""
-    today = today or date.today()
+    today = today or clock.today()
     by_ticker: dict[str, Position] = {}
     for p in positions:
         if p.asset_class == "option" and p.bbg_ticker in missing_options:

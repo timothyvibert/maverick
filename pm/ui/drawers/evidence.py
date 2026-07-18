@@ -19,6 +19,7 @@ from pm.store.suppression_store import is_active
 from pm.ui import state_access as sa
 from pm.ui.blotter.grid import format_position_descriptor
 from pm.ui.drawers.trace_table import render_trace
+from pm.core import clock
 
 
 _TIER_WORD = {1: "T1 · Act today", 2: "T2 · Worth raising", 3: "T3 · FYI"}
@@ -35,7 +36,7 @@ _SNOOZE_PRESETS = [
 
 def _snooze_until(preset_days: int, today: Optional[date] = None) -> str:
     """The ISO date a snooze of ``preset_days`` runs through (inclusive)."""
-    return ((today or date.today()) + timedelta(days=preset_days)).isoformat()
+    return ((today or clock.today()) + timedelta(days=preset_days)).isoformat()
 
 
 def _ctl_id(kind: str, fire: Fire) -> dict:

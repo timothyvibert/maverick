@@ -50,6 +50,7 @@ from pm.pricing import dividends as _div
 from pm.pricing import strategy as _strategy
 from pm.pricing.conventions import year_frac
 from pm.pricing.implied_vol import implied_vol
+from pm.core import clock
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +264,7 @@ def _resolve_dividends(und_bbg, und_snap, pdivs, spot, r, T, today, expiry):
 # --------------------------------------------------------------------------
 def _normalize_today(today) -> pd.Timestamp:
     if today is None:
-        return pd.Timestamp.today().normalize()
+        return pd.Timestamp(clock.today())
     return pd.Timestamp(today).normalize()
 
 

@@ -27,6 +27,7 @@ from pm.ui.deepdive.formatters import (
     QTY_FMT,
     SIGNED_COLOR_STYLE,
 )
+from pm.core import clock
 from pm.ui.deepdive.structures_panel import (
     build_structure_columns,
     build_structure_rows,
@@ -84,7 +85,7 @@ def _dte_for(position) -> Optional[int]:
     if position is None or position.asset_class != "option" or position.expiry is None:
         return None
     try:
-        return (position.expiry - date.today()).days
+        return (position.expiry - clock.today()).days
     except Exception:
         return None
 

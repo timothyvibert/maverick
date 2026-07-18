@@ -19,6 +19,7 @@ import pandas as pd
 
 from pm.core.ticker_utils import construct_option_ticker
 from pm.ingest.extract_loader import URGENT_FLAG, PortfolioExtract
+from pm.core import clock
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +520,7 @@ def _attach_trade_history(position: Position, trades: pd.DataFrame) -> None:
         open_dt = first_open.get("trade_date")
         if isinstance(open_dt, date):
             position.open_date = open_dt
-            position.days_held = max((date.today() - open_dt).days, 0)
+            position.days_held = max((clock.today() - open_dt).days, 0)
 
     last = sorted_matches.iloc[-1]
     last_dt = last.get("trade_date")
