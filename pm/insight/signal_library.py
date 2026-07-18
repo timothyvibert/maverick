@@ -136,7 +136,7 @@ def _computed_input(value: Any, description: str) -> dict:
         "value": value,
         "source": f"computed:{description}",
         "as_of": clock.now().isoformat(timespec="seconds"),
-        "stale": False,
+        "stale": _is_nan_or_none(value),
     }
 
 
@@ -763,7 +763,7 @@ def _compute_days_to_ex_div(snap: dict, projected_dividend: Optional[dict] = Non
     if next_div.get("dps") is not None:
         inputs["projected_dividend"] = {
             "value": next_div.get("dps"),
-            "source": "BBG:BDVD_ALL_PROJECTIONS",
+            "source": "BBG:BDVD_PR_EX_DTS_DVD_AMTS_W_ANN",
             "as_of": None,
             "stale": False,
         }
@@ -771,7 +771,7 @@ def _compute_days_to_ex_div(snap: dict, projected_dividend: Optional[dict] = Non
     if proj_ex is not None:
         try:
             chosen_date = pd.to_datetime(proj_ex).date()
-            chosen_field = "BDVD_ALL_PROJECTIONS"
+            chosen_field = "BDVD_PR_EX_DTS_DVD_AMTS_W_ANN"
         except Exception:
             pass
 
@@ -1228,10 +1228,13 @@ def _compute_composite_score(legacy_signals: Optional[list]) -> SignalValue:
             "value": 0 if legacy_signals is None else len(legacy_signals),
             "source": "computed:from pm.core.portfolio_signals.compute_per_underlying_signals",
             "as_of": None,
-            "stale": legacy_signals is None,
+            "stale": not legacy_signals,
         },
     }
-    if legacy_signals is None:
+    if not legacy_signals:
+        # None (never computed) and [] (computed, produced nothing) are both an
+        # absence of inputs — a real-looking "Quiet" score from an empty list
+        # would read as an assessment that was never made.
         return _stale("composite_score", "legacy_signals",
                       reason="upstream signals not available", inputs=inputs)
     try:
@@ -1318,11 +1321,15 @@ def compute_signals_for_underlying(
     out["days_to_ex_div"] = _wrap(_compute_days_to_ex_div, snap, projected_dividend)
     out["dte_nearest_expiry_in_account"] = _wrap(
         _compute_dte_nearest_expiry, positions_in_account, underlying,
+        signal_id="dte_nearest_expiry_in_account",
     )
 
     # Group D
     out["analyst_rating_and_target"] = _wrap(_compute_analyst_rating_and_target, snap, analyst_data)
-    out["street_consensus_rating_and_target"] = _wrap(_compute_street_consensus, snap)
+    out["street_consensus_rating_and_target"] = _wrap(
+        _compute_street_consensus, snap,
+        signal_id="street_consensus_rating_and_target",
+    )
     out["analyst_note_recent"] = _wrap(_compute_analyst_note_recent, analyst_note_date,
                                        note_recent_window_bd)
 
@@ -1350,12 +1357,16 @@ def compute_position_signals(
     return out
 
 
-def _wrap(fn, *args, **kwargs) -> SignalValue:
-    """Catch unexpected exceptions and degrade to a stale SignalValue."""
+def _wrap(fn, *args, signal_id: Optional[str] = None) -> SignalValue:
+    """Catch unexpected exceptions and degrade to a stale SignalValue.
+
+    ``signal_id`` names the dict key the caller files this signal under; the
+    fallback derivation from the function name is wrong for the two signals
+    whose key does not match their function (pass it explicitly there)."""
     try:
-        return fn(*args, **kwargs)
+        return fn(*args)
     except Exception as exc:
-        signal_id = getattr(fn, "__name__", "unknown").replace("_compute_", "")
+        signal_id = signal_id or getattr(fn, "__name__", "unknown").replace("_compute_", "")
         return SignalValue(
             signal_id=signal_id,
             value=None,

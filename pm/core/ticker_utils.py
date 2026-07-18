@@ -1,11 +1,8 @@
 """Ticker construction utilities.
 
-Includes the option-ticker construction primitives. The live BBG
-validation (`validate_tickers`, `resolve_option_ticker_from_strike`)
-calls Bloomberg in production; here `validate_tickers` is a stub that
-raises if invoked without a monkeypatch (the live implementation lives
-in `pm.core.bloomberg_client`). The resolver can be tested via a
-monkey-patched validator.
+Option-ticker construct / parse / match primitives plus the chain slice
+filter. Pure string/date work — the Bloomberg I/O lives in
+``pm.core.bloomberg_client``.
 """
 from __future__ import annotations
 
@@ -17,11 +14,6 @@ import pandas as pd
 
 # Sector keywords that may appear at the end of a Bloomberg ticker
 MARKET_SECTOR_KEYWORDS = {"EQUITY", "INDEX", "CURNCY", "COMDTY"}
-
-# Strike offset ladder used by resolve_option_ticker_from_strike to walk
-# nearby strikes when the exact strike isn't tradeable.
-DEFAULT_STRIKE_OFFSETS = [-0.5, 0.5, -1.0, 1.0, -2.5, 2.5, -5.0, 5.0]
-
 
 def _normalize_put_call(value: object) -> Optional[str]:
     if value is None:
@@ -103,66 +95,6 @@ def construct_option_ticker(
     strike_text = _format_strike_for_ticker(strike)
     sector = _infer_sector_suffix(underlying, sector_hint)
     return f"{base} {expiry_text} {prefix}{strike_text} {sector}".strip()
-
-
-def validate_tickers(tickers: list[str]) -> pd.DataFrame:
-    """Live-probe seam — no live implementation exists in this codebase.
-
-    A real implementation would BDP-probe the tickers and return the subset
-    that resolve to a genuine Bloomberg contract. Tests monkeypatch this;
-    any un-patched call raises.
-    """
-    raise NotImplementedError(
-        "validate_tickers has no live implementation — monkeypatch it in tests."
-    )
-
-
-def resolve_option_ticker_from_strike(
-    underlying: str,
-    expiry: str,
-    put_call: str,
-    strike: float,
-    sector_hint: Optional[str] = None,
-    offsets: Optional[Sequence[float]] = None,
-) -> Optional[str]:
-    exact = construct_option_ticker(
-        underlying, expiry, put_call, strike, sector_hint
-    )
-    exact_df = validate_tickers([exact])
-    if not exact_df.empty:
-        return exact
-
-    offset_list = list(offsets) if offsets is not None else DEFAULT_STRIKE_OFFSETS
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for offset in offset_list:
-        if offset == 0:
-            continue
-        candidate_strike = float(strike) + float(offset)
-        if candidate_strike <= 0:
-            continue
-        ticker = construct_option_ticker(
-            underlying, expiry, put_call, candidate_strike, sector_hint
-        )
-        key = ticker.upper()
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(ticker)
-
-    if not candidates:
-        return None
-    validated = validate_tickers(candidates)
-    if validated.empty:
-        return None
-    valid_set = {
-        str(value).strip().upper()
-        for value in validated["security"].dropna().tolist()
-    }
-    for ticker in candidates:
-        if ticker.upper() in valid_set:
-            return ticker
-    return None
 
 
 def _value_or_none(value: object) -> Optional[float]:

@@ -584,14 +584,14 @@ def get_next_dividend_date(
 
 
 # ---------------------------------------------------------------------------
-# Projected dividends — Bloomberg Dividend Forecast (BDS BDVD_ALL_PROJECTIONS)
+# Projected dividends — Bloomberg Dividend Forecast (bulk field via plain bdp)
 # ---------------------------------------------------------------------------
 # fetch_projected_dividend returns one fixed shape so callers never branch on
 # source:
 #   {"next": {"ex_date": date|None, "declared_date": date|None,
 #             "dps": float|None} | None,
 #    "schedule": [{"ex_date": date, "dps": float}, ...]}   # forward-ordered
-# The bulk BDS parse fills next + the full forward schedule; the single-value
+# The bulk-field parse fills next + the full forward schedule; the single-value
 # BDP estimate fills next only (schedule stays []). The ex-div fire (P7) reads
 # next.dps; when it is absent the fire falls back to the DVD_YLD yield heuristic,
 # so a missing forecast degrades gracefully. Layer-2 pricing will consume the
@@ -605,9 +605,10 @@ def fetch_projected_dividend(ticker: str) -> Dict[str, object]:
     """Forward dividend forecast for *ticker* in the fixed
     ``{"next": {...}, "schedule": [...]}`` shape documented above.
 
-    Order of preference: the BDS bulk schedule (BDVD_ALL_PROJECTIONS, mnemonic
-    DV140) for the full forward set, then the single-value BDP estimate for a
-    next-only forecast, then the empty shape. Never raises.
+    Order of preference: the bulk forward schedule (a plain ``bdp`` on
+    ``BDVD_PR_EX_DTS_DVD_AMTS_W_ANN``, DV147 — this env's polars_bloomberg has
+    no ``.bds``) for the full forward set, then the single-value BDP estimate
+    for a next-only forecast, then the empty shape. Never raises.
     """
     if not ticker:
         return _empty_projection()

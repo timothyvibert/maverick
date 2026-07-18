@@ -370,7 +370,9 @@ def reapply_thresholds(state: PortfolioState) -> PortfolioState:
     Structure detection, exposure, tier-2 economics, assignment risk and the
     client profile do NOT re-run: none reads PatternConfig, and each lives on
     its own AccountState field untouched by the engine. ``state.all_warnings``
-    is left as loaded — this path adds no load events to warn about.
+    keeps its load events untouched; only the engine's own ``[insight]``
+    stale-skip lines are replaced by the re-run (never stacked — the engine
+    strips its previous notes before appending the fresh set).
 
     Mutates and returns the same state object.
     """

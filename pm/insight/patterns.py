@@ -90,8 +90,6 @@ class Fire:
     rationale: str
     trace: dict[str, Any]
     fired_at: datetime
-    skipped: bool = False
-    skip_reason: Optional[str] = None
     # Set on the structure-aware fires (P16–P20) to their originating structure's
     # id, so confirming/rejecting a structure can add or remove exactly that
     # structure's fires. None on the per-position / account patterns (P1–P15).
@@ -210,6 +208,52 @@ def _signal_present(signals: SignalDict, signal_id: str) -> bool:
     return sv is not None and not sv.stale and sv.value is not None
 
 
+# ---------------------------------------------------------------------------
+# Stale-skip reporting — the spec's never-silent rule. A pattern that cannot
+# be EVALUATED because a required signal is missing/stale reports the miss;
+# an eligibility non-fire (wrong asset class, below a threshold, a fresh None)
+# stays silent. The engine installs a collector per account and aggregates
+# the records into the load notes.
+# ---------------------------------------------------------------------------
+
+_SKIP_COLLECTOR: Optional[list] = None   # (pattern_id, entity, signal_id)
+
+
+def begin_skip_collection() -> None:
+    global _SKIP_COLLECTOR
+    _SKIP_COLLECTOR = []
+
+
+def drain_skip_collection() -> list:
+    global _SKIP_COLLECTOR
+    out, _SKIP_COLLECTOR = (_SKIP_COLLECTOR or []), None
+    return out
+
+
+def _report_stale_skip(pattern_id: str, entity: str, signal_id: str) -> None:
+    if _SKIP_COLLECTOR is not None:
+        _SKIP_COLLECTOR.append((pattern_id, entity, signal_id))
+
+
+def _required_signal(
+    signals: SignalDict, signal_id: str, *, pattern_id: str, entity: str,
+) -> Any:
+    """``_signal_value`` for a REQUIRED input: same return in every case, plus
+    a skip report when the signal is missing or stale (data gap — the pattern
+    cannot be evaluated). A fresh ``None`` value is an evaluated absence and
+    reports nothing."""
+    sv = signals.get(signal_id)
+    if sv is None or sv.stale:
+        _report_stale_skip(pattern_id, entity, signal_id)
+        return None
+    return sv.value
+
+
+def _entity(position: Position) -> str:
+    return (position.underlying_symbol or position.symbol
+            or position.position_id or "?")
+
+
 def _build_trace(
     *,
     inputs_from_signals: list[str],
@@ -304,7 +348,8 @@ def detect_p1(
 ) -> Optional[Fire]:
     if not _is_short_option(position):
         return None
-    captured = _signal_value(signals, "option_captured_pct")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P1", entity=_entity(position))
     if captured is None:
         return None
     if captured < config.p1_captured_min:
@@ -341,8 +386,10 @@ def detect_p2(
 ) -> Optional[Fire]:
     if not _is_short_option(position):
         return None
-    captured = _signal_value(signals, "option_captured_pct")
-    iv_pctl = _signal_value(signals, "iv_3m_percentile_1y")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P2", entity=_entity(position))
+    iv_pctl = _required_signal(signals, "iv_3m_percentile_1y",
+                               pattern_id="P2", entity=_entity(position))
     if captured is None or iv_pctl is None:
         return None
     if captured < config.p2_captured_min or iv_pctl < config.p2_iv_pctl_min:
@@ -382,9 +429,12 @@ def detect_p3(
 ) -> Optional[Fire]:
     if not _is_short_option(position):
         return None
-    captured = _signal_value(signals, "option_captured_pct")
-    spot_vs_200d = _signal_value(signals, "spot_vs_200d_ma")
-    rh = _signal_value(signals, "return_horizons")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P3", entity=_entity(position))
+    spot_vs_200d = _required_signal(signals, "spot_vs_200d_ma",
+                                    pattern_id="P3", entity=_entity(position))
+    rh = _required_signal(signals, "return_horizons",
+                          pattern_id="P3", entity=_entity(position))
     return_5d = rh.get("return_5d") if isinstance(rh, dict) else None
 
     if captured is None or spot_vs_200d is None or return_5d is None:
@@ -408,7 +458,8 @@ def detect_p3(
             return None
         if return_5d <= -config.p3_return_5d_threshold:  # ≤+0.03
             return None
-        moneyness = _signal_value(signals, "option_moneyness")
+        moneyness = _required_signal(signals, "option_moneyness",
+                                     pattern_id="P3", entity=_entity(position))
         if moneyness is None or moneyness <= -0.10:  # call too far OTM = not "moving toward ITM"
             return None
         direction_word = "strengthening"
@@ -461,11 +512,15 @@ def detect_p4(
 ) -> Optional[Fire]:
     if not _is_short_option(position):
         return None
-    captured = _signal_value(signals, "option_captured_pct")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P4", entity=_entity(position))
     if captured is None or captured < config.p4_captured_min:
         return None
     # D3 is stale offline / on names with no analyst coverage.
     if not _signal_present(signals, "analyst_note_recent"):
+        sv = signals.get("analyst_note_recent")
+        if sv is None or sv.stale:
+            _report_stale_skip("P4", _entity(position), "analyst_note_recent")
         return None
     note = _signal_value(signals, "analyst_note_recent")
     is_recent = note.get("is_recent") if isinstance(note, dict) else False
@@ -504,8 +559,10 @@ def detect_p5(
 ) -> Optional[Fire]:
     if not _is_short_option(position):
         return None
-    captured = _signal_value(signals, "option_captured_pct")
-    dte = _signal_value(signals, "option_dte")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P5", entity=_entity(position))
+    dte = _required_signal(signals, "option_dte",
+                           pattern_id="P5", entity=_entity(position))
     if captured is None or dte is None:
         return None
     if dte > config.p5_dte_max or captured < config.p5_captured_min:
@@ -567,7 +624,8 @@ def detect_p6(
 ) -> Optional[Fire]:
     if position.asset_class != "option":
         return None
-    pnl_pct = _signal_value(signals, "position_unrealized_pnl_pct")
+    pnl_pct = _required_signal(signals, "position_unrealized_pnl_pct",
+                               pattern_id="P6", entity=_entity(position))
     dte = _signal_value(signals, "option_dte")
     if pnl_pct is None:
         return None
@@ -631,8 +689,10 @@ def detect_p7(
         return None
     if (position.right or "").upper() != "CALL":
         return None
-    moneyness = _signal_value(signals, "option_moneyness")
-    days_to_exdiv = _signal_value(signals, "days_to_ex_div")
+    moneyness = _required_signal(signals, "option_moneyness",
+                                 pattern_id="P7", entity=_entity(position))
+    days_to_exdiv = _required_signal(signals, "days_to_ex_div",
+                                     pattern_id="P7", entity=_entity(position))
     if moneyness is None or days_to_exdiv is None:
         return None
     if moneyness <= 0:  # not ITM
@@ -669,6 +729,9 @@ def detect_p7(
     else:
         dvd_yld = _from_trace("DVD_YLD")
         if dvd_yld is None:
+            # An imminent ex-div with no way to size the dividend: the trap
+            # check cannot run at all, which the load notes must say.
+            _report_stale_skip("P7", _entity(position), "dividend estimate")
             return None
         try:
             dividend_amount = float(spot) * float(dvd_yld) / 100.0 / 4.0  # quarterly heuristic
@@ -854,7 +917,8 @@ def detect_p9(
         return None
     if position.days_held > config.p9_fresh_window_days:
         return None
-    nav_pct = _signal_value(signals, "position_size_pct_of_nav")
+    nav_pct = _required_signal(signals, "position_size_pct_of_nav",
+                               pattern_id="P9", entity=_entity(position))
     if nav_pct is None or nav_pct < config.p9_nav_pct_min:
         return None
 
@@ -894,7 +958,8 @@ def detect_p10(
 ) -> Optional[Fire]:
     if not _is_long_option(position):
         return None
-    pnl_pct = _signal_value(signals, "position_unrealized_pnl_pct")
+    pnl_pct = _required_signal(signals, "position_unrealized_pnl_pct",
+                               pattern_id="P10", entity=_entity(position))
     if pnl_pct is None or pnl_pct < config.p10_pnl_pct_min:
         return None
 
@@ -1128,9 +1193,12 @@ def detect_p13(
     if position.quantity is None or position.quantity <= 0:
         return None
 
-    iv_pctl = _signal_value(signals, "iv_3m_percentile_1y")
-    regime = _signal_value(signals, "ma_stack_regime")
-    rsi = _signal_value(signals, "rsi_14d_regime")
+    iv_pctl = _required_signal(signals, "iv_3m_percentile_1y",
+                               pattern_id="P13", entity=_entity(position))
+    regime = _required_signal(signals, "ma_stack_regime",
+                              pattern_id="P13", entity=_entity(position))
+    rsi = _required_signal(signals, "rsi_14d_regime",
+                           pattern_id="P13", entity=_entity(position))
 
     if iv_pctl is None or regime is None or rsi is None:
         return None
@@ -1191,7 +1259,8 @@ def detect_p14_account(account_state, config: PatternConfig) -> list[Fire]:
 
     for under, held in by_under.items():
         signals = account_state.signals.get(under, {}) if hasattr(account_state, "signals") else {}
-        days = _signal_value(signals, "days_to_earnings")
+        days = _required_signal(signals, "days_to_earnings",
+                                pattern_id="P14", entity=under)
         if days is None or not (1 <= days <= config.p14_earnings_window_days):
             continue
         iv_pctl = _signal_value(signals, "iv_3m_percentile_1y")
@@ -1199,6 +1268,11 @@ def detect_p14_account(account_state, config: PatternConfig) -> list[Fire]:
         iv_pctl_ok = iv_pctl is not None and iv_pctl >= config.p14_iv_pctl_min
         term_ok = term is not None and term >= config.p14_term_structure_min
         if not (iv_pctl_ok or term_ok):
+            if iv_pctl is None and term is None:
+                # The OR-gate needs at least one vol input; with both dark the
+                # setup cannot be judged either way.
+                _report_stale_skip("P14", under,
+                                   "iv_3m_percentile_1y|iv_term_structure")
             continue
 
         anchor = max(held, key=lambda p: abs(p.market_value or 0))
@@ -1251,12 +1325,14 @@ def detect_p15(
     # Eligibility: held position (equity, fund_etf, or any option) — not cash/other.
     if position.asset_class not in ("equity", "fund_etf", "option"):
         return None
-    vol_units = _signal_value(signals, "vol_adjusted_move")
+    vol_units = _required_signal(signals, "vol_adjusted_move",
+                                 pattern_id="P15", entity=_entity(position))
     if vol_units is None:
         return None
     if vol_units < config.p15_vol_multiplier_min:
         return None
-    rh = _signal_value(signals, "return_horizons")
+    rh = _required_signal(signals, "return_horizons",
+                          pattern_id="P15", entity=_entity(position))
     return_1d = rh.get("return_1d") if isinstance(rh, dict) else None
     if return_1d is None:
         return None
@@ -1351,7 +1427,8 @@ def detect_p21_account(account_state, config: PatternConfig) -> list[Fire]:
 
     for under, held in sorted(by_under.items()):
         signals = account_state.signals.get(under, {}) if hasattr(account_state, "signals") else {}
-        note = _signal_value(signals, "analyst_note_recent")
+        note = _required_signal(signals, "analyst_note_recent",
+                                pattern_id="P21", entity=under)
         if not isinstance(note, dict):
             continue                     # D3 stale (offline / no coverage) → skip
         days_since = note.get("days_since")
@@ -1421,8 +1498,10 @@ def detect_p22(
     bd_to_expiry = _safe_business_days_until(position.expiry)
     if bd_to_expiry is None or not (0 <= bd_to_expiry <= config.p22_expiry_window_bd):
         return None                      # outside the window, or already expired
-    captured = _signal_value(signals, "option_captured_pct")
-    pnl_pct = _signal_value(signals, "position_unrealized_pnl_pct")
+    captured = _required_signal(signals, "option_captured_pct",
+                                pattern_id="P22", entity=_entity(position))
+    pnl_pct = _required_signal(signals, "position_unrealized_pnl_pct",
+                               pattern_id="P22", entity=_entity(position))
     if captured is None or pnl_pct is None:
         return None
     if captured >= config.p5_captured_min:

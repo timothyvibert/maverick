@@ -10,13 +10,19 @@ attached to ``PortfolioState`` before the engine runs.
 Side effects:
 - Populates ``account_state.signals`` (underlying → SignalDict).
 - Populates ``account_state.fires`` (list[Fire]).
-- Appends up to 20 stale-skip warnings to ``state.all_warnings``.
+- Replaces the ``[insight]``-prefixed lines in ``state.all_warnings`` with this
+  run's stale-skip notes (capped): one line per (account, pattern, missing
+  signal) naming how many names could not be evaluated. Replacement, not
+  append, so a threshold recompute over the same state never stacks
+  duplicates. An eligibility non-fire stays silent; only a required signal
+  that is missing/stale reports (see ``patterns._required_signal``).
 """
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
+from pm.insight import patterns as _patterns
 from pm.insight.patterns import (
     ACCOUNT_LEVEL_DETECTORS,
     Fire,
@@ -126,6 +132,7 @@ def run_insight_engine(
         account_state.position_signals = {}
 
         # ---- Stage 2: per-position signals + per-position detectors -------
+        _patterns.begin_skip_collection()
         account_fires: list[Fire] = []
         for position in account_state.positions:
             symbol = position.underlying_symbol or position.symbol
@@ -169,8 +176,23 @@ def run_insight_engine(
         account_state.fires = account_fires
         all_fires.extend(account_fires)
 
+        # ---- Stage 3.5: aggregate this account's stale-skips --------------
+        by_gap: dict[tuple[str, str], set[str]] = {}
+        for pid, entity, sid in _patterns.drain_skip_collection():
+            by_gap.setdefault((pid, sid), set()).add(entity)
+        for (pid, sid), names in sorted(by_gap.items()):
+            noun = "name" if len(names) == 1 else "names"
+            skip_warnings.append(
+                f"[insight] {account_id}: {pid} not evaluated on "
+                f"{len(names)} {noun} — {sid} unavailable"
+            )
+
     # ---- Stage 4: stale-skip warnings ------------------------------------
-    if skip_warnings:
+    # Replace this engine's previous notes rather than stacking them: a
+    # threshold recompute re-runs the engine over the same loaded state.
+    if getattr(state, "all_warnings", None) is not None:
+        state.all_warnings = [w for w in state.all_warnings
+                              if not w.startswith("[insight]")]
         cap = skip_warnings[:_WARNING_CAP]
         state.all_warnings.extend(cap)
         rest = len(skip_warnings) - len(cap)
