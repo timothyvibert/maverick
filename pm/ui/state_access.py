@@ -797,8 +797,11 @@ def resolve_structure(
         target = next((s for s in acc.structures if s.structure_id == structure_id), None)
         if target is None:
             return False
-        if chosen_type is None and resolution == structure_store.CONFIRMED:
-            chosen_type = target.type  # the confirmed/chosen reading's type
+        if chosen_type is None:
+            # Record the reading the decision was made against — the apply pass
+            # demotes to a fresh proposal if the same legs later re-detect as a
+            # different type (a confirm of one reading never silently carries).
+            chosen_type = target.type
         leg_pids = structure_store.decision_leg_pids(acc.structures, target)
         structure_store.save_resolution(
             account, leg_pids, resolution, chosen_type=chosen_type, edited_legs=edited_legs)

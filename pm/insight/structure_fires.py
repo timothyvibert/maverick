@@ -43,11 +43,18 @@ _PIN_DTE = 1               # expiry-day (or last day)
 _PIN_DTE_MIN = 0           # never on an already-expired leg (a stale extract row)
 # Every structure type carrying a short leg that can pin: the original covered
 # call / collar / vertical plus the canonical pin cases the first cut omitted —
-# short straddles/strangles, covered / cash-secured short puts, and the naked
-# short call itself (the position P16 declares most dangerous).
+# short straddles/strangles, covered / cash-secured short puts, the naked
+# short call itself (the position P16 declares most dangerous) — and the
+# combination suite's short-legged types, so the T1 pin net does not narrow as
+# claims migrate from the residual sweeps into the new groupings.
 _PIN_TYPES = (S.COVERED_CALL, S.COLLAR, S.VERTICAL, S.STRADDLE, S.STRANGLE,
-              S.COVERED_PUT, S.CASH_SECURED_PUT, S.NAKED_EXCESS_SHORT_CALL)
-_PIN_SHORT_ROLES = ("short_call", "short_put", "naked_excess_short_call")
+              S.COVERED_PUT, S.CASH_SECURED_PUT, S.NAKED_EXCESS_SHORT_CALL,
+              S.BOX, S.IRON_BUTTERFLY, S.IRON_CONDOR, S.CONDOR, S.DOUBLE_DIAGONAL,
+              S.JELLY_ROLL, S.CONVERSION, S.REVERSAL, S.BUTTERFLY, S.JADE_LIZARD,
+              S.LADDER, S.RATIO_SPREAD, S.BACKSPREAD, S.SYNTHETIC_LONG,
+              S.SYNTHETIC_SHORT, S.RISK_REVERSAL, S.CALENDAR, S.DIAGONAL)
+_PIN_SHORT_ROLES = ("short_call", "short_put", "naked_excess_short_call",
+                    S.NAKED_EXCESS_SHORT_PUT)
 _MONETIZE_EXTRINSIC_FRAC = 0.05   # put extrinsic <= 5% of intrinsic (owner threshold)
 
 
@@ -107,7 +114,17 @@ def _struct_word(typ: str) -> str:
     return {S.COVERED_CALL: "covered call", S.COLLAR: "collar", S.VERTICAL: "vertical",
             S.COVERED_PUT: "covered put", S.CASH_SECURED_PUT: "cash-secured put",
             S.STRADDLE: "straddle", S.STRANGLE: "strangle",
-            S.NAKED_EXCESS_SHORT_CALL: "naked short call"}.get(typ, typ)
+            S.NAKED_EXCESS_SHORT_CALL: "naked short call",
+            S.BOX: "box", S.IRON_BUTTERFLY: "iron butterfly",
+            S.IRON_CONDOR: "iron condor", S.CONDOR: "condor",
+            S.DOUBLE_DIAGONAL: "double diagonal", S.JELLY_ROLL: "jelly roll",
+            S.CONVERSION: "conversion", S.REVERSAL: "reversal",
+            S.BUTTERFLY: "butterfly", S.JADE_LIZARD: "jade lizard",
+            S.LADDER: "ladder", S.MARRIED_PUT: "married put",
+            S.RATIO_SPREAD: "ratio spread", S.BACKSPREAD: "backspread",
+            S.SYNTHETIC_LONG: "synthetic long", S.SYNTHETIC_SHORT: "synthetic short",
+            S.RISK_REVERSAL: "risk reversal", S.CALENDAR: "calendar",
+            S.DIAGONAL: "diagonal"}.get(typ, typ)
 
 
 def _group_representative(account_state, st) -> bool:
@@ -145,18 +162,27 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
     out: list[Fire] = []
 
     # --- P16 coverage breach (T1, holdings-only) ---------------------------
-    # One fire per naked LEG position (blotter rows are per (account, position);
-    # a single fire on legs[0] would leave every other naked leg alert-less).
-    if st.type == S.NAKED_EXCESS_SHORT_CALL:
+    # ROLE-driven, not type-driven: any structure's uncovered short-call slices
+    # fire — the standalone naked / over-write structures (whose legs all carry
+    # the role) exactly as before, and the uncovered side of a combination type
+    # (ratio spread, ladder, synthetic short, reverse calendar, risk reversal)
+    # the moment the detector marks it, so grouping a loose short call never
+    # silences the breach. One fire per naked LEG position (blotter rows are
+    # per (account, position); a single fire on legs[0] would leave every other
+    # naked leg alert-less).
+    naked_legs = [l for l in st.legs
+                  if l.role == "naked_excess_short_call" and (l.allocated_qty or 0) < 0]
+    if naked_legs:
+        standalone = st.type == S.NAKED_EXCESS_SHORT_CALL
         outright_naked = st.source == "detector:naked_call"
-        for leg in st.legs:
+        for leg in naked_legs:
             pos = by_id.get(leg.position_id)
             if pos is None:
                 continue
             n = int(abs(leg.allocated_qty))
             if n <= 0:
                 continue
-            if outright_naked:
+            if standalone and outright_naked:
                 label = f"{u} naked short call — {n} uncovered contract(s)"
                 rationale = (
                     f"Short {u} call(s) with no cover on the name: {n} contract(s) are "
@@ -164,7 +190,8 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                     f"exposure the client likely did not intend. Cover with stock, pair "
                     f"with a longer-dated long call, or close.")
                 computation = "short call with no available cover on the name → naked"
-            else:
+                source = "structure:naked_excess_short_call"
+            elif standalone:
                 label = f"{u} over-write — {n} naked-excess short call(s)"
                 rationale = (
                     f"Your {u} over-write writes {n} more call(s) than the shares held cover. "
@@ -172,8 +199,20 @@ def _fires_for_structure(account_state, st, by_id, rate_curve, rate_fallback, as
                     f"stock, exposure the client likely did not intend. Bring coverage back to 1:1 "
                     f"or close the excess.")
                 computation = "short-call shares > shares held → the excess is uncovered"
+                source = "structure:naked_excess_short_call"
+            else:
+                word = _struct_word(st.type)
+                label = f"{u} {word} — {n} uncovered short call(s)"
+                rationale = (
+                    f"The short-call side of your {u} {word} runs {n} contract(s) beyond "
+                    f"its in-structure cover. The excess behaves like a naked short call — "
+                    f"assignment there delivers short stock, unbounded upside exposure the "
+                    f"client likely did not intend. Pair it with a longer-dated long call, "
+                    f"cover with stock, or close the excess.")
+                computation = "short calls beyond the structure's own cover → the excess is uncovered"
+                source = f"structure:{st.type}"
             out.append(_fire("P16", account, pos, u, label, rationale,
-                _trace({"naked_excess_contracts": {"value": n, "source": "structure:naked_excess_short_call"}},
+                _trace({"naked_excess_contracts": {"value": n, "source": source}},
                        computation,
                        "coverage breach (naked short call)"),
                 fired_at))

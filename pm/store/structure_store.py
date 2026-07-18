@@ -126,20 +126,40 @@ def apply_resolutions(account: str, structures, resolutions: Optional[dict] = No
     Legs unchanged → honour confirm / reject / choose / edit. Legs changed → no
     stored key matches → the structure stays ``proposed`` (a fresh proposal)."""
     data = resolutions if resolutions is not None else _load()
+    # Per contention group, the set of type readings currently on offer — a
+    # stored choice must name ONE of them to act on the group.
+    group_types: dict = {}
+    for s in structures:
+        if s.contention_group:
+            group_types.setdefault(s.contention_group, set()).add(s.type)
     for s in structures:
         r = data.get(_key(account, decision_leg_pids(structures, s)))
         if not r:
             s.status = "proposed"
             continue
         resolution = r.get("resolution")
+        chosen = r.get("chosen_type")
         if s.contention_group:
-            # One reading is chosen; the other alternatives are rejected.
+            # One reading is chosen; the other alternatives are rejected. A
+            # stored resolution with NO chosen type (or one naming a reading no
+            # longer offered — a renamed/regrouped detection) must not silently
+            # mass-reject the group: every alternative returns to proposed and
+            # the user decides again.
             if resolution == CONFIRMED:
-                s.status = CONFIRMED if r.get("chosen_type") == s.type else REJECTED
+                if chosen not in group_types.get(s.contention_group, set()):
+                    s.status = "proposed"
+                else:
+                    s.status = CONFIRMED if chosen == s.type else REJECTED
             else:
                 s.status = REJECTED if resolution == REJECTED else "proposed"
         else:
-            if resolution == EDITED:
+            # The stored resolution records the TYPE it was made against (rows
+            # written before that are applied as-is). Same legs re-detected as
+            # a DIFFERENT type demote to a fresh proposal — a confirm of one
+            # reading is never silently applied to another.
+            if chosen and chosen != s.type:
+                s.status = "proposed"
+            elif resolution == EDITED:
                 kept = set(r.get("edited_legs") or [])
                 s.legs = [leg for leg in s.legs if leg.position_id in kept] or s.legs
                 s.status = EDITED

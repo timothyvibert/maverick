@@ -33,7 +33,14 @@ from pm.ui.deepdive.structure_economics import (
 )
 
 _PRIMARY = {S.COVERED_CALL, S.COLLAR, S.VERTICAL, S.COVERED_PUT,
-            S.CASH_SECURED_PUT, S.STRADDLE, S.STRANGLE}
+            S.CASH_SECURED_PUT, S.STRADDLE, S.STRANGLE,
+            # the combination suite — every detected type must render here; a
+            # detected-but-invisible structure is a silent failure.
+            S.BOX, S.IRON_BUTTERFLY, S.IRON_CONDOR, S.CONDOR, S.DOUBLE_DIAGONAL,
+            S.JELLY_ROLL, S.CONVERSION, S.REVERSAL, S.BUTTERFLY, S.JADE_LIZARD,
+            S.LADDER, S.MARRIED_PUT, S.RATIO_SPREAD, S.BACKSPREAD,
+            S.SYNTHETIC_LONG, S.SYNTHETIC_SHORT, S.RISK_REVERSAL,
+            S.CALENDAR, S.DIAGONAL}
 _SUB = {S.RESIDUAL_LONG, S.NAKED_EXCESS_SHORT_CALL}
 _CONFIRMED = ("confirmed", "edited")
 _BAND_LABEL = {S.HIGH: "High", S.MEDIUM: "Medium", S.LOW_AMBIGUOUS: "Low-Ambiguous"}
@@ -43,7 +50,78 @@ _TYPE_LABEL = {
     S.STRADDLE: "Straddle", S.STRANGLE: "Strangle",
     S.RESIDUAL_LONG: "Uncovered long (residual)",
     S.NAKED_EXCESS_SHORT_CALL: "Naked-excess short call",
+    S.BOX: "Box", S.IRON_BUTTERFLY: "Iron butterfly", S.IRON_CONDOR: "Iron condor",
+    S.CONDOR: "Condor", S.DOUBLE_DIAGONAL: "Double diagonal",
+    S.JELLY_ROLL: "Jelly roll", S.CONVERSION: "Conversion", S.REVERSAL: "Reversal",
+    S.BUTTERFLY: "Butterfly", S.JADE_LIZARD: "Jade lizard", S.LADDER: "Ladder",
+    S.MARRIED_PUT: "Married put", S.RATIO_SPREAD: "Ratio spread",
+    S.BACKSPREAD: "Backspread", S.SYNTHETIC_LONG: "Synthetic long",
+    S.SYNTHETIC_SHORT: "Synthetic short", S.RISK_REVERSAL: "Risk reversal",
+    S.CALENDAR: "Calendar", S.DIAGONAL: "Diagonal",
 }
+
+# --- PMCC: a live display qualifier on the DIAGONAL type, never a type -------
+# The stored type stays "diagonal" (a market-price-dependent type would re-type
+# on a fixed leg set as spot moved, invalidating stored confirms). The qualifier
+# is a render-time read of the already-loaded snapshot greeks: the long call is
+# trading like stock.
+_PMCC_DELTA = 0.80        # long-leg delta at/above this = trading like stock
+_PMCC_MONEYNESS = 1.15    # fallback when delta is missing: spot ≥ 1.15× strike
+_PMCC_TIP = ("PMCC — the diagonal's long call is trading like stock (Δ ≥ 0.80; "
+             "deep-ITM moneyness when delta is unavailable). The qualifier drops "
+             "off when the long leg loses that delta: the signal a PMCC has "
+             "stopped working as one, not a re-typing — the type stays Diagonal.")
+
+
+def _long_call_delta(account_state, pid):
+    g = getattr(account_state, "greeks", None)
+    df = getattr(g, "by_position", None)
+    if df is None or getattr(df, "empty", True) or "position_id" not in df.columns:
+        return None
+    rows = df[df["position_id"] == pid]
+    if not len(rows):
+        return None
+    try:
+        v = float(rows.iloc[0]["delta"])
+        return v if v == v else None            # NaN guard
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _pmcc_qualifies(s, account_state) -> bool:
+    """Delta first; strike-vs-spot moneyness only where delta is missing; when
+    neither is available the qualifier simply doesn't render (dash, not guess)."""
+    if account_state is None or getattr(s, "type", None) != S.DIAGONAL:
+        return False
+    longs = [l for l in s.legs if l.role == "long_call"]
+    if len(longs) != 1:
+        return False
+    pid = longs[0].position_id
+    delta = _long_call_delta(account_state, pid)
+    if delta is not None:
+        return abs(delta) >= _PMCC_DELTA
+    pos = next((p for p in getattr(account_state, "positions", []) if p.position_id == pid), None)
+    if pos is None or pos.strike is None:
+        return False
+    snap = getattr(account_state, "snapshot", None)
+    df = getattr(snap, "underlyings", None)
+    bbg = getattr(pos, "underlying_bbg_ticker", None)
+    if df is None or getattr(df, "empty", True) or not bbg or bbg not in getattr(df, "index", []):
+        return False
+    try:
+        spot = float(df.loc[bbg, "PX_LAST"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    return spot == spot and spot >= float(pos.strike) * _PMCC_MONEYNESS
+
+
+def _type_label_live(s, account_state):
+    """(label, tooltip) — the static type label, with the PMCC qualifier
+    appended live when the diagonal's long leg qualifies."""
+    label = _TYPE_LABEL.get(s.type, s.type)
+    if _pmcc_qualifies(s, account_state):
+        return label + " — PMCC", _PMCC_TIP
+    return label, ""
 _STATUS_LABEL = {"proposed": "Proposed", "confirmed": "Confirmed",
                  "edited": "Confirmed (edited)", "rejected": "Rejected"}
 
@@ -105,7 +183,7 @@ def build_structure_columns() -> list[dict]:
         {"field": "caret", "headerName": "", "width": 40, "sortable": False,
          "filter": False, "cellClass": "struct-caret-cell"},
         {"field": "label", "headerName": "Structure", "flex": 2, "minWidth": 240,
-         "filter": "agTextColumnFilter", "tooltipField": "label", "cellClass": "dd-cell-ellipsis"},
+         "filter": "agTextColumnFilter", "tooltipField": "label_tip", "cellClass": "dd-cell-ellipsis"},
         {"field": "net_qty", "headerName": "Net Qty", "width": 92,
          "type": "rightAligned", "valueFormatter": QTY_FMT, "filter": "agNumberColumnFilter"},
         {"field": "strikes", "headerName": "Strikes", "width": 110,
@@ -162,15 +240,19 @@ def _breakeven_tooltip(t2_entry) -> str:
     return ""
 
 
-def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None) -> dict:
+def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None,
+                   account_state=None) -> dict:
     e = structure_economics(s, by_id)
+    type_label, tip = _type_label_live(s, account_state)
+    label = f"{type_label} · {s.underlying}"
     return {
         "_row_id": f"structure::{s.structure_id}",
         "_kind": "structure",
         "_structure_id": s.structure_id,
         "_expandable": expandable,
         "caret": ("▾" if s.structure_id in expanded else "▸") if expandable else "",
-        "label": f"{_TYPE_LABEL.get(s.type, s.type)} · {s.underlying}",
+        "label": label,
+        "label_tip": tip or label,
         "band": _BAND_LABEL.get(s.confidence_band, s.confidence_band),
         "status": _STATUS_LABEL.get(s.status, s.status),
         "strikes": _strikes_str(e["strikes"]),
@@ -195,6 +277,7 @@ def _leg_row(s, leg, by_id, idx: int) -> dict:
         "_structure_id": s.structure_id,
         "caret": "",
         "label": f" ↳ {leg.role.replace('_', ' ')}: {desc}",
+        "label_tip": f" ↳ {leg.role.replace('_', ' ')}: {desc}",
         "band": "", "status": "",
         "strikes": "", "expiry": "", "dte": None,
         "net_qty": leg.allocated_qty,
@@ -213,6 +296,7 @@ def _substructure_row(sub, by_id, t2_map=None) -> dict:
         "_structure_id": sub.structure_id,
         "caret": "",
         "label": f" ↳ {_TYPE_LABEL.get(sub.type, sub.type)}",
+        "label_tip": f" ↳ {_TYPE_LABEL.get(sub.type, sub.type)}",
         "band": _BAND_LABEL.get(sub.confidence_band, sub.confidence_band),
         "status": _STATUS_LABEL.get(sub.status, sub.status),
         "strikes": _strikes_str(e["strikes"]),
@@ -264,7 +348,8 @@ def build_structure_rows(account_state, state, expanded_sids=None) -> list[dict]
     for group, alts in sorted(groups.items()):
         chosen = next((a for a in alts if a.status in _CONFIRMED), None)
         if chosen is not None:
-            rows.append(_structure_row(chosen, by_id, expanded, t2_map=t2_map))
+            rows.append(_structure_row(chosen, by_id, expanded, t2_map=t2_map,
+                                       account_state=account_state))
             if chosen.structure_id in expanded:
                 rows.extend(_leg_row(chosen, leg, by_id, i) for i, leg in enumerate(chosen.legs))
         else:
@@ -277,6 +362,7 @@ def build_structure_rows(account_state, state, expanded_sids=None) -> list[dict]
                 "_group": group,
                 "caret": "",
                 "label": f"Contention · {alts[0].underlying}",
+                "label_tip": f"Contention · {alts[0].underlying}",
                 "band": _BAND_LABEL.get(S.LOW_AMBIGUOUS),
                 "status": "Needs your choice",
                 "strikes": "", "expiry": "", "dte": None, "net_qty": None,
@@ -296,7 +382,8 @@ def build_structure_rows(account_state, state, expanded_sids=None) -> list[dict]
                 -abs(npnl) if npnl is not None else 0.0)
 
     for s in sorted(primaries, key=_attention_key):
-        rows.append(_structure_row(s, by_id, expanded, t2_map=t2_map))
+        rows.append(_structure_row(s, by_id, expanded, t2_map=t2_map,
+                                   account_state=account_state))
         if s.structure_id in expanded:
             rows.extend(_leg_row(s, leg, by_id, i) for i, leg in enumerate(s.legs))
             for sub in structures:
@@ -415,12 +502,13 @@ def _sub_block(account, structures, underlying, by_id) -> list:
     return out
 
 
-def _single_detail(account, s, structures, by_id, t2=None) -> html.Div:
+def _single_detail(account, s, structures, by_id, t2=None, account_state=None) -> html.Div:
     confirmed = s.status in _CONFIRMED
     e = structure_economics(s, by_id)
+    type_label, tip = _type_label_live(s, account_state)
     head = [
-        html.Span(f"{_TYPE_LABEL.get(s.type, s.type)} · {s.underlying}",
-                  className="struct-card-title"),
+        html.Span(f"{type_label} · {s.underlying}",
+                  className="struct-card-title", title=tip or None),
         _chip(s.confidence_band),
         html.Span(_STATUS_LABEL.get(s.status, s.status),
                   className="struct-confirmed-by" if confirmed else "struct-status-proposed"),
@@ -501,4 +589,4 @@ def render_structure_detail(account, structure_id, state) -> html.Div:
         return _contention_detail(account, target, structures, by_id)
     t2_map = getattr(acc, "structure_tier2", None) or {}
     return _single_detail(account, target, structures, by_id,
-                          t2=t2_map.get(target.structure_id))
+                          t2=t2_map.get(target.structure_id), account_state=acc)
