@@ -14,7 +14,11 @@ Calibrated convention map (measured against the live Terminal):
   * rate   r     -- ``risk_free_curve`` via ``pick_rate_for_dte`` (decimal),
                     else the ``risk_free_rate`` scalar fallback
   * vol    sigma -- ``iv_mid`` / 100 (percent->decimal); brentq IV-solve on the
-                    option ``PX_MID`` as the fallback (returns ``None``, never NaN)
+                    option ``PX_MID`` as the fallback (returns ``None``, never
+                    NaN). The fallback solve runs under BS2002 continuous-q on
+                    the full spot while the truth path prices CRR strip-spot -
+                    a deliberate convention mismatch, rare-path and bounded
+                    well inside the fast model's own approximation envelope
   * style        -- ``OPTION_EXERCISE_TYPE_REALTIME`` -> 'American'/'European'
                     (read per leg; default 'American' + warn only if absent)
   * dividends    -- discrete schedule (``projected_dividends_by_ticker``), ex-date

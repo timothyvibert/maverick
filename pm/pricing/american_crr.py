@@ -38,8 +38,11 @@ def crr_price(S_full, K, T, r, sigma, divs_df, opt_type,
               n_steps=DEFAULT_CRR_STEPS, today=None, return_gamma_nodes=False):
     """CRR American option on a strip-spot tree with discrete cash dividends.
 
-    ``S_full``: the un-stripped market spot. ``sigma``: vol of S_risky (the IV
-    solver back-solves under this same convention). ``divs_df``: canonical
+    ``S_full``: the un-stripped market spot. ``sigma``: vol of S_risky. Note
+    the shipped IV solver does NOT back-solve under this convention: its
+    American mode solves under BS2002 continuous-q on the full spot - a
+    deliberate, bounded mismatch used only on the iv_mid-missing fallback
+    (see pm.risk.pricing_adapter). ``divs_df``: canonical
     [EX_DATE, DIVIDENDS] DataFrame, or None / empty for no-div names.
     """
     if today is None:
