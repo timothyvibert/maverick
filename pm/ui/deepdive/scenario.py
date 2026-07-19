@@ -193,7 +193,7 @@ def _impact_table(rows, target, shocked: bool = True):
         body.append(html.Tr(
             id={"type": "scn-drill", "id": r["id"]}, n_clicks=0,
             className="scn-impact-row" + active, children=[
-                html.Td(r["label"], className="scn-impact-name", title="click to drill the surface"),
+                html.Td(r["label"], className="scn-impact-name", title="click to drill the surface and open this leg's payoff view"),
                 _pnl_cell(r["pnl"]),
                 html.Td(_fmt_money(r["dd"]), className="scn-impact-num"),
                 html.Td(_fmt_money(r["dg"]), className="scn-impact-num"),

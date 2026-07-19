@@ -25,20 +25,20 @@ from pm.ui.deepdive.layout import render_deepdive_tab
 def _drawer_root() -> html.Div:
     """The shared fixed-size centered modal.
 
-    Header bar (pinned): Alert|Tearsheet view toggle + prev/next position nav
-    (both visible in both modes) + close. The body scrolls inside the fixed
-    box. Backdrop click / X / Escape all dismiss it.
+    Header bar (pinned): the four-tab view toggle (Alert | Tearsheet | Payoff |
+    Scanner — all four present whichever view opened the popup), prev/next
+    position nav (Alert/Tearsheet only), and close. The structure-detail view
+    hides the tab strip. The body scrolls inside the fixed box. Backdrop click
+    / X / Escape all dismiss it.
     """
     return html.Div(id="drawer-root", className="drawer-root", children=[
         html.Div(id="drawer-overlay", className="drawer-overlay", n_clicks=0),
         html.Div(className="drawer-panel", children=[
             html.Div(className="drawer-headerbar", children=[
                 html.Div(className="drawer-headerbar-left", children=[
-                    # Segmented view toggle. The visible buttons depend on which popup
-                    # family is open (set by _nav_and_toggle): a position popup shows
-                    # Alert | Tearsheet | Scanner; a payoff popup shows Payoff | Scanner.
-                    # DOM order keeps each family's visible set contiguous and correctly
-                    # ordered once the others are hidden.
+                    # Segmented view toggle: all four tabs stay visible for every
+                    # popup view (_nav_and_toggle hides the strip only for the
+                    # structure-detail view); prev/next render on Alert/Tearsheet.
                     html.Div(className="view-toggle", children=[
                         html.Button("Alert", id="view-alert", n_clicks=0,
                                     className="view-toggle-btn"),

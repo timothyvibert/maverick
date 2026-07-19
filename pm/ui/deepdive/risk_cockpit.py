@@ -109,6 +109,15 @@ def _cols(left: list, right: list) -> html.Div:
     ])
 
 
+def _quiet(build):
+    """A pre-compute that degrades to None on failure; the consuming _safe
+    blocks then say so per block."""
+    try:
+        return build()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _safe(build, label: str):
     """Per-block isolation: a failed block renders an honest error line instead
     of freezing the whole populate callback (Tab 2 is one all-or-nothing repaint)."""
@@ -754,9 +763,12 @@ def render_risk_section(account_state, state) -> html.Div:
     except Exception:  # noqa: BLE001
         impact, grid = None, None
 
-    ob = assignment_obligations(account_state)
-    lenses = concentration_lenses(account_state, obligations=ob)
-    cal = upcoming_events(state, account_state, ob, lenses)
+    # Each pre-compute degrades alone: a calendar or obligations failure must
+    # cost its own block, not the section (the blocks below are _safe-wrapped
+    # and render an honest error line on a None/raise).
+    ob = _quiet(lambda: assignment_obligations(account_state))
+    lenses = _quiet(lambda: concentration_lenses(account_state, obligations=ob))
+    cal = _quiet(lambda: upcoming_events(state, account_state, ob, lenses))
 
     # 1 — posture
     if e is not None:
@@ -798,9 +810,9 @@ def render_risk_section(account_state, state) -> html.Div:
                      "priceable options).", className="dd-empty")]
 
     # 6 — what's coming: chart | event grid
-    cal_rows = build_calendar_rows(cal, nav)
+    cal_rows = _quiet(lambda: build_calendar_rows(cal, nav)) or []
     left6 = [_band("What's coming — next 60 days", tip=_CAL_TIP,
-                   badges=_events_badges(cal))]
+                   badges=_safe(lambda: _events_badges(cal), "Event badges"))]
     right6 = [_band("Event detail")]
     if cal_rows:
         left6.append(_safe(lambda: _event_chart(cal, nav), "Event timeline"))
@@ -815,7 +827,7 @@ def render_risk_section(account_state, state) -> html.Div:
                    badges=_safe(lambda: _conc_badges(lenses), "Concentration badges")),
              _safe(lambda: _concentration_grid(lenses), "Concentration")]
     right7 = [_band("Standing obligations", tip=_OBLIG_TIP,
-                    badges=_oblig_badges(ob)),
+                    badges=_safe(lambda: _oblig_badges(ob), "Obligation badges")),
               _safe(lambda: _oblig_block(ob, nav), "Standing obligations")]
 
     children = [head, *posture, *scenario_blocks,

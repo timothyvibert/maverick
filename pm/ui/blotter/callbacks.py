@@ -251,9 +251,13 @@ def register_callbacks(app: dash.Dash) -> None:
             return no_update, no_update
         # All four tabs are always present on the unified popup, so any button is a valid
         # target; each tab renders from the shared anchor (position_id + optional structure).
+        # Open sites that never needed the underlying (structure row, scenario impact row)
+        # omit it — resolve it here so the Tearsheet tab is never an empty sheet.
+        underlying = ds.get("underlying") or _underlying_for(
+            state, ds.get("account"), ds.get("position_id"))
         body = _render_body(state, ds.get("account"), ds.get("position_id"),
-                            ds.get("underlying", ""), target, structure_id=ds.get("structure_id"))
-        return body, {**ds, "view": target}
+                            underlying, target, structure_id=ds.get("structure_id"))
+        return body, {**ds, "underlying": underlying, "view": target}
 
     # 3) Prev/Next: step POSITION-to-position in the visible (filter+sort)
     #    order (virtualRowData = consolidated rows). View mode persists.

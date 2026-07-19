@@ -7,9 +7,12 @@ inline children; the callback then drives picker changes / refresh / tab switch.
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from dash import html
+
+logger = logging.getLogger(__name__)
 
 from pm.store.portfolio_state import PortfolioState
 from pm.ui.deepdive.header import (
@@ -41,12 +44,28 @@ def render_deepdive_sections(state: Optional[PortfolioState], account: Optional[
             "deepdive-trades": empty,
         }
     return {
-        "deepdive-kpi": render_kpis(acc_state),
-        "deepdive-positions": render_positions_section(acc_state, state, pos_view, expanded_sids),
-        "deepdive-risk": render_risk_section(acc_state, state),
-        "deepdive-trade-insights": render_trade_insights_section(acc_state),
-        "deepdive-trades": render_trades_section(acc_state),
+        "deepdive-kpi": _guarded(lambda: render_kpis(acc_state), "Account KPIs"),
+        "deepdive-positions": _guarded(
+            lambda: render_positions_section(acc_state, state, pos_view, expanded_sids),
+            "Holdings"),
+        "deepdive-risk": _guarded(lambda: render_risk_section(acc_state, state), "Risk"),
+        "deepdive-trade-insights": _guarded(
+            lambda: render_trade_insights_section(acc_state), "Trade-history insights"),
+        "deepdive-trades": _guarded(lambda: render_trades_section(acc_state), "Recent trades"),
     }
+
+
+def _guarded(builder, label: str):
+    """Per-section isolation: the populate callback repaints all five hosts in
+    one shot, so one section's raise would otherwise freeze the whole tab
+    behind a silent error (debug is off). A failed section renders an honest
+    error line; the other four render normally."""
+    try:
+        return builder()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("%s section failed to render", label)
+        return html.Div(f"{label} failed to render ({type(exc).__name__}).",
+                        className="dd-empty risk-block-error")
 
 
 def render_deepdive_tab(state: Optional[PortfolioState]) -> html.Div:
