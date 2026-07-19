@@ -69,10 +69,13 @@ def _alert_controls(fire: Fire) -> html.Div:
             placeholder="Snooze ▾", clearable=False, searchable=False,
             className="alert-snooze-dd",
         ),
-        dcc.DatePickerSingle(
-            id=_ctl_id("sup-date", fire), placeholder="date",
-            display_format="YYYY-MM-DD", className="alert-snooze-date",
-            style={"display": "none"},
+        # Native date input, deliberately not a component calendar: the drawer
+        # panel clips overflow, so a DOM-rendered calendar loses most of its
+        # columns at the panel edge — the browser's own picker overlays outside
+        # the DOM and cannot clip. Emits ISO YYYY-MM-DD directly.
+        dcc.Input(
+            id=_ctl_id("sup-date", fire), type="date",
+            className="alert-snooze-date", style={"display": "none"},
         ),
     ])
 
@@ -92,6 +95,8 @@ def _alert_section(fire: Fire, state: PortfolioState) -> html.Div:
             # Markdown render so the templates' **bold** emphasis shows as bold
             # rather than literal asterisks. The .drawer-rationale CSS (incl. its
             # strong/b rule) styles the rendered output.
+            # dangerously_allow_html stays UNSET: rationale text carries
+            # extract/Bloomberg-derived strings, and raw HTML must never render.
             dcc.Markdown(fire.rationale, className="drawer-rationale"),
         ]),
         html.Div(className="drawer-section", children=[

@@ -42,7 +42,38 @@ def build_app() -> dash.Dash:
     register_payoff_callbacks(app)
     register_scanner_callbacks(app)
     register_comparison_callbacks(app)
+    _harden(app.server)
     return app
+
+
+# Host values a browser may legitimately present for the loopback bind.
+_TRUSTED_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _harden(server) -> None:
+    """Loopback hardening. The app binds 127.0.0.1 only, but the state-mutating
+    callbacks (mute/restore, structure resolve, threshold apply, scanner pulls)
+    are plain POSTs — a DNS-rebinding page could reach them through the
+    victim's own browser. Rejecting foreign Host headers closes that route;
+    the response headers stop framing and MIME sniffing.
+
+    No Content-Security-Policy header here: Dash's renderer boots from inline
+    scripts, so a useful CSP needs 'unsafe-inline' script-src — near-zero value
+    against the rebinding threat the Host check already closes, at real risk of
+    breaking the grid/plotly renderers. Deliberate omission, not an oversight."""
+    from flask import abort, request
+
+    @server.before_request
+    def _reject_foreign_hosts():
+        host = (request.host or "").rsplit(":", 1)[0]
+        if host not in _TRUSTED_HOSTS:
+            abort(403)
+
+    @server.after_request
+    def _static_headers(resp):
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
 
 
 if __name__ == "__main__":

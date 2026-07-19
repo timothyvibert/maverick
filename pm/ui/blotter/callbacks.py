@@ -389,7 +389,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Input({"type": "sup-restore", "account": ALL, "pid": ALL, "pat": ALL}, "n_clicks"),
         Input({"type": "sup-ack", "account": ALL, "pid": ALL, "pat": ALL}, "n_clicks"),
         Input({"type": "sup-snooze", "account": ALL, "pid": ALL, "pat": ALL}, "value"),
-        Input({"type": "sup-date", "account": ALL, "pid": ALL, "pat": ALL}, "date"),
+        Input({"type": "sup-date", "account": ALL, "pid": ALL, "pat": ALL}, "value"),
         State("drawer-state", "data"),
         State("deepdive-account-picker", "value"),
         State("pos-view-mode", "data"),
