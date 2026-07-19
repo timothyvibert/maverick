@@ -236,7 +236,10 @@ def price_payoff(
 def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
                       *, n_expiries: int = 3):
     """The cached ranked scanner candidate at ``(objective, rank)`` for a held position,
-    or None. A pure read of the slice the scanner already pulled + ranked.
+    or None. Reads the slice the scanner already pulled + ranked — but a COLD
+    cache (fresh reload, first touch) resolves through ``pull_slice``, which
+    performs the sanctioned on-demand Bloomberg pull; only the warm path is a
+    pure read.
 
     ``n_expiries`` must be the scanner's ACTIVE window (the drawer threads its
     window store through): the slice cache is keyed by window, so reading the
@@ -579,11 +582,12 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
 def rank_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
                           n_expiries: int = 3):
     """Generate + price + rank the adjustment candidates for a held position, grouped
-    by objective. A pure, read-only derivation over already-loaded state: it reads the
-    account's client profile and the slice's IV+pp rows, ranks each objective's
-    candidates through ``pm.candidates.ranking`` (no Bloomberg, no state write beyond
-    caching the result on the option slice for reuse), and returns
-    ``{objective: [RankedCandidate, ...]}`` (or None). Render is M5's job."""
+    by objective. Reads the account's client profile and the slice's IV+pp rows and
+    ranks each objective's candidates through ``pm.candidates.ranking``; the only
+    state write is caching the result on the option slice for reuse. On a cache
+    MISS it delegates to ``generate_slice_candidates``, which resolves the slice
+    via the sanctioned on-demand Bloomberg pull — only the warm path runs
+    Bloomberg-free. Returns ``{objective: [RankedCandidate, ...]}`` (or None)."""
     from datetime import date
 
     state = _RUNTIME.get("state")

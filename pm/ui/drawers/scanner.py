@@ -237,7 +237,9 @@ def _exp_ord(d) -> int:
 
 def _fit_indicator(rc):
     """A compact strength mark for a ranked candidate — the rank (★ on rank 1) beside a
-    small fit bar from the combined score. The full reasons live on the comparison detail."""
+    small fit bar from the combined score. The ranking's per-candidate reasons and
+    flags are computed but not yet rendered anywhere — this mark is the whole
+    visible story for now."""
     score = rc.score if rc.score is not None else 0.0
     pct = max(0, min(100, round(score * 100)))
     label = "★" if rc.rank == 1 else str(rc.rank)
