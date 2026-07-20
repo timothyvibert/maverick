@@ -109,6 +109,9 @@ class Position:
     last_trade_date: Optional[date] = None
     last_trade_action: Optional[str] = None
     n_trades: int = 0
+    transfer_inferred: bool = False  # True when any trade-history field above was
+                                     # derived from another account's trades (the
+                                     # book-transfer fallback join, options only).
 
     # Forward-compat
     style: Optional[str] = None   # The extract has no Style column; always None in V1.
@@ -478,13 +481,26 @@ def _attach_trade_history(position: Position, trades: pd.DataFrame) -> None:
     if trades is None or trades.empty:
         return
 
-    # Options join on option_contract_key alone (NO
-    # account filter — cross-account journal entries / book transfers
-    # are valid). Equities/funds join on (account, ticker_final).
+    # Options join account-scoped FIRST on (account, option_contract_key); the
+    # join widens to the contract key alone only when the holding account's own
+    # rows cannot supply a derivation (cross-account journal entries / book
+    # transfers), and anything derived that way marks the position
+    # transfer_inferred. Equities/funds join on (account, ticker_final).
+    book_wide = None
     if position.asset_class == "option" and position.option_contract_key:
         if "option_contract_key" not in trades.columns:
             return
-        matches = trades[trades["option_contract_key"] == position.option_contract_key]
+        book_wide = trades[trades["option_contract_key"] == position.option_contract_key]
+        if "account" in book_wide.columns:
+            matches = book_wide[book_wide["account"] == position.account]
+        else:
+            # No account column at all: unscoped is the only join available (the
+            # loader already flags the dropped column urgently).
+            matches = book_wide
+        if matches.empty and not book_wide.empty:
+            # The holding account never traded this contract: transfer fallback.
+            matches = book_wide
+            position.transfer_inferred = True
     elif position.asset_class in ("equity", "fund_etf"):
         if "ticker_final" not in trades.columns or "account" not in trades.columns:
             return
@@ -514,6 +530,26 @@ def _attach_trade_history(position: Position, trades: pd.DataFrame) -> None:
             open_rows = sorted_matches[sorted_matches["buy_sell"] == "Buy"]
         else:
             open_rows = sorted_matches[sorted_matches["buy_sell"] == "Sell"]
+
+    if (
+        open_rows.empty
+        and not position.transfer_inferred
+        and book_wide is not None
+        and len(book_wide) > len(matches)
+        and "option_lifecycle_action" in book_wide.columns
+    ):
+        # The account traded the contract but holds no opening trade of its own
+        # (transferred in, then adjusted): widen the OPEN derivation — and only
+        # that — to the whole book, marked.
+        wide_sorted = (
+            book_wide.sort_values("trade_date") if "trade_date" in book_wide.columns else book_wide
+        )
+        wide_open = wide_sorted[
+            wide_sorted["option_lifecycle_action"].isin(["Buy to Open", "Sell to Open"])
+        ]
+        if not wide_open.empty:
+            open_rows = wide_open
+            position.transfer_inferred = True
 
     if not open_rows.empty:
         first_open = open_rows.iloc[0]

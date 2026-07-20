@@ -227,12 +227,14 @@ class HoldingPeriod:
     option positions that have a derivable opening trade. DOUBLY LIMITED — it is
     current-book only (survivorship-biased toward longer holds: positions that were
     short-held and already closed are absent) AND counts only positions whose
-    contract has an opening trade in the book (``Position.days_held`` matches opens
-    cross-account by contract key — a deliberate ingest behaviour for book
-    transfers). Not a realised holding period; None below the sample floor."""
+    contract has a derivable open (``Position.days_held`` joins the account's own
+    trades first; an open found only in another account's history is used as a
+    marked book-transfer fallback and counted here in ``n_transfer_inferred``).
+    Not a realised holding period; None below the sample floor."""
     median_days_held: Optional[float] = None
     n_positions: int = 0
     confidence: str = "low"
+    n_transfer_inferred: int = 0
 
 
 @dataclass
@@ -676,10 +678,11 @@ def _positions_with_derivable_open(df: pd.DataFrame, positions) -> Optional[floa
 
 def _build_holding_period(positions) -> Optional[HoldingPeriod]:
     """Median days-held-so-far across currently-held option positions that carry a
-    derivable open (``Position.days_held`` = today − the contract's first opening
-    trade in the book, matched cross-account by contract key). None below the
-    sample floor. Doubly limited — see HoldingPeriod."""
+    derivable open (``Position.days_held`` = today − the first opening trade found
+    by the account-scoped-first join; transfer-inferred opens are counted and
+    disclosed). None below the sample floor. Doubly limited — see HoldingPeriod."""
     held: list[int] = []
+    n_transfer = 0
     for p in positions or []:
         if str(getattr(p, "asset_class", "") or "").strip().lower() != _OPTION_CLASS:
             continue
@@ -690,10 +693,13 @@ def _build_holding_period(positions) -> Optional[HoldingPeriod]:
             held.append(int(dh))
         except (TypeError, ValueError):
             continue
+        if getattr(p, "transfer_inferred", False):
+            n_transfer += 1
     if len(held) < _HOLDS_MIN_POSITIONS:
         return None
     return HoldingPeriod(median_days_held=float(median(held)), n_positions=len(held),
-                         confidence=_confidence(len(held)))
+                         confidence=_confidence(len(held)),
+                         n_transfer_inferred=n_transfer)
 
 
 def _build_roll_behavior(df: pd.DataFrame) -> Optional[RollBehavior]:
@@ -813,8 +819,9 @@ def compute_account_profile(account_state) -> ClientProfile:
             strategy_bias=StrategyBias(), direction_bias=DirectionBias(),
             tenor_pref=TenorPref(), sector_lean=SectorLean(), sizing=Sizing(),
             cadence=Cadence(),
-            # Holds is positions-derived (Position.days_held, cross-account by
-            # contract), so it can still read for a positions-only / transferred-in
+            # Holds is positions-derived (Position.days_held; the join is
+            # account-scoped first, cross-account only as the marked transfer
+            # fallback), so it can still read for a positions-only / transferred-in
             # account with an empty trade blotter; rolls needs trades, so stays None.
             holding_period=_build_holding_period(positions),
             headline="No trade history.",

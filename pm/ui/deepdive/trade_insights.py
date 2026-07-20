@@ -250,20 +250,22 @@ def _fragile_holds(hp) -> html.Div:
     if hp is None or hp.median_days_held is None:
         value = html.Div("Insufficient history.", className="dd-empty")
     else:
+        sub = f"median held · {hp.n_positions} positions" + _conf_suffix(hp.confidence)
+        if getattr(hp, "n_transfer_inferred", 0):
+            sub += f" · {hp.n_transfer_inferred} transfer-inferred"
         value = html.Div(children=[
             html.Div(f"{hp.median_days_held:.0f}d", className="dd-stat-value"),
-            html.Div(f"median held · {hp.n_positions} positions" + _conf_suffix(hp.confidence),
-                     className="dd-stat-sub"),
+            html.Div(sub, className="dd-stat-sub"),
         ])
     return html.Div(children=[
         html.Div("Holding period", className="dd-stat-label"),
         value,
         # The load-bearing caveat — both limitations, stated plainly, not a footnote.
-        html.Div("Current-book proxy: days since each held position's contract was first opened in "
-                 "the book (matched by contract across accounts — a deliberate ingest behaviour for "
-                 "book transfers; only positions with such an open are counted). Survivorship-biased "
-                 "toward longer holds — short positions already closed are absent. Not a realised "
-                 "holding period.", className="dd-panel-note"),
+        html.Div("Current-book proxy: days since each held position's contract was first opened "
+                 "(this account's own trades first; an open found only in another account's history "
+                 "is a marked transfer-inferred fallback; only positions with a derivable open are "
+                 "counted). Survivorship-biased toward longer holds — short positions already closed "
+                 "are absent. Not a realised holding period.", className="dd-panel-note"),
     ])
 
 
