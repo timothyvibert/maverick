@@ -593,9 +593,10 @@ def get_next_dividend_date(
 #    "schedule": [{"ex_date": date, "dps": float}, ...]}   # forward-ordered
 # The bulk-field parse fills next + the full forward schedule; the single-value
 # BDP estimate fills next only (schedule stays []). The ex-div fire (P7) reads
-# next.dps; when it is absent the fire falls back to the DVD_YLD yield heuristic,
-# so a missing forecast degrades gracefully. Layer-2 pricing will consume the
-# full schedule.
+# next.dps; when it is absent the fire falls back to the yield heuristic on the
+# first populated of DVD_YLD / EQY_DVD_YLD_IND (DVD_YLD is None on this
+# Terminal), so a missing forecast degrades gracefully. Layer-2 pricing will
+# consume the full schedule.
 
 def _empty_projection() -> Dict[str, object]:
     return {"next": None, "schedule": []}

@@ -708,7 +708,8 @@ def detect_p7(
         return None
 
     # Dividend amount: prefer a real Bloomberg forward projection; else estimate
-    # from DVD_YLD (annual yield × spot / 4, quarterly). Both ride in the
+    # from the dividend yield (annual yield × spot / 4, quarterly), reading the
+    # first populated of DVD_YLD / EQY_DVD_YLD_IND. All ride in the
     # days_to_ex_div / spot_vs_50d_ma traces, recorded upstream in the library.
     def _from_trace(input_name: str) -> Any:
         for sid in ("days_to_ex_div", "spot_vs_50d_ma"):
@@ -720,6 +721,7 @@ def detect_p7(
         return None
 
     projected_dps = _from_trace("projected_dividend")
+    yield_field = None
     if projected_dps is not None:
         try:
             dividend_amount = float(projected_dps)
@@ -727,7 +729,13 @@ def detect_p7(
             return None
         dividend_source = "projected"
     else:
-        dvd_yld = _from_trace("DVD_YLD")
+        # First populated of the two yield fields, in percent either way.
+        # DVD_YLD returns None on this Terminal, so the indicated forward
+        # yield (EQY_DVD_YLD_IND — the field the pricing adapter and scanner
+        # already trust) is the fallback that actually works.
+        dvd_yld, yield_field = _from_trace("DVD_YLD"), "DVD_YLD"
+        if dvd_yld is None:
+            dvd_yld, yield_field = _from_trace("EQY_DVD_YLD_IND"), "EQY_DVD_YLD_IND"
         if dvd_yld is None:
             # An imminent ex-div with no way to size the dividend: the trap
             # check cannot run at all, which the load notes must say.
@@ -773,10 +781,12 @@ def detect_p7(
         thresholds_used={"exdiv_window_days": config.p7_exdiv_window_days},
         computation=("ITM short call AND ex-div ≤7 BD AND extrinsic estimate "
                       "(max(0, |MV|/(qty×100) − max(0, spot−strike))) < dividend "
-                      "(Bloomberg projection when available, else spot × DVD_YLD/100 / 4)"),
+                      "(Bloomberg projection when available, else spot × yield/100 / 4 "
+                      "on the first populated of DVD_YLD, EQY_DVD_YLD_IND)"),
         fire_result={
             "extrinsic_estimate": extrinsic, "dividend": dividend_amount,
             "dividend_source": dividend_source, "fired": True,
+            **({"dividend_yield_field": yield_field} if yield_field else {}),
         },
         template_variables={**lv, **rv},
         extras=extras,

@@ -752,9 +752,13 @@ def _compute_days_to_ex_div(snap: dict, projected_dividend: Optional[dict] = Non
             chosen_date = parsed
             chosen_field = field_name
 
-    # DVD_YLD rides along in the trace so the ex-div fire can fall back to the
-    # yield heuristic (annual yield × spot / 4) when no forward forecast exists.
+    # The dividend yield rides along in the trace so the ex-div fire can fall
+    # back to the yield heuristic (annual yield × spot / 4) when no forward
+    # forecast exists. Both yield fields are planted (mirroring the ex-date
+    # field family): DVD_YLD returns None on this Terminal, so the indicated
+    # forward yield is the fallback that actually populates.
     inputs["DVD_YLD"] = _bbg_input(snap.get("DVD_YLD"), "DVD_YLD")
+    inputs["EQY_DVD_YLD_IND"] = _bbg_input(snap.get("EQY_DVD_YLD_IND"), "EQY_DVD_YLD_IND")
 
     # Forward dividend forecast: the precise per-share amount + ex-date the
     # ex-div fire prefers over the yield heuristic. A projected ex-date is the
