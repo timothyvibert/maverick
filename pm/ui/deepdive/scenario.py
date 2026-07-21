@@ -236,9 +236,19 @@ def _total_line(impact, shocked: bool = True) -> html.Div:
     else:
         children.append(html.Span(_fmt_money(pnl) + pct_s,
                                   className=f"scn-total-val {_sign_cls(pnl)}"))
+    beta_excluded = impact.get("beta_excluded_names") or []
     if n_skipped and n_priced:
         children.append(html.Span(
             f"{n_priced} of {n_priced + n_skipped} legs priced — "
             f"{n_skipped} skipped (unpriceable)",
             className="scn-total-coverage"))
+    if beta_excluded:
+        # Missing-beta policy: excluded from spot shocks, counted + named — the
+        # full name list rides the title (badge idiom, not a sentence).
+        children.append(html.Span(
+            f"{len(beta_excluded)} excluded (no β)",
+            className="scn-total-coverage",
+            title=(f"{len(beta_excluded)} name(s) have no SPX beta and are excluded "
+                   f"from spot-shocked pricing (never priced at a default): "
+                   + ", ".join(beta_excluded))))
     return html.Div(className="scn-total", children=children)

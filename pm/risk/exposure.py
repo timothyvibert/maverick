@@ -453,6 +453,9 @@ def compute_account_exposure(account_state, *, beta_source: str = "adjusted",
             "beta_field_raw": BETA_FIELD_RAW,
             "beta_source": beta_source,
             "n_positions_with_greeks": len(rows_by_pid),
+            # n-of-m coverage for the dollar-beta total: every name the beta
+            # lookup was asked for, so the badge can read "k of n beta-mapped".
+            "n_names_beta_eligible": len([k for k in beta_cache if k]),
             "names_missing_beta": list(missing_beta),
             "names_missing_greeks": list(missing_greeks),
             "as_of": today.isoformat(),

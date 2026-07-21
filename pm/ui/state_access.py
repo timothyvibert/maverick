@@ -198,6 +198,7 @@ def price_scenario(
                     "axes": shock.axes(), "mode": mode, "target": target,
                     "n_priced": impact.get("n_priced"),
                     "n_skipped": impact.get("n_skipped"),
+                    "beta_excluded_names": impact.get("beta_excluded_names"),
                     # current-vs-stressed exposure totals (engine-priced both
                     # sides, account scope) — the reshape view's substrate
                     "exposures": impact.get("exposures")},

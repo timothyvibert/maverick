@@ -67,7 +67,8 @@ _RESHAPE_CAPTION = (
     "Both states are engine-priced through the same repricer (fast BS2002) — "
     "the zero shock is the current state, so Change is the shock's effect, "
     "never a live greek differenced against a recomputed one. Γ$ per 1% spot "
-    "move; θ per business day; a name with no SPX beta prices at β = 1. "
+    "move; θ per business day; a name with no SPX beta is excluded from spot "
+    "shocks (counted and named on the badge, never priced at a default). "
     "Account scope — the Target drill moves the heatmap, not this strip. The "
     "posture band reads the Bloomberg snapshot greeks and differs by the "
     "engine reconciliation (~1–2% on Δ/ν).")
@@ -205,11 +206,15 @@ def _posture_badges(e) -> list:
     """The posture band's qualifiers: provenance always, missing-data marks
     only when something is actually missing. Sentences live in the titles."""
     badges = [_badge("source", _provenance(e) + " " + _NAV_TIP)]
-    missing_beta = (e.trace or {}).get("inputs", {}).get("names_missing_beta", []) or []
+    inputs = (e.trace or {}).get("inputs", {})
+    missing_beta = inputs.get("names_missing_beta", []) or []
     if missing_beta:
+        n_eligible = inputs.get("n_names_beta_eligible")
+        mapped = (f"{n_eligible - len(missing_beta)} of {n_eligible} names beta-mapped; "
+                  if isinstance(n_eligible, int) and n_eligible else "")
         badges.append(_badge(
             f"⚠ {len(missing_beta)} no β",
-            f"{len(missing_beta)} name(s) had no SPX beta and are excluded "
+            f"{mapped}{len(missing_beta)} name(s) had no SPX beta and are excluded "
             f"from dollar-beta: {', '.join(missing_beta)}", warn=True))
     missing_greeks = getattr(e, "missing_greeks", []) or []
     if missing_greeks:
@@ -282,6 +287,18 @@ def _coverage_badge(exposures: Optional[dict]) -> Optional[html.Span]:
                       f"{n_legs} of {n_legs + n_skipped} legs priced — "
                       f"{n_skipped} skipped (unpriceable)", warn=True)
     return _badge(f"{n_legs} legs priced", f"All {n_legs} legs priced.")
+
+
+def _beta_excluded_badge(exposures: Optional[dict]) -> Optional[html.Span]:
+    """The missing-beta exclusion, visible where the shocked numbers live: a
+    count badge with the names in the title."""
+    names = (exposures or {}).get("beta_excluded_names") or []
+    if not names:
+        return None
+    return _badge(f"⚠ {len(names)} no β",
+                  f"{len(names)} name(s) have no SPX beta and are excluded from "
+                  f"spot-shocked pricing (never priced at a default): "
+                  + ", ".join(names), warn=True)
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +806,8 @@ def render_risk_section(account_state, state) -> html.Div:
             html.Div(id="scn-total",
                      children=_total_line(impact, shocked=False)),
             _band("Convexity — how the book reshapes", tip=_RESHAPE_CAPTION,
-                  badges=[b for b in (_coverage_badge(exposures),) if b]),
+                  badges=[b for b in (_coverage_badge(exposures),
+                                      _beta_excluded_badge(exposures)) if b]),
             html.Div(id="risk-reshape",
                      children=_reshape_table(exposures, nav, shocked=False)),
             html.Div(className="scn-body", children=[

@@ -43,7 +43,17 @@ from pm.core import clock
 logger = logging.getLogger(__name__)
 
 BETA_FIELD = "EQY_BETA"          # SPX-adjusted beta (snapshot.underlyings)
-DEFAULT_BETA = 1.0               # full market participation when a name has no beta
+# Missing-beta policy (one rule across the risk layers): a name with no
+# resolvable SPX beta is EXCLUDED from beta-mapped spot shocks — counted and
+# named, never priced at a default. A defaulted beta is a fabricated number
+# presented as data, the same failure mode as $0-for-missing. Shocks with no
+# spot component (vol / rate / time) are beta-independent and still price the
+# full set. The only permitted beta = 0 is ASSERTED for classes that genuinely
+# imply zero market beta (cash and money-market equivalents — which carry no
+# greeks and never reach these legs, so the assertion is structural). The
+# exposure aggregation (pm/risk/exposure.py) applies the same rule:
+# dollar-beta accrues only names with a numeric beta; missing names are
+# warned and traced.
 SIGMA_FLOOR = 1e-4
 _T_FLOOR = 1e-6
 # A beta-mapped move past -100% (|beta| x shock, e.g. beta 6 at SPX -20%) would drive
@@ -200,8 +210,11 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     """Per-position / structure P&L (+ shocked-state dollar greeks) under one shock,
     plus the account total. The per-position rows SUM to the account total — the
     total covers the PRICEABLE book only, so the return also carries n_priced /
-    n_skipped (whole-book counts) for the coverage cue. Fast on the dial;
-    ``mode='truth'`` for a committed point. Pure, read-only.
+    n_skipped (whole-book counts) for the coverage cue, and
+    ``beta_excluded_names``: names with no resolvable SPX beta, excluded from any
+    spot-component shock per the module's missing-beta policy (empty on
+    beta-independent shocks). Fast on the dial; ``mode='truth'`` for a committed
+    point. Pure, read-only.
 
     The return also carries ``exposures`` — the priced scope's exposure totals at
     the CURRENT state and at the SHOCKED state, engine-priced on both sides through
@@ -213,6 +226,8 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     today_ts = _normalize_today(today)
     legs, equities, skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
+    legs, equities, beta_excluded = _split_beta_excluded(
+        legs, equities, beta_map, bool(shock.spot_pct))
     curve = getattr(state, "risk_free_curve", None) or []
     shifted = _shifted_curve(curve, shock.rate_bps)
     nav = _num(getattr(account_state, "nav", None))
@@ -223,7 +238,10 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     exp_now = _exposure_acc()
     exp_str = _exposure_acc()
     for lg in legs:
-        beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
+        # None only on a beta-independent shock (excluded otherwise) — the spot
+        # term is inert there, so 0.0 is arithmetic identity, not a default.
+        beta = beta_map.get(lg.underlying_bbg)
+        beta_dbeta, beta = beta, (beta if beta is not None else 0.0)
         S, sigma, r, T, t2 = _shocked_inputs(lg, beta, shock, shifted, today_ts)
         px0 = _price_at(lg, lg.spot, lg.sigma, lg.r, lg.T, lg.today, mode)
         px1 = _price_at(lg, S, sigma, r, T, t2, mode)
@@ -235,15 +253,16 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
         # identical tuples at zero shock, so Now == Stressed exactly there.
         S0, sig0, r0, T0, t0 = _shocked_inputs(lg, beta, zero, curve, today_ts)
         g0 = _greeks_at(lg, S0, sig0, r0, T0, t0, mode)
-        _accrue_exposure(exp_now, mult, g0, S0, beta)
-        _accrue_exposure(exp_str, mult, g, S, beta)
+        _accrue_exposure(exp_now, mult, g0, S0, beta_dbeta)
+        _accrue_exposure(exp_str, mult, g, S, beta_dbeta)
         rows.append({
             "id": lg.position_id, "label": _leg_label(lg), "kind": "option",
             "underlying": lg.underlying_bbg, "structure_id": _structure_of(account_state, lg.position_id),
             "pnl": pnl, "dd": mult * g.get("delta", 0.0) * S, "dg": mult * g.get("gamma", 0.0) * S,
             "dv": mult * g.get("vega", 0.0), "dt": mult * g.get("theta", 0.0)})
     for eq in equities:
-        s1 = max(eq["spot"] * (1.0 + eq["beta"] * shock.spot_pct / 100.0), 0.0)
+        b = eq["beta"] if eq["beta"] is not None else 0.0   # None ⇒ spot term inert
+        s1 = max(eq["spot"] * (1.0 + b * shock.spot_pct / 100.0), 0.0)
         pnl = eq["qty"] * (s1 - eq["spot"])
         total += pnl
         _accrue_equity_exposure(exp_now, eq["qty"] * eq["spot"], eq["beta"])
@@ -257,15 +276,18 @@ def shock_reprice(state, account_state, shock: ShockSpec, today=None, target=Non
     n_skipped = skips["n_options_skipped"] + skips["n_equities_skipped"]
     return {"account_pnl": total, "account_pnl_pct": (total / nav if nav else None),
             "rows": rows, "n_priced": len(legs) + len(equities), "n_skipped": n_skipped,
+            "beta_excluded_names": beta_excluded,
             "exposures": {
                 "now": exp_now, "stressed": exp_str,
                 "n_legs": len(legs) + len(equities), "n_skipped": n_skipped,
+                "beta_excluded_names": beta_excluded,
                 "basis": {
                     "gamma": "dollar gamma per 1% spot move (engine gamma x spot/100); "
                              "dg_native is the engine per-$1 form",
                     "theta": "engine, per business day",
-                    "beta": f"{BETA_FIELD} (SPX 2y wkly); missing beta prices at "
-                            f"{DEFAULT_BETA:g} (full market participation)",
+                    "beta": f"{BETA_FIELD} (SPX 2y wkly); names with no beta are "
+                            "excluded from spot-shocked pricing, counted and named "
+                            "(never priced at a default)",
                     "pricer": ("truth-CRR" if mode == "truth"
                                else "fast vectorized BS2002"),
                 }}}
@@ -282,7 +304,8 @@ def _exposure_acc() -> dict:
 def _accrue_exposure(acc: dict, mult, g: dict, S, beta) -> None:
     dd = mult * g.get("delta", 0.0) * S
     acc["dd"] += dd
-    acc["dbeta"] += dd * beta
+    if beta is not None:   # missing beta: real delta-$, excluded from beta-$
+        acc["dbeta"] += dd * beta
     dg_native = mult * g.get("gamma", 0.0) * S
     acc["dg_native"] += dg_native
     acc["dg_1pct"] += dg_native * S / 100.0
@@ -294,7 +317,8 @@ def _accrue_equity_exposure(acc: dict, dd, beta) -> None:
     # Stock is delta-one and carries no vol/rate/time sensitivity in this model —
     # its gamma/vega/theta contributions are genuine zeros, not missing data.
     acc["dd"] += dd
-    acc["dbeta"] += dd * beta
+    if beta is not None:   # missing beta: real delta-$, excluded from beta-$
+        acc["dbeta"] += dd * beta
 
 
 def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=None,
@@ -310,6 +334,8 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
     today_ts = _normalize_today(today)
     legs, equities, _skips = _select(state, account_state, target, today_ts)
     beta_map = _beta_map(account_state)
+    # The mesh IS a spot sweep, so the missing-beta exclusion always applies here.
+    legs, equities, beta_excluded = _split_beta_excluded(legs, equities, beta_map, True)
     shifted = _shifted_curve(getattr(state, "risk_free_curve", None) or [], rate_bps)
     spot_axis = np.round(np.linspace(-GRID_SPOT_SPAN, GRID_SPOT_SPAN, GRID_SPOT_N), 4)
     vol_axis = np.array(GRID_VOL_PTS, dtype=float)
@@ -321,7 +347,7 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
     # surfaces differ by one business day of decay.
     t2 = _bd(today_ts + pd.Timedelta(days=time_days)) if time_days else None
     for lg in legs:
-        beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
+        beta = beta_map[lg.underlying_bbg]      # excluded above when unresolvable
         if time_days:
             T = max(year_frac(t2.date(), lg.expiry), _T_FLOOR)
             r = _shocked_rate(lg, shifted, t2, rate_bps)
@@ -350,6 +376,7 @@ def spot_vol_grid(state, account_state, *, rate_bps=0.0, time_days=0, target=Non
 
     return {"spot_axis": spot_axis.tolist(), "vol_axis": vol_axis.tolist(),
             "pnl_matrix": matrix.tolist(), "point_pnl": point_pnl,
+            "beta_excluded_names": beta_excluded,
             "pricer": "fast vectorized BS2002"}
 
 
@@ -391,15 +418,21 @@ def _greeks_at(leg, S, sigma, r, T, today, mode):
 
 def _account_pnl(legs, equities, beta_map, base_price, curve_pts, today_ts, shock,
                  mode="truth", n_steps=None) -> float:
+    """Total over the beta-mappable set: under a spot-component shock, no-beta
+    names are excluded per the module policy (never priced at a default)."""
+    legs, equities, _excluded = _split_beta_excluded(
+        legs, equities, beta_map, bool(shock.spot_pct))
     shifted = _shifted_curve(curve_pts, shock.rate_bps)
     total = 0.0
     for lg in legs:
-        beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
-        S, sigma, r, T, t2 = _shocked_inputs(lg, beta, shock, shifted, today_ts)
+        beta = beta_map.get(lg.underlying_bbg)
+        S, sigma, r, T, t2 = _shocked_inputs(lg, beta if beta is not None else 0.0,
+                                             shock, shifted, today_ts)
         px = _price_at(lg, S, sigma, r, T, t2, mode, n_steps=n_steps)
         total += lg.qty * lg.multiplier * (px - base_price[lg.position_id])
     for eq in equities:
-        s1 = max(eq["spot"] * (1.0 + eq["beta"] * shock.spot_pct / 100.0), 0.0)
+        b = eq["beta"] if eq["beta"] is not None else 0.0
+        s1 = max(eq["spot"] * (1.0 + b * shock.spot_pct / 100.0), 0.0)
         total += eq["qty"] * (s1 - eq["spot"])
     return total
 
@@ -491,9 +524,11 @@ def _leg_label(leg) -> str:
 # --------------------------------------------------------------------------
 def _portfolio_curve(legs, equities, beta_map, scenarios, today_ts) -> dict:
     grid = np.linspace(-CURVE_SPAN_PCT, CURVE_SPAN_PCT, CURVE_POINTS)
+    # A spot sweep by construction: no-beta names are excluded per the policy.
+    legs, equities, _excluded = _split_beta_excluded(legs, equities, beta_map, True)
     pnl = np.zeros_like(grid)
     for lg in legs:
-        beta = beta_map.get(lg.underlying_bbg, DEFAULT_BETA)
+        beta = beta_map[lg.underlying_bbg]
         s_arr = np.maximum(lg.spot * (1.0 + beta * grid / 100.0), _SPOT_FLOOR)
         p = np.asarray(strategy.price_leg(s_arr, lg.K, lg.T, lg.r, lg.q, lg.sigma,
                                           lg.opt_type, style=lg.style, mode="fast"), dtype=float)
@@ -543,6 +578,28 @@ def _zero_crossings(grid, pnl) -> list:
 # --------------------------------------------------------------------------
 # Inputs
 # --------------------------------------------------------------------------
+def _split_beta_excluded(legs, equities, beta_map, spot_active: bool):
+    """Partition the priceable set under the missing-beta policy: when the shock
+    has a spot component, no-beta names cannot be beta-mapped and are excluded
+    (returned as a sorted name list for the cues); beta-independent shocks keep
+    the full set. Both sides of any Now-vs-Stressed comparison price the SAME
+    partition, so an exclusion can never masquerade as shock effect."""
+    if not spot_active:
+        return legs, equities, []
+    ok_legs, ok_eqs, names = [], [], set()
+    for lg in legs:
+        if beta_map.get(lg.underlying_bbg) is None:
+            names.add(lg.underlying_bbg or "?")
+        else:
+            ok_legs.append(lg)
+    for eq in equities:
+        if eq["beta"] is None:
+            names.add(eq["bbg"] or "?")
+        else:
+            ok_eqs.append(eq)
+    return ok_legs, ok_eqs, sorted(names)
+
+
 def _beta_map(account_state) -> dict:
     snap = getattr(getattr(account_state, "snapshot", None), "underlyings", None)
     out: dict = {}
@@ -578,7 +635,7 @@ def _equity_legs_with_skips(account_state, beta_map) -> tuple:
             continue
         out.append({"bbg": bbg, "pid": getattr(p, "position_id", None),
                     "spot": spot, "qty": qty,
-                    "beta": beta_map.get(bbg, DEFAULT_BETA)})
+                    "beta": beta_map.get(bbg)})   # None = no resolvable beta
     return out, n_skipped
 
 
