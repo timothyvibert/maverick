@@ -33,6 +33,7 @@ from datetime import date, datetime
 from statistics import median
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -67,10 +68,13 @@ _EQUITY_CLASSES = ("equity", "fund_etf")
 class UnknownLifecycleAction(ValueError):
     """A trade carries an ``option_lifecycle_action`` outside the canonical set.
 
-    Raised rather than silently bucketed: an unrecognised lifecycle string would
-    quietly mis-state strategy / direction / coverage, so the profile for that
-    account fails loud (the load path catches it per-account and degrades that
-    account's profile to None)."""
+    Raised by ``_canonical_action`` rather than silently bucketed: an
+    unrecognised lifecycle string would quietly mis-state strategy / direction /
+    coverage. ``normalize_trades`` catches it per ROW: the offending row is
+    staged ``"unknown"`` (excluded from every open/close-based read, kept for
+    flow-level ones), the raw string reaches the profile's ``degraded_reason``
+    and the load notes — the rest of the account's profile stays live instead
+    of nulling wholesale."""
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +99,17 @@ _CONF_HIGH_MIN = 10      # sample size for a "high"-confidence dimension
 _BAND_MED_MIN = 6        # trades for a "medium" overall coverage band
 _BAND_HIGH_MIN = 15      # trades (with paired evidence) for a "high" band
 _BAND_HIGH_PAIRED = 0.34  # paired fraction also required for "high"
+_BAND_WINDOW_MIN_DAYS = 30  # a span shorter than this caps the band at "low" —
+                            # a dense burst is not a behavioural history
 _CADENCE_MIN_WINDOW_DAYS = 30  # shorter spans can't be annualised into a rate
 _TOP_N = 5               # sector / name lean is reported top-N
 
 # Fragile-tier dials (provisional — behaviour-tested, not calibrated).
 _HOLDS_MIN_POSITIONS = 3   # held option positions with a derivable open to read a median
 _ROLLS_MIN_CLOSES = 6      # closing trades needed to characterise a roll tendency
-_ROLL_WINDOW_DAYS = 1      # a reopen this many calendar days from a close counts as a roll
+_ROLL_WINDOW_BD = 1        # a reopen within this many FORWARD business days of a
+                           # close counts as a roll (captures Fri-close/Mon-reopen;
+                           # a prior-day open is not a roll of a later close)
 _ROLL_HIGH = 0.5           # roll-like share at/above this reads "rolls"
 _ROLL_LOW = 0.25           # roll-like share below this reads "closes_early"
 
@@ -265,6 +273,10 @@ class ClientProfile:
     holding_period: Optional[HoldingPeriod] = None
     roll_behavior: Optional[RollBehavior] = None
     headline: str = ""
+    # Set when trade rows carried unrecognised lifecycle actions: those rows are
+    # excluded from open/close-based reads and this names them (rendered on the
+    # section + echoed into the load notes). None = clean vocabulary.
+    degraded_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +292,18 @@ def _confidence(n: Optional[int]) -> str:
     return "high"
 
 
-def _band(n_trades: int, paired_fraction: float) -> str:
-    """Overall coverage band from trade count (primary) and paired evidence
-    (secondary). Monotone non-decreasing in both, so more history never lowers
-    the band. Thresholds are provisional (no calibration extract available); the
-    band intentionally does not yet floor on window span, so a short dense burst
-    can read 'medium' even while cadence is suppressed — to reconcile when the
-    calibration extract lands."""
+def _band(n_trades: int, paired_fraction: float,
+          window_days: Optional[int] = None) -> str:
+    """Overall coverage band from trade count (primary), paired evidence
+    (secondary), and a window-span floor: a history spanning under
+    ``_BAND_WINDOW_MIN_DAYS`` caps at 'low' regardless of trade count — a short
+    dense burst is activity, not a behavioural read (the same reason cadence
+    refuses to annualise it). Monotone non-decreasing in every input, so more
+    history never lowers the band. Thresholds are provisional (no calibration
+    extract available). ``window_days is None`` (undated trades) does not cap —
+    absence of dates is not evidence of a burst."""
+    if window_days is not None and window_days < _BAND_WINDOW_MIN_DAYS:
+        return "low"
     pf = paired_fraction or 0.0
     if n_trades >= _BAND_HIGH_MIN and pf >= _BAND_HIGH_PAIRED:
         return "high"
@@ -342,19 +359,24 @@ def _canonical_action(action) -> Optional[tuple[str, str]]:
 # Normalisation (the gate)
 # ---------------------------------------------------------------------------
 
-def normalize_trades(trades: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Validate and tag the account's trades, returning (clean_frame, n_cancels).
+def normalize_trades(trades: pd.DataFrame) -> tuple[pd.DataFrame, int, list[str]]:
+    """Validate and tag the account's trades, returning
+    (clean_frame, n_cancels, unknown_actions).
 
     - Cancelled / busted rows (``cancel_code`` populated) are dropped.
     - Each row gets ``_side`` / ``_stage``: from the lifecycle map for options;
       from Buy/Sell for equities (buy -> open/long, sell -> exit).
     - ``buy_sell`` is cross-checked against the mapped side; a disagreement is
       logged, not fatal.
-    - Any ``option_lifecycle_action`` outside the canonical set raises
-      ``UnknownLifecycleAction`` — never silently bucketed.
+    - Any ``option_lifecycle_action`` outside the canonical set is NEVER
+      silently bucketed: the row is staged ``"unknown"`` (excluded from every
+      open/close-based read, kept for flow-level ones) and the raw string is
+      returned in ``unknown_actions`` so the profile can stamp its degraded
+      reason and the load notes can name it. One bad vocabulary row no longer
+      nulls the whole profile.
     """
     if trades is None or getattr(trades, "empty", True):
-        return (trades if trades is not None else pd.DataFrame()), 0
+        return (trades if trades is not None else pd.DataFrame()), 0, []
 
     df = trades.copy()
 
@@ -369,13 +391,20 @@ def normalize_trades(trades: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     sides: list[str] = []
     stages: list[str] = []
     mismatches = 0
+    unknown_actions: list[str] = []
     has_lc = "option_lifecycle_action" in df.columns
     has_bs = "buy_sell" in df.columns
 
     for _, row in df.iterrows():
         ac = str(row.get("asset_class") or "").strip().lower()
         bs_word = str(row.get("buy_sell") or "").strip().lower().split(" ")[0] if has_bs else ""
-        mapped = _canonical_action(row.get("option_lifecycle_action")) if has_lc else None
+        try:
+            mapped = _canonical_action(row.get("option_lifecycle_action")) if has_lc else None
+        except UnknownLifecycleAction as exc:
+            unknown_actions.append(str(exc))
+            sides.append(bs_word)
+            stages.append("unknown")
+            continue
 
         if ac == _OPTION_CLASS:
             if mapped is None:
@@ -404,7 +433,7 @@ def normalize_trades(trades: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             "client profile: %d trade row(s) where Buy/Sell disagrees with the "
             "lifecycle side", mismatches,
         )
-    return df, n_cancels
+    return df, n_cancels, unknown_actions
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +668,7 @@ def _build_coverage(df: pd.DataFrame, positions, n_cancels: int) -> Coverage:
     # the opens-predate-window caveat distinct from the round-trip rate above).
     pos_open_frac = _positions_with_derivable_open(df, positions)
 
-    band = _band(n_trades, paired_fraction)
+    band = _band(n_trades, paired_fraction, window_days)
     return Coverage(
         n_trades=n_trades,
         n_opens=n_opens,
@@ -744,7 +773,11 @@ def _build_roll_behavior(df: pd.DataFrame) -> Optional[RollBehavior]:
                 continue
             if not _blank(o_key) and not _blank(ckey) and str(o_key) == str(ckey):
                 continue  # same contract — a re-add, not a roll
-            if abs((o_date - cdate).days) <= _ROLL_WINDOW_DAYS:
+            # Forward-only, in business days: a roll REPLACES the closed leg, so
+            # its open comes at or after the close (same day, or the next
+            # business day — Friday close / Monday reopen counts). An open that
+            # PRECEDES the close is an existing position, not a roll.
+            if 0 <= np.busday_count(cdate, o_date) <= _ROLL_WINDOW_BD:
                 n_events += 1
                 break
 
@@ -804,7 +837,16 @@ def compute_account_profile(account_state) -> ClientProfile:
     snapshot = getattr(account_state, "snapshot", None)
     underlyings = getattr(snapshot, "underlyings", None)
 
-    df, n_cancels = normalize_trades(trades)
+    df, n_cancels, unknown_actions = normalize_trades(trades)
+    degraded_reason = None
+    if unknown_actions:
+        uniq = sorted(set(unknown_actions))
+        degraded_reason = (
+            f"{len(unknown_actions)} trade row(s) carry unrecognised lifecycle "
+            f"action(s) {uniq} — excluded from open/close-based reads (posture, "
+            "direction, tenor, round-trips, rolls); flow-level reads (sector, "
+            "sizing, cadence, window) include them."
+        )
 
     if df is None or df.empty:
         coverage = Coverage(
@@ -825,6 +867,7 @@ def compute_account_profile(account_state) -> ClientProfile:
             # account with an empty trade blotter; rolls needs trades, so stays None.
             holding_period=_build_holding_period(positions),
             headline="No trade history.",
+            degraded_reason=degraded_reason,
         )
 
     coverage = _build_coverage(df, positions, n_cancels)
@@ -843,6 +886,7 @@ def compute_account_profile(account_state) -> ClientProfile:
         direction_bias=direction_bias, tenor_pref=tenor_pref, sector_lean=sector_lean,
         sizing=sizing, cadence=cadence, holding_period=holding_period,
         roll_behavior=roll_behavior, headline=headline,
+        degraded_reason=degraded_reason,
     )
 
 
@@ -851,7 +895,13 @@ def run_account_profile(state) -> None:
 
     Reads each account's already-loaded trades + snapshot + positions and stores
     the result on ``acc.client_profile`` — no Bloomberg, no recompute. One bad
-    account degrades to ``None`` and is logged, leaving the rest intact."""
+    account degrades to ``None`` and is logged, leaving the rest intact; a
+    profile computed around unrecognised lifecycle rows carries its
+    ``degraded_reason`` into the load notes (replace-not-stack, the [insight]
+    idiom) so the operator surface names the offending strings."""
+    warnings = getattr(state, "all_warnings", None)
+    if warnings is not None:
+        state.all_warnings = [w for w in warnings if not w.startswith("[profile]")]
     for acc in getattr(state, "accounts", {}).values():
         try:
             acc.client_profile = compute_account_profile(acc)
@@ -860,3 +910,8 @@ def run_account_profile(state) -> None:
                 "client profile failed for account %s", getattr(acc, "account", "?")
             )
             acc.client_profile = None
+            continue
+        reason = getattr(acc.client_profile, "degraded_reason", None)
+        if reason and getattr(state, "all_warnings", None) is not None:
+            state.all_warnings.append(
+                f"[profile] {getattr(acc, 'account', '?')}: {reason}")

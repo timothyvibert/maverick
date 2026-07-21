@@ -197,9 +197,16 @@ def _tenor_direction_tile(profile) -> html.Div:
         className="dd-panel-note",
         children=f"Call / put: {_skew_text(d.call_put_skew, 'calls', 'puts')}",
     )
+    # The structural data limitation, stated where the lean is read (mirrors the
+    # holds-proxy caveat idiom): equity sells carry no short marker.
+    direction_caveat = html.Div(
+        "No short-sale marker in the extract — equity sells read as exits, "
+        "never as shorts, so the directional lean skews long.",
+        className="dd-panel-note",
+    )
     return _tile("Tenor & direction",
                  "At-open days-to-expiry and directional lean" + _conf_suffix(d.confidence) + ".",
-                 *tenor_body, net_delta, call_put)
+                 *tenor_body, net_delta, call_put, direction_caveat)
 
 
 def _sector_tile(profile) -> html.Div:
@@ -337,5 +344,11 @@ def render_trade_insights_section(account_state) -> html.Div:
         _sizing_tile(profile),
         _cadence_tile(profile),
     ])
-    return html.Div(className="dd-section", children=[head, _fingerprint_strip(profile), grid,
-                                                      _fragile_panel(profile)])
+    children = [head, _fingerprint_strip(profile)]
+    if getattr(profile, "degraded_reason", None):
+        # Visible degrade reason: the profile computed AROUND bad rows, and the
+        # reader must know which reads excluded them (full text, not a footnote).
+        children.append(html.Div(f"⚠ {profile.degraded_reason}",
+                                 className="dd-panel-note dd-profile-degraded"))
+    children += [grid, _fragile_panel(profile)]
+    return html.Div(className="dd-section", children=children)

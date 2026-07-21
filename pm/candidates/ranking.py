@@ -313,21 +313,32 @@ def _client_fit(cand, profile):
     flags: list = []
     dims: list = []
 
+    # Per-dimension confidence gate: a dimension whose OWN read is
+    # low-confidence (thin sample) must not move ranking even when the global
+    # band is medium+ — it is skipped with a reason, never half-trusted.
+    def _dim_ok(dim, label):
+        if getattr(dim, "confidence", None) == "low":
+            reasons.append(f"{label} read low-confidence — not scored")
+            return False
+        return True
+
+    tenor_pref = getattr(profile, "tenor_pref", None)
     cand_dte = _num((getattr(cand, "economics", None) or {}).get("dte"))
-    tfit, treason, over_msg = _tenor_fit(cand_dte, getattr(profile, "tenor_pref", None))
-    if tfit is not None:
+    tfit, treason, over_msg = _tenor_fit(cand_dte, tenor_pref)
+    if tfit is not None and _dim_ok(tenor_pref, "tenor"):
         dims.append(tfit)
-    if treason:
-        reasons.append(treason)
+        if treason:
+            reasons.append(treason)
     over = over_msg is not None
     if over_msg:
         flags.append(over_msg)
 
-    pfit, preason = _posture_fit(_candidate_posture(cand), getattr(profile, "strategy_bias", None))
-    if pfit is not None:
+    strategy_bias = getattr(profile, "strategy_bias", None)
+    pfit, preason = _posture_fit(_candidate_posture(cand), strategy_bias)
+    if pfit is not None and _dim_ok(strategy_bias, "posture"):
         dims.append(pfit)
-    if preason:
-        reasons.append(preason)
+        if preason:
+            reasons.append(preason)
 
     if not dims:
         return 0.5, (reasons or ["profile too thin for this candidate — objective-fit only"]), flags, over

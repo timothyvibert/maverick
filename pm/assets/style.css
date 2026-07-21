@@ -927,6 +927,9 @@ html, body {
     font-size: 11px; color: var(--pm-grey-500); margin: -4px 0 10px 0;
 }
 .dd-panel-note { font-size: 12px; color: var(--pm-grey-700); margin-top: 10px; line-height: 1.5; }
+/* Client-profile degrade reason — unrecognised trade rows excluded from the
+   open/close-based reads; amber because the reads above it are qualified. */
+.dd-profile-degraded { color: var(--pm-urgent); font-weight: 600; }
 .dd-beta-chip {
     font-size: 12px; font-weight: 600; color: var(--pm-charcoal);
     font-family: "Consolas", monospace;
