@@ -95,9 +95,13 @@ def scn_payoff_drawer_state(account, position_id) -> dict:
 
 
 def _short_leg_pid(acc_state, structure_id):
-    """The structure's roll-target leg — its short option leg (short call preferred,
-    then short put), so the Payoff|Scanner toggle anchors the scan on the contract the
-    desk would actually roll. None when no short option leg is present."""
+    """The structure's scan anchor — its short OPTION leg (short call preferred,
+    then short put, then any short option role, e.g. a naked excess), so the
+    Payoff|Scanner toggle anchors the scan on the contract the desk would
+    actually roll. A structure with no short option leg falls back to its STOCK
+    leg — the overlay scan, exactly what clicking the stock position itself
+    opens (married put, residual long). None only when neither exists (a long
+    straddle/strangle: the scanner then says so instead of dead-ending)."""
     s = next((x for x in (getattr(acc_state, "structures", None) or [])
               if x.structure_id == structure_id), None)
     if s is None:
@@ -108,7 +112,12 @@ def _short_leg_pid(acc_state, structure_id):
             if getattr(lg, "role", None) == want:
                 return lg.position_id
     for lg in legs:
-        if "short" in (getattr(lg, "role", "") or ""):
+        role = getattr(lg, "role", "") or ""
+        if "short" in role and "stock" not in role:
+            return lg.position_id
+    for lg in legs:
+        role = getattr(lg, "role", "") or ""
+        if "stock" in role or role == "residual_long":
             return lg.position_id
     return None
 

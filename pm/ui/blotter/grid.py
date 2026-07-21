@@ -431,8 +431,11 @@ def default_grid_options() -> dict:
         "enableCellTextSelection": True,
         "ensureDomOrder": True,
         "rowClassRules": {
-            # Top-border separator above the first row of each group block.
-            "blotter-group-start": "params.data && params.data._group_first",
+            # Top-border separator above the first row of each group block —
+            # suppressed while a header sort is active, because the flags are
+            # server-stamped in the server's order and a client re-sort would
+            # scatter them mid-list (dashAgGridFunctions.blotterGroupStart).
+            "blotter-group-start": {"function": "blotterGroupStart(params)"},
             # Subtle (non-red) urgency accent on T1 rows.
             "blotter-row-t1": "params.data && params.data.tier == 1",
         },

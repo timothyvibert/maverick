@@ -420,7 +420,21 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
     """The drawer body for ``view='scanner'``. Opens immediately with a placeholder; the
     one-shot ``scanner-load`` interval then pulls + fills the ranked candidates.
     ``structure_id`` is reserved context — the candidates are position-anchored (covered
-    vs naked is already resolved in generation), so v1 does not read it."""
+    vs naked is already resolved in generation), so v1 does not read it.
+
+    ``position_id=None`` (a structure with no scannable anchor — no short option
+    leg and no stock leg, e.g. a long straddle) renders an explicit no-roll-target
+    state instead of a dead tab: the scan never starts, so no misleading
+    market-data message can appear."""
+    if position_id is None:
+        return html.Div(className="drawer-content scanner-content", children=[
+            html.Div(className="scanner-head", children=[
+                html.Div("Scan candidates", className="scanner-identity")]),
+            html.Div("No roll target in this structure — a scan anchors on a "
+                     "short option leg (or held stock, for an overlay write); "
+                     "this structure has neither. Open a leg position directly "
+                     "to scan its chain.", className="scanner-empty"),
+        ])
     state = sa.get_state()
     pos = sa.position_by_id(state, account, position_id) if state else None
     # Expand exists only for option rolls: it widens the slice by one expiry

@@ -20,3 +20,20 @@ dagfuncs.ISODateComparator = function (filterLocalDateAtMidnight, cellValue) {
     }
     return 0;
 };
+
+// Blotter group separators are stamped SERVER-side into row data (_group_first)
+// and are only meaningful in the server's sort order. A header click re-sorts
+// rows client-side while the flags stay glued to their rows, which would
+// scatter separators mid-list — so the rule renders only while no column sort
+// is active. Clearing the sort restores the server order and the separators.
+dagfuncs.blotterGroupStart = function (params) {
+    try {
+        var state = params.api && params.api.getColumnState ? params.api.getColumnState() : [];
+        for (var i = 0; i < state.length; i++) {
+            if (state[i].sort) {
+                return false;
+            }
+        }
+    } catch (e) { /* fall through: render as the server stamped it */ }
+    return !!(params.data && params.data._group_first);
+};
