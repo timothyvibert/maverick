@@ -240,17 +240,28 @@ def _exp_ord(d) -> int:
 
 def _fit_indicator(rc):
     """A compact strength mark for a ranked candidate — the rank (★ on rank 1) beside a
-    small fit bar from the combined score. The ranking's per-candidate reasons and
-    flags are computed but not yet rendered anywhere — this mark is the whole
-    visible story for now."""
+    small fit bar from the combined score. The ranking's computed reasons and flags
+    surface HERE: an amber ⚠ when any flag is present (over-extends, degraded
+    pricing) with the full flag + reason text in the title — a computed suitability
+    warning must never stay invisible. The full inline render belongs to the
+    compare-step redesign."""
     score = rc.score if rc.score is not None else 0.0
     pct = max(0, min(100, round(score * 100)))
     label = "★" if rc.rank == 1 else str(rc.rank)
-    return html.Div(className="scanner-fit", title=f"rank {rc.rank} · fit {pct}", children=[
+    flags = list(getattr(rc, "flags", None) or [])
+    reasons = list(getattr(rc, "reasons", None) or [])
+    tip = f"rank {rc.rank} · fit {pct}"
+    detail = "\n".join(flags + reasons)
+    if detail:
+        tip += "\n" + detail
+    children = [
         html.Span(label, className="scanner-fit-rank"),
         html.Div(className="scanner-fit-bar",
                  children=html.Div(className="scanner-fit-fill", style={"width": f"{pct}%"})),
-    ])
+    ]
+    if flags:
+        children.append(html.Span("⚠", className="scanner-fit-flag"))
+    return html.Div(className="scanner-fit", title=tip, children=children)
 
 
 def _cand_by_ticker(ranked_active) -> dict:

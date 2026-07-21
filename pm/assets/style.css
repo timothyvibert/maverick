@@ -1170,6 +1170,9 @@ html, body {
 .scanner-fit-bar { flex: 1; height: 5px; min-width: 26px; background: var(--pm-grey-100);
     border-radius: 3px; overflow: hidden; }
 .scanner-fit-fill { height: 100%; background: var(--pm-accent); }
+/* A ranked candidate carrying a suitability flag (over-extends, degraded
+   pricing): the computed warning is visible, full text in the title. */
+.scanner-fit-flag { color: var(--pm-urgent); font-weight: 700; flex: none; }
 .scanner-row-rec .scanner-fit-fill { background: var(--pm-urgent); }
 
 /* Browse rows: candidates highlighted, the held strike marked, candidate rows clickable. */
