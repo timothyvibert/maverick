@@ -625,6 +625,106 @@ def _detect_married_put(account, underlying, stock_pid, stock_rem,
     return stock_rem
 
 
+def _decompose_forced_splits(account, underlying, options, opt_rem, trades_df,
+                             out: list, reserve) -> None:
+    """Split one position's quantity across multiple vertical claims — but ONLY
+    when the split is forced, never chosen.
+
+    The gap this fills: the exact-composite tier matches only bindings that
+    consume every strike group whole (a correct guard — a partial carve can
+    fabricate structure and mark contracts naked that outside longs cover), so
+    a rolled or partially-closed book with three-plus strike groups on one
+    right/expiry falls through as loose legs. Some of those books have exactly
+    one valid reading; this pass emits it and refuses everything else.
+
+    Determinacy rule, per (right, expiry, contract-size) bucket of remaining
+    slices (stock-cover reservation already senior — claims go through the same
+    reserve-aware availability the exact tier uses):
+      * ONE long strike group vs MANY short groups: forced. Shorts draw cover
+        from the single long in the module's canonical cover order — calls
+        ascending strike, puts descending (the ``_cover_split`` order) — so
+        each claim's quantity is min(short, long remaining) with no choice of
+        source; if the long runs dry the order itself says who went uncovered,
+        and the shorts' remainder is left for the naked sweep (this pass emits
+        NO naked marks of its own).
+      * ONE short group vs MANY long groups, and short >= sum(longs): forced —
+        every long is consumed whole, so no allocation is chosen. A smaller
+        short would ration among longs, and the module has no canonical
+        long-side order (the cover order ranks shorts): refuse.
+      * Anything else refuses: two-plus longs facing two-plus shorts (the
+        butterfly remnant +10/-15/+10 — any split of the middle short between
+        the wings is arithmetically valid and economically distinct), a strike
+        group holding both signs, or a bucket of fewer than three groups (a
+        pair book belongs to the ratio/vertical passes, untouched).
+    Refusal falls through exactly as today — no guess, no new contention
+    groups. Same-expiry buckets by construction, so every emission is a plain
+    VERTICAL; banded MEDIUM (a split is an inference about intent), raised to
+    HIGH only by co-opened trades, never lowered by a missing one."""
+    groups = _slice_groups(options, opt_rem, reserve)
+    buckets: dict = defaultdict(list)   # (right, expiry, mult) -> [(strike, long_avail, short_avail)]
+    for key in groups:
+        right, expiry, strike, mult = key
+        la = _group_avail(groups, key, +1, opt_rem, reserve)
+        sa = _group_avail(groups, key, -1, opt_rem, reserve)
+        if la or sa:
+            buckets[(right, expiry, mult)].append((strike, la, sa))
+    for (right, expiry, mult), rows in sorted(
+            buckets.items(), key=lambda kv: (kv[0][0], str(kv[0][1]), kv[0][2])):
+        if len(rows) < 3:
+            continue                     # a pair is not a split
+        if any(la and sa for _, la, sa in rows):
+            continue                     # a two-sided strike group is no clean substrate
+        longs = sorted([(k, la) for k, la, _ in rows if la])
+        shorts = [(k, sa) for k, _, sa in rows if sa]
+        if not longs or not shorts:
+            continue
+        if len(longs) > 1 and len(shorts) > 1:
+            continue                     # non-star: any pairing would be chosen
+        pairs: list[tuple[float, float, int]] = []   # (long_strike, short_strike, qty)
+        if len(longs) == 1:
+            lk, remaining = longs[0]
+            for sk, sa in sorted(shorts, key=lambda t: t[0], reverse=(right == "PUT")):
+                take = min(remaining, sa)
+                if take >= 1:
+                    pairs.append((lk, sk, take))
+                    remaining -= take
+                if remaining < 1:
+                    break
+        else:
+            sk, sa = shorts[0]
+            if sum(la for _, la in longs) > sa:
+                continue                 # rationing among longs: no canonical order → refuse
+            pairs = [(lk, sk, la) for lk, la in longs]
+        for lk, sk, qty in pairs:
+            claimed: list = []
+            _claim_group(groups, (right, expiry, lk, mult), +1, qty, opt_rem, reserve, claimed)
+            _claim_group(groups, (right, expiry, sk, mult), -1, qty, opt_rem, reserve, claimed)
+            keys = sorted({c["key"] for c in claimed if c.get("key")})
+            co = _co_opened(keys, trades_df)
+            debit = (right == "CALL" and lk < sk) or (right == "PUT" and lk > sk)
+            rlow = right.lower()
+            out.append(Structure(
+                structure_id=_sid(account, underlying, VERTICAL,
+                                  sorted({c["pid"] for c in claimed})),
+                account=account, underlying=underlying, type=VERTICAL,
+                confidence_band=HIGH if co else MEDIUM, status="proposed",
+                legs=_cover_split(claimed),
+                rationale_trace=_trace(
+                    {"long_strike": {"value": lk, "source": "EXTRACT:option_strike"},
+                     "short_strike": {"value": sk, "source": "EXTRACT:option_strike"},
+                     "qty": {"value": qty, "source": "EXTRACT:quantity"},
+                     "expiry": {"value": str(expiry), "source": "EXTRACT:option_expiration"},
+                     "shared_leg": {"value": "one leg split across sibling spreads on this "
+                                             "name — allocation forced under the canonical "
+                                             "cover order, not chosen",
+                                    "source": "computed:forced split"},
+                     "co_opened": {"value": co, "source": "computed:trade corroboration"}},
+                    f"{qty}x {underlying} {rlow} spread {lk:g}/{sk:g} exp {expiry} "
+                    f"(a shared leg's quantity split across sibling spreads)",
+                    f"{rlow} vertical ({'debit' if debit else 'credit'})"),
+                source="detector:vertical_split"))
+
+
 def _detect_ratio_backspread(account, underlying, options, opt_rem, trades_df,
                              out: list) -> None:
     """Ratio spread / backspread: same right, expiry and contract size, exactly
@@ -776,7 +876,9 @@ def _detect_for_underlying(
     """Allocate signed-quantity slices in priority order: the exact-composite
     tier (box → iron butterfly → iron condor → condor → double diagonal →
     jelly roll → conversion / reversal → butterfly → jade lizard → ladder,
-    matching only what the stock-cover reservation leaves) → the covered-call-
+    matching only what the stock-cover reservation leaves) → the forced-split
+    decomposition (a shared leg split across sibling verticals, forced
+    allocations only) → the covered-call-
     vs-vertical contention carve-out → collar (matched expiry) → covered call
     (+ naked-excess slices) → married put → ratio spread / backspread (unequal
     only) → vertical (1:1, same expiry) → straddle / strangle → synthetic
@@ -825,6 +927,14 @@ def _detect_for_underlying(
                                             options, opt_rem, trades_df, out, demotable)
     _run_specs(_TIER_A_POST, account, underlying, options, opt_rem, trades_df,
                out, demotable, tier_a=True, reserve_fn=_reserve)
+
+    # ---- A2) Forced-split decomposition — the exact tier's fallthrough case ---
+    # A rolled/partially-closed book (three-plus strike groups, one right and
+    # expiry) whose only valid reading splits a shared leg across sibling
+    # verticals. Forced allocations only (see the function doc); the stock
+    # reservation stays senior through the same reserve-aware availability.
+    _decompose_forced_splits(account, underlying, options, opt_rem, trades_df,
+                             out, _reserve())
 
     # ---- 0) Contention: covered call vs vertical on a shared short call --------
     # A short call that long stock can fully cover AND that also pairs with a long
