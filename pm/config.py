@@ -21,8 +21,9 @@ PORT = 8062
 DEFAULT_RISK_FREE_RATE = 0.04
 
 # ---------- Option contract multiplier ----------
-# US listed equity options + Eurex single-stock options both use 100. Index
-# options can differ but they don't appear in the holdings file.
+# US listed equity options + Eurex single-stock options both use 100, as do the
+# major US index options (SPX/NDX/RUT/XSP — see INDEX_UNDERLIERS below). A
+# non-100 contract would need an extract column; the builder hardcodes 100.
 OPTION_CONTRACT_MULTIPLIER = 100
 
 # ---------- Cash-equivalent funds ----------

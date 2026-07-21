@@ -342,15 +342,26 @@ def _build_option(
             )
         return None
 
-    underlying_cc = _pick_country_code(
-        row, "underlying_issuer_country_code", "issuer_country_code_final",
-        "listing_hint_country_code",
-    )
-    underlying_bbg = _build_equity_bbg_ticker(underlying_ticker, underlying_cc, warnings)
+    # Index underliers (SPX, NDX, …) build "<root> Index" and carry the Index
+    # sector through the option ticker — the extract has no instrument-type
+    # signal for indices, so the config allowlist is the honest source. The
+    # equity-shaped default would enumerate a dead security's chain and read
+    # the book as riskless.
+    from pm.config import INDEX_UNDERLIERS
+    if (underlying_ticker or "").upper() in INDEX_UNDERLIERS:
+        underlying_bbg = f"{underlying_ticker.upper()} Index"
+        sector_hint = "Index"
+    else:
+        underlying_cc = _pick_country_code(
+            row, "underlying_issuer_country_code", "issuer_country_code_final",
+            "listing_hint_country_code",
+        )
+        underlying_bbg = _build_equity_bbg_ticker(underlying_ticker, underlying_cc, warnings)
+        sector_hint = "Equity"
 
     try:
         option_bbg = construct_option_ticker(
-            underlying_bbg, expiry, option_type, strike, sector_hint="Equity",
+            underlying_bbg, expiry, option_type, strike, sector_hint=sector_hint,
         )
     except ValueError as exc:
         warnings.append(

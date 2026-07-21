@@ -189,18 +189,21 @@ def _beta_lookup(underlyings, ticker: Optional[str], field_name: str) -> Optiona
 
 def _sector_of(underlyings, ticker: Optional[str]) -> str:
     """GICS sector for one underlying — 'Unclassified' when the snapshot/name/field
-    is absent or blank. Mirrors the diagnostics fallback so the two bases never
-    disagree on a name's sector."""
+    is absent or blank, except index underliers ("… Index" tickers, which carry
+    no GICS sector by nature) — those read "Index", not missing-data. Mirrors
+    the client-profile fallback so the two bases never disagree on a name's
+    sector."""
     val = _cell_lookup(underlyings, ticker, SECTOR_FIELD)
+    fallback = "Index" if str(ticker or "").strip().endswith(" Index") else "Unclassified"
     if val is None:
-        return "Unclassified"
+        return fallback
     try:
         if pd.isna(val):
-            return "Unclassified"
+            return fallback
     except (TypeError, ValueError):
         pass
     s = str(val).strip()
-    return s or "Unclassified"
+    return s or fallback
 
 
 def _new_acc() -> dict:

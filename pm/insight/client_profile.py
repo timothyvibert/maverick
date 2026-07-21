@@ -116,28 +116,32 @@ _ROLL_LOW = 0.25           # roll-like share below this reads "closes_early"
 
 def _sector_of(underlyings, ticker: Optional[str]) -> str:
     """GICS sector for one underlying (in BBG-ticker form), or 'Unclassified'
-    when the snapshot, name, or field is absent or blank — never raises."""
+    when the snapshot, name, or field is absent or blank — never raises. Index
+    underliers ("… Index" tickers) carry no GICS sector by nature and read
+    "Index", not missing-data (kept identical to the exposure helper)."""
+    fallback = ("Index" if str(ticker or "").strip().endswith(" Index")
+                else UNCLASSIFIED)
     if underlyings is None or not ticker:
-        return UNCLASSIFIED
+        return fallback
     try:
         if SECTOR_FIELD not in getattr(underlyings, "columns", []):
-            return UNCLASSIFIED
+            return fallback
         if ticker not in underlyings.index:
-            return UNCLASSIFIED
+            return fallback
         val = underlyings.loc[ticker, SECTOR_FIELD]
     except Exception:
-        return UNCLASSIFIED
+        return fallback
     # A duplicated index yields a Series — take the first row defensively.
     if hasattr(val, "iloc"):
         val = val.iloc[0] if len(val) else None
     if val is None:
-        return UNCLASSIFIED
+        return fallback
     try:
         if pd.isna(val):
-            return UNCLASSIFIED
+            return fallback
     except (TypeError, ValueError):
         pass
-    return str(val).strip() or UNCLASSIFIED
+    return str(val).strip() or fallback
 
 
 # ---------------------------------------------------------------------------
