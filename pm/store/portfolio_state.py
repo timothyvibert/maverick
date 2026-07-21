@@ -153,6 +153,13 @@ class PortfolioState:
     # Freshly empty each load, so a reload (which swaps in a new PortfolioState) drops
     # every cached slice — the marks never survive a Refresh stale.
     slice_cache: dict = field(default_factory=dict)
+    # Structured alert-coverage gaps from the insight engine's stale-skip pass:
+    # {account: {n_not_evaluated, n_patterns, gaps: [{pattern, signal, n_names}]}}.
+    # Written whole by run_insight_engine each run (never merged), so the
+    # threshold recompute replaces it exactly like the [insight] load notes.
+    # Feeds the status bar's not-evaluated coverage chip; empty when every
+    # pattern evaluated (the BBG-up clean load).
+    insight_skips: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

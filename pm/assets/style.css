@@ -215,6 +215,16 @@ html, body {
     color: var(--pm-grey-500); font-weight: 600; text-align: left;
 }
 .status-muted-patterns:hover { text-decoration: underline; }
+/* Alert-coverage honesty cue — patterns the engine could not evaluate (missing
+   or stale required signals) are counted, never silently absent from the fire
+   totals; amber when Bloomberg is the reason. Clicking opens the Alert
+   Manager's Load notes tab. Same button-chrome reset as the notes cluster. */
+.status-skips {
+    background: none; border: none; padding: 0; font: inherit; cursor: pointer;
+    color: var(--pm-grey-500); font-weight: 600; text-align: left;
+}
+.status-skips:hover { text-decoration: underline; }
+.status-skips-urgent { color: var(--pm-urgent); }
 .status-load-note-chip { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
 .status-load-urgent { color: var(--pm-urgent); font-weight: 600; }
 .status-load-more { color: var(--pm-grey-500); font-weight: 600; flex: none; }

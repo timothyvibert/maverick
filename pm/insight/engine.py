@@ -93,6 +93,7 @@ def run_insight_engine(
     config = config or PatternConfig()
     all_fires: list[Fire] = []
     skip_warnings: list[str] = []
+    skips_by_account: dict[str, dict] = {}
 
     iv_histories = getattr(state, "iv_histories", {}) or {}
     analyst_data_by_ticker = getattr(state, "analyst_data_by_ticker", {}) or {}
@@ -186,6 +187,17 @@ def run_insight_engine(
                 f"[insight] {account_id}: {pid} not evaluated on "
                 f"{len(names)} {noun} — {sid} unavailable"
             )
+        if by_gap:
+            # Structured form of the same gaps, for the status-bar coverage
+            # chip: (pattern, name) deduped so one dark name skipped by two
+            # required signals counts once.
+            skips_by_account[account_id] = {
+                "n_not_evaluated": len({(pid, nm) for (pid, _sid), nms in by_gap.items()
+                                        for nm in nms}),
+                "n_patterns": len({pid for (pid, _sid) in by_gap}),
+                "gaps": [{"pattern": pid, "signal": sid, "n_names": len(nms)}
+                         for (pid, sid), nms in sorted(by_gap.items())],
+            }
 
     # ---- Stage 4: stale-skip warnings ------------------------------------
     # Replace this engine's previous notes rather than stacking them: a
@@ -198,5 +210,7 @@ def run_insight_engine(
         rest = len(skip_warnings) - len(cap)
         if rest > 0:
             state.all_warnings.append(f"[insight] … and {rest} more skip warning(s).")
+    # Whole-run product, assigned not merged — the recompute replaces it.
+    state.insight_skips = skips_by_account
 
     return all_fires

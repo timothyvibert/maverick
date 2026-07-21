@@ -481,15 +481,17 @@ def register_callbacks(app: dash.Dash) -> None:
         Input("alert-manager-open-btn", "n_clicks"),
         Input("status-load-notes-btn", "n_clicks"),
         Input("status-muted-patterns-btn", "n_clicks"),
+        Input("status-skips-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _open_alert_manager(_n, _notes_n, _pat_n):
+    def _open_alert_manager(_n, _notes_n, _pat_n, _skips_n):
         # The status-bar host is re-rendered on every load, recreating the notes
         # button with n_clicks=0 — guard the spurious (re)creation fire.
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
             return (no_update,) * 6
         tab = {"status-load-notes-btn": "loadnotes",
-               "status-muted-patterns-btn": "patterns"}.get(ctx.triggered_id, "suppressed")
+               "status-muted-patterns-btn": "patterns",
+               "status-skips-btn": "loadnotes"}.get(ctx.triggered_id, "suppressed")
         s_cls, p_cls, t_cls, n_cls = _am_tab_classes(tab)
         return _AM_OPEN, render_alert_manager_body(tab), s_cls, p_cls, t_cls, n_cls
 

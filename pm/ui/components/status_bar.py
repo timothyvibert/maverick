@@ -39,6 +39,8 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
                         style={"display": "none"}),
             html.Button("", id="status-load-notes-btn", n_clicks=0,
                         style={"display": "none"}),
+            html.Button("", id="status-skips-btn", n_clicks=0,
+                        style={"display": "none"}),
         ], className="status-left status-empty")
 
     # Active alerts only: a suppressed/snoozed fire is excluded from every
@@ -96,6 +98,36 @@ def render_status_bar(state: Optional[PortfolioState]) -> html.Div:
         style=({} if disabled else {"display": "none"}),
         title=(f"{detail}\n\nClick to review or turn patterns back on."
                if disabled else ""),
+    ))
+
+    # Alert-coverage honesty cue: patterns the engine could NOT evaluate because
+    # a required signal was missing/stale (the stale-skip records). Without it
+    # the fire count silently understates under a market-data outage — the blind
+    # spot is quantified here, amber when Bloomberg is the reason. Click opens
+    # the Alert Manager's Load notes tab (the full [insight] skip lines).
+    # ALWAYS rendered, hidden when every pattern evaluated (same
+    # nonexistent-Input hazard as the two chips below).
+    skips = getattr(state, "insight_skips", {}) or {}
+    n_not_eval = sum(v.get("n_not_evaluated", 0) for v in skips.values())
+    skip_label = ""
+    skip_title = ""
+    if n_not_eval:
+        noun = "alert" if n_not_eval == 1 else "alerts"
+        skip_label = f"{n_not_eval} {noun} not evaluated"
+        if not state.bloomberg_ok:
+            skip_label += " — market data missing"
+        detail_lines = [
+            f"{acct}: {g['pattern']} on {g['n_names']} name(s) — {g['signal']} unavailable"
+            for acct, v in sorted(skips.items()) for g in v.get("gaps", [])
+        ]
+        skip_title = ("\n".join(detail_lines)
+                      + "\n\nClick to open the full list on the Load notes tab.")
+    items.append(html.Button(
+        skip_label, id="status-skips-btn", n_clicks=0,
+        className="status-item status-skips"
+        + (" status-skips-urgent" if (n_not_eval and not state.bloomberg_ok) else ""),
+        style=({} if n_not_eval else {"display": "none"}),
+        title=skip_title,
     ))
 
     # Load-time notes (header aliasing, missing/optional columns, skipped rows,
