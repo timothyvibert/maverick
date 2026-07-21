@@ -25,6 +25,22 @@ DEFAULT_RISK_FREE_RATE = 0.04
 # options can differ but they don't appear in the holdings file.
 OPTION_CONTRACT_MULTIPLIER = 100
 
+# ---------- Cash-equivalent funds ----------
+# Fund/ETF symbols the desk ASSERTS are cash-equivalents (money-market
+# vehicles): only these count toward the idle-cash check's cash bucket. A fund
+# not named here is invested capital, never idle cash — a sector or crypto ETF
+# must not read as a balance awaiting deployment. Empty until the desk names
+# one; extend by symbol as they appear in books.
+CASH_EQUIVALENT_TICKERS: tuple[str, ...] = ()
+
+# ---------- Index underliers ----------
+# Option roots whose underlier is an INDEX, not a stock: the extract carries no
+# instrument-type signal for these, so an explicit allowlist is the honest
+# source. A mapped root builds "<root> Index" (and its options carry the Index
+# sector) instead of the equity-shaped default. Extend as index positions
+# appear in books.
+INDEX_UNDERLIERS: tuple[str, ...] = ("SPX", "NDX", "RUT", "VIX", "XSP", "DJX", "OEX")
+
 # ---------- Non-US underlying detection ----------
 NON_US_STYLE_VALUES = {"Eurozone", "Europe", "UK", "Switzerland", "Japan"}
 # CINS CUSIPs start with a letter (CINS country code). US CUSIPs start with a digit.

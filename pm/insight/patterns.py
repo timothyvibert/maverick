@@ -565,7 +565,9 @@ def detect_p5(
                            pattern_id="P5", entity=_entity(position))
     if captured is None or dte is None:
         return None
-    if dte > config.p5_dte_max or captured < config.p5_captured_min:
+    # dte >= 0: an already-expired row cannot be harvested/rolled — the house
+    # convention (P17/P19/P22 all floor at expiry; ingest tags the expired row).
+    if dte < 0 or dte > config.p5_dte_max or captured < config.p5_captured_min:
         return None
 
     # Determine direction words from option type + moneyness.
@@ -629,10 +631,13 @@ def detect_p6(
     dte = _signal_value(signals, "option_dte")
     if pnl_pct is None:
         return None
-    # Path A: pnl ≤ -100% AND dte ≤ 60 (short option only)
-    # Path B: pnl ≤ -200%, any DTE (any option)
+    # Path A: pnl ≤ -100% AND 0 ≤ dte ≤ 60 (short option only) — the roll/time-
+    # pressure read needs a live contract (dte >= 0, the P17/P19/P22 convention).
+    # Path B: pnl ≤ -200%, ANY dte incl. expired (any option) — deliberately
+    # unfloored: an expired deep-underwater short is a pending assignment
+    # liability the catch-all must keep surfacing.
     path_a = (_is_short_option(position) and pnl_pct <= config.p6_pnl_pct_max
-              and dte is not None and dte <= config.p6_dte_max)
+              and dte is not None and 0 <= dte <= config.p6_dte_max)
     path_b = pnl_pct <= config.p6_extreme_pnl_pct_max
     if not (path_a or path_b):
         return None
@@ -1015,10 +1020,17 @@ def detect_p11_account(account_state, config: PatternConfig) -> list[Fire]:
     if days_since_trade is not None and days_since_trade < config.p11_idle_days_min:
         return []
 
+    # "Cash" means cash: a fund/ETF is invested capital, not idle balance (the
+    # review's BTC-ETF-reads-as-cash case). A fund counts only when the desk has
+    # asserted it cash-equivalent by name (money-market vehicles) in config.
+    from pm.config import CASH_EQUIVALENT_TICKERS
     cash_total = sum(
         abs(p.market_value)
         for p in account_state.positions
-        if p.asset_class in ("cash", "fund_etf") and p.market_value is not None
+        if p.market_value is not None
+        and (p.asset_class == "cash"
+             or (p.asset_class == "fund_etf"
+                 and (p.symbol or "") in CASH_EQUIVALENT_TICKERS))
     )
     cash_pct = cash_total / account_state.nav if account_state.nav else 0.0
     if cash_pct < config.p11_cash_pct_min:
@@ -1044,7 +1056,9 @@ def detect_p11_account(account_state, config: PatternConfig) -> list[Fire]:
             "idle_days_min": config.p11_idle_days_min,
             "cash_pct_min": config.p11_cash_pct_min,
         },
-        computation="days_since_trade ≥ 15 AND cash_pct ≥ 5%",
+        computation=(f"days_since_trade ≥ {config.p11_idle_days_min} AND cash_pct ≥ "
+                     f"{config.p11_cash_pct_min:.0%}; cash = asset_class 'cash' plus "
+                     "config-asserted cash-equivalent funds only"),
         fire_result={"days_since_trade": days_since_trade, "cash_pct": cash_pct,
                       "fired": True},
         template_variables={**lv, **rv},
@@ -1355,8 +1369,10 @@ def detect_p15(
     sign = "-" if mv < 0 else ""
     position_value_signed = f"{sign}${abs(mv):,.0f}"
 
-    # Earnings context — emitted only when earnings are within 14 BD (per spec).
-    if days_to_earn is not None and days_to_earn <= 14:
+    # Earnings context — emitted only when earnings are AHEAD within 14 BD (per
+    # spec; 0 <= floor matches P14's convention so a past report date can never
+    # render "Earnings in -2 business days").
+    if days_to_earn is not None and 0 <= days_to_earn <= 14:
         earnings_context_sentence = f"Earnings in {days_to_earn} business days. "
     else:
         earnings_context_sentence = ""
