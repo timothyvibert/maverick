@@ -126,6 +126,43 @@ def _type_label_live(s, account_state):
 _STATUS_LABEL = {"proposed": "Proposed", "confirmed": "Confirmed",
                  "edited": "Confirmed (edited)", "rejected": "Rejected"}
 
+# Minimal per-type leg-shape requirements for the EDITED integrity check: a
+# leg-set filter can hollow a structure below what its type label promises
+# (a covered call without its stock, a collar without its put) — the stored
+# type is deliberately kept (the user chose the edit), but the label must stop
+# over-claiming. Types not listed carry no check (composition too variable for
+# a cheap role test). Display-time only; no stored-state change.
+_TYPE_REQUIRED_ROLES = {
+    S.COVERED_CALL: {"long_stock", "short_call"},
+    S.COLLAR: {"long_stock", "short_call", "long_put"},
+    S.COVERED_PUT: {"short_stock", "short_put"},
+    S.MARRIED_PUT: {"long_stock", "long_put"},
+    S.CASH_SECURED_PUT: {"short_put"},
+}
+
+_EDITED_SHAPE_NOTE = "edited — legs no longer match type"
+
+
+def _edited_shape_broken(s) -> bool:
+    """True when an EDITED structure's surviving legs miss a role its type
+    label requires. Pure read of the legs; unlisted types never flag."""
+    if getattr(s, "status", None) != "edited":
+        return False
+    required = _TYPE_REQUIRED_ROLES.get(getattr(s, "type", None))
+    if not required:
+        return False
+    roles = {getattr(l, "role", None) for l in (getattr(s, "legs", None) or [])}
+    return not required.issubset(roles)
+
+
+def _status_label_live(s) -> str:
+    """The Status cell text, with the edited-integrity qualifier appended when
+    the surviving legs no longer satisfy the type."""
+    label = _STATUS_LABEL.get(s.status, s.status)
+    if _edited_shape_broken(s):
+        return f"{label} ⚠ {_EDITED_SHAPE_NOTE}"
+    return label
+
 
 # ---------------------------------------------------------------------------
 # Small formatters (Python-side, for the modal)
@@ -255,7 +292,7 @@ def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None
         "label": label,
         "label_tip": tip or label,
         "band": _BAND_LABEL.get(s.confidence_band, s.confidence_band),
-        "status": _STATUS_LABEL.get(s.status, s.status),
+        "status": _status_label_live(s),
         "strikes": _strikes_str(e["strikes"]),
         "expiry": _expiries_str(e["expiries"]),
         "dte": _nearest_dte(e["expiries"]),
@@ -511,7 +548,7 @@ def _single_detail(account, s, structures, by_id, t2=None, account_state=None) -
         html.Span(f"{type_label} · {s.underlying}",
                   className="struct-card-title", title=tip or None),
         _chip(s.confidence_band),
-        html.Span(_STATUS_LABEL.get(s.status, s.status),
+        html.Span(_status_label_live(s),
                   className="struct-confirmed-by" if confirmed else "struct-status-proposed"),
     ]
     if confirmed and s.resolved_at:

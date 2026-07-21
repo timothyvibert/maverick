@@ -1083,6 +1083,17 @@ def _detect_for_underlying(
         typ = COVERED_PUT if is_covered else CASH_SECURED_PUT
         contracts = sum(int(abs(opt_rem[o.position_id])) for o in short_puts)
         legs = [StructureLeg(o.position_id, opt_rem[o.position_id], "short_put") for o in short_puts]
+        if is_covered and stock_pid is not None:
+            # The hedge the label promises: allocate the covering short-stock
+            # slice (mirroring the covered-call pass) so tier-2 / payoff price
+            # the COMBINED position — profits toward zero, unbounded loss on the
+            # upside via the short stock — never a naked short put.
+            deliverable = sum(int(abs(opt_rem[o.position_id])) * _opt_mult(o)
+                              for o in short_puts)
+            covered_shares = min(abs(stock_rem), deliverable)
+            if covered_shares > 0:
+                legs.append(StructureLeg(stock_pid, -covered_shares, "short_stock"))
+                stock_rem += covered_shares
         put_sweep = Structure(
             structure_id=_sid(account, underlying, typ, [l.position_id for l in legs]),
             account=account, underlying=underlying, type=typ, confidence_band=HIGH,
