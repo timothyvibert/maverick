@@ -145,13 +145,16 @@ def _identity(pos) -> str:
     return f"{name} · {pos.asset_class}"
 
 
-def _stamp(pulled_at, kind) -> str:
+def _stamp(pulled_at, kind, spot_asof=None) -> str:
     if pulled_at is None:
         # The overlay path prices off the morning snapshot, not a stamped chain pull.
         return "spot from snapshot" if (kind and kind != "option") else "—"
     mins = int((datetime.now() - pulled_at).total_seconds() // 60)
     rel = "just now" if mins <= 0 else ("1 min ago" if mins == 1 else f"{mins} min ago")
-    return f"pulled {rel} · this name only"
+    # The spot's own as-of, disclosed beside the pull time: "live" means the
+    # underlier rode in the same snapshot request as the candidate quotes.
+    spot_note = {"live": " · spot live", "snapshot": " · spot from morning snapshot"}.get(spot_asof, "")
+    return f"pulled {rel} · this name only{spot_note}"
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +503,7 @@ def _scan_view(account, position_id, *, active_hint=None, expiry_hint=None, refr
     contracts = data.get("contracts") or []
     surface, spot, held_strike = data.get("surface"), data.get("spot"), data.get("held_strike")
     objectives = _ordered_objectives(ranked)
-    stamp = _stamp(data.get("pulled_at"), data.get("kind"))
+    stamp = _stamp(data.get("pulled_at"), data.get("kind"), data.get("spot_asof"))
     exp_opts = _expiry_options(contracts)
     exp_val = (expiry_hint if any(o["value"] == expiry_hint for o in exp_opts)
                else (exp_opts[0]["value"] if exp_opts else None))

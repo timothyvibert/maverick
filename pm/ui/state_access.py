@@ -333,8 +333,11 @@ def pull_slice(
     snapshots the survivors. The held leg's own greeks/IV come from the morning snapshot
     and are never re-pulled here — this fetches candidate contracts only.
 
-    Returns ``{key, underlier, candidates, df, spot, pulled_at}`` or ``None`` (no state /
-    position / spot, or Bloomberg off). ``refresh`` re-snapshots with fresh greeks/IV
+    Returns ``{key, underlier, candidates, df, spot, spot_asof, pulled_at}`` or ``None``
+    (no state / position / spot, or Bloomberg off). ``spot`` is the underlier's live
+    PX_LAST fetched in the same snapshot request as the candidates (``spot_asof ==
+    "live"``); it falls back to the morning-snapshot spot (``"snapshot"``) when the
+    fetch cannot supply it. ``refresh`` re-snapshots with fresh greeks/IV
     (reusing the cached chain); ``refresh_chain`` additionally re-enumerates the chain.
     Re-opening the same window without ``refresh`` is a cache hit — no Bloomberg call."""
     state = _RUNTIME.get("state")
@@ -379,14 +382,31 @@ def pull_slice(
     )
 
     from pm.core.bloomberg_client import fetch_option_snapshots
-    df = fetch_option_snapshots(candidates) if candidates else None
+    df = None
+    spot_asof = "snapshot"
+    if candidates:
+        # The underlier rides in the SAME batched snapshot request (one extra
+        # security, no extra round trip): its live PX_LAST re-anchors the slice
+        # spot so the candidate quotes and the spot they price against are
+        # contemporaneous. The chain window above is still cut on the
+        # morning-snapshot spot — the fresh value only exists once this fetch
+        # returns. On any fetch failure (empty frame, missing row/field) the
+        # snapshot spot stands and the stamp says so.
+        df = fetch_option_snapshots(list(candidates) + [underlier])
+        if df is not None and underlier in df.index:
+            live_spot = coerce_float(df.loc[underlier].get("PX_LAST"))
+            df = df.drop(index=underlier)
+            if live_spot is not None and live_spot > 0:
+                spot = live_spot
+                spot_asof = "live"
 
     # Surface + IV+pp (a read-only derivation of the cached slice) and IV-rank (a
     # name-level metric cached beside the chain). Best-effort — a fit failure must not
-    # break the slice pull.
+    # break the slice pull. Both price against the (freshened) slice spot.
     surface, iv_pp = _slice_surface(acc, underlier, spot, df)
     result = {"key": key, "underlier": underlier, "candidates": candidates,
-              "df": df, "spot": spot, "pulled_at": datetime.now(),
+              "df": df, "spot": spot, "spot_asof": spot_asof,
+              "pulled_at": datetime.now(),
               "surface": surface, "iv_pp": iv_pp,
               "iv_rank": _slice_iv_rank(state, acc, underlier)}
     slices[key] = result
@@ -683,7 +703,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
     if ranked is None:
         return None
 
-    pulled_at = spot = underlier = None
+    pulled_at = spot = underlier = spot_asof = None
     df = surface = iv_pp = None
     if pos.asset_class == "option":
         sl = pull_slice(account, position_id, n_expiries=n_expiries)   # cache hit after the rank
@@ -691,6 +711,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
             pulled_at, spot, underlier, df = (sl.get("pulled_at"), sl.get("spot"),
                                               sl.get("underlier"), sl.get("df"))
             surface, iv_pp = sl.get("surface"), sl.get("iv_pp")
+            spot_asof = sl.get("spot_asof")
     else:
         underlier = pos.bbg_ticker
         spot = _spot_from_snapshot(acc, pos.bbg_ticker)
@@ -698,6 +719,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
 
     metrics = _contract_metrics(df)
     return {"ranked": ranked, "pulled_at": pulled_at, "spot": spot,
+            "spot_asof": spot_asof,
             "underlier": underlier, "kind": pos.asset_class,
             "contract_metrics": metrics, "surface": surface, "iv_pp": iv_pp,
             "contracts": _slice_contracts(df, iv_pp, metrics),
