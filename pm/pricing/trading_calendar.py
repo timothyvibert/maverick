@@ -1,12 +1,14 @@
 """NYSE full-day holiday calendar, generated from the exchange's published rules.
 
-Staged for the holiday-aware tenor day-count: the live probe (four non-dividend
-names, ATM calls and puts, expiries bracketing Labor Day and Thanksgiving)
-showed the terminal's option clock excludes exchange holidays, while
-``conventions.year_frac`` counts plain weekdays. ``year_frac`` is pinned in the
-byte-identical gate, so wiring this calendar into it is a baseline-recapture
-epoch; until that recapture is signed off, NOTHING in the pricing package
-consumes this module. It is additive and output-identical by construction.
+Consumed by the tenor day-count (``conventions.year_frac``): the live probe
+(four non-dividend names, ATM calls and puts, expiries bracketing Labor Day
+and Thanksgiving) showed the terminal's option clock excludes exchange
+holidays, while a plain weekday count overstates the tenor by one day per
+holiday spanned. ``year_frac`` is pinned in the byte-identical gate, so wiring
+this calendar in was a baseline-recapture boundary: the date-bearing baseline
+entries were re-pinned when the wiring landed (2026-07-20), every other entry
+kept its prior pinned value, and the outgoing baseline is archived beside the
+live fixture.
 
 Why a rules generator, not a static list or an external source: NYSE holidays
 are deterministic functions of the year (fixed dates, nth-weekday rules, and
@@ -105,7 +107,8 @@ def nyse_holidays(year: int) -> tuple[dt.date, ...]:
 
 def holidays_between(start: dt.date, end: dt.date) -> tuple[dt.date, ...]:
     """NYSE holidays in the half-open window [start, end) — the same window
-    convention as ``np.busday_count(start, end)``, so the epoch wiring is
+    convention as ``np.busday_count(start, end)``; ``conventions.year_frac``
+    consumes this as
     ``np.busday_count(start, end, holidays=holidays_between(start, end))``."""
     if end <= start:
         return ()

@@ -10,7 +10,11 @@ import math
 import numpy as np
 import pandas as pd
 
-# Option-engine tenor day-count: business days / 252, matching Bloomberg OVME.
+from pm.pricing.trading_calendar import holidays_between
+
+# Option-engine tenor day-count: NYSE trading days / 252. The terminal's option
+# clock excludes exchange holidays as well as weekends (probed live, side by
+# side); plain weekday counting overstates the tenor by one day per holiday.
 DAYS_PER_YEAR = 252
 
 
@@ -46,8 +50,16 @@ def norm_pdf(x):
 
 
 def year_frac(today, expiry):
-    """Years-to-expiry as a business-day fraction (busday_count / 252), the
-    single tenor entry point for option pricing (OVME-match day-count).
+    """Years-to-expiry as a trading-day fraction — NYSE trading days in
+    [today, expiry) divided by 252 — the single tenor entry point for option
+    pricing.
+
+    Trading days exclude weekends AND NYSE full-day holidays
+    (``trading_calendar.holidays_between``, same half-open window as
+    ``np.busday_count``). This matches the terminal's option clock: a live
+    side-by-side showed it excludes exchange holidays, so the earlier plain
+    weekday count overstated T by one day per holiday spanned. Unscheduled
+    exchange closures are not captured — see the trading_calendar module note.
 
     Returns 0.0 if expiry <= today; callers requiring strictly positive T clamp
     to a small floor (production call sites use 1e-4).
@@ -56,4 +68,5 @@ def year_frac(today, expiry):
     expiry = pd.Timestamp(expiry).normalize().date()
     if expiry <= today:
         return 0.0
-    return np.busday_count(today, expiry) / DAYS_PER_YEAR
+    holidays = holidays_between(today, expiry)
+    return np.busday_count(today, expiry, holidays=list(holidays)) / DAYS_PER_YEAR
