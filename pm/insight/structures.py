@@ -99,12 +99,16 @@ DIAGONAL = "diagonal"            # PMCC is a render-time qualifier on this type
 # Leg role (not a type): the uncovered short-put analog of naked_excess_short_call.
 NAKED_EXCESS_SHORT_PUT = "naked_excess_short_put"
 
-# New-suite types whose structural HIGH band demotes to MEDIUM while sibling
-# option legs on the same underlying remain unexplained (never over-claim a
-# structure on a partial read; co-opened legs keep their trade-corroborated band).
+# Types whose structural HIGH band demotes to MEDIUM while sibling option legs
+# on the same underlying remain unexplained (never over-claim a structure on a
+# partial read; co-opened legs keep their trade-corroborated band). The pass-5
+# put sweep is included: a leftover short put beside an unexplained sibling leg
+# (e.g. the long call of a cross-expiry risk reversal no pair spec can claim)
+# may be that combination's financing side, not an income put — its HIGH is
+# structural only, so it demotes like an uncorroborated combo.
 _SIBLING_DEMOTABLE = {BOX, IRON_BUTTERFLY, IRON_CONDOR, CONDOR, DOUBLE_DIAGONAL,
                       JELLY_ROLL, CONVERSION, REVERSAL, BUTTERFLY, JADE_LIZARD,
-                      LADDER, MARRIED_PUT}
+                      LADDER, MARRIED_PUT, CASH_SECURED_PUT, COVERED_PUT}
 
 _MULT = 100  # standard option contract multiplier (the fallback)
 _OPEN_ACTIONS = {"Buy to Open", "Sell to Open"}
@@ -1079,7 +1083,7 @@ def _detect_for_underlying(
         typ = COVERED_PUT if is_covered else CASH_SECURED_PUT
         contracts = sum(int(abs(opt_rem[o.position_id])) for o in short_puts)
         legs = [StructureLeg(o.position_id, opt_rem[o.position_id], "short_put") for o in short_puts]
-        out.append(Structure(
+        put_sweep = Structure(
             structure_id=_sid(account, underlying, typ, [l.position_id for l in legs]),
             account=account, underlying=underlying, type=typ, confidence_band=HIGH,
             status="proposed", legs=legs,
@@ -1089,7 +1093,12 @@ def _detect_for_underlying(
                 f"short {contracts} {underlying} put(s)"
                 + (" against short stock" if is_covered else " (income posture; no stock leg)"),
                 typ),
-            source=f"detector:{typ}"))
+            source=f"detector:{typ}")
+        out.append(put_sweep)
+        if typ in _SIBLING_DEMOTABLE:
+            # A sweep has no co-opening corroboration, so its HIGH is structural
+            # only — pass 9 demotes it while unexplained sibling legs remain.
+            demotable.append(put_sweep)
         for o in short_puts:
             opt_rem[o.position_id] = 0.0
 
