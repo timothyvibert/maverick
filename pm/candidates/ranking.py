@@ -141,8 +141,28 @@ def _avg_rank_percentile(values) -> list:
 # Objective driver + reason
 # ---------------------------------------------------------------------------
 
-# Tenor weight for the up-and-out relief driver: added days scaled into strike-$ units.
+# Tenor weight for the away-and-out relief driver: added days scaled into strike-$ units.
 _OUT_W = 0.05
+
+# Dollar scale of the costless solve's cap tie-break. The priced max_profit maps
+# through 0.5 + 0.4·x/(|x|+_CAP_SCALE) into (0.1, 0.9) strictly; unbounded gain sits
+# at 0.95, missing economics at 0.0. Total spread ≤ 0.95 — STRICTLY below the 1-day
+# tenor step — so nearest-term ordering is exactly lexicographic even when caps
+# straddle sign (an underwater covered call's caps are negative), and within a day:
+# unpriced < every real cap < unbounded.
+_CAP_SCALE = 10_000.0
+
+
+def _cap_term(cand) -> float:
+    e = getattr(cand, "economics", None)
+    if not e:
+        return 0.0
+    if e.get("unbounded_gain"):
+        return 0.95
+    cap = _num(e.get("max_profit"))
+    if cap is None:
+        return 0.0
+    return 0.5 + 0.4 * cap / (abs(cap) + _CAP_SCALE)
 
 
 def _opt_legs(cand) -> list:
@@ -174,14 +194,26 @@ def _cand_dte(cand) -> Optional[float]:
     return _num((getattr(cand, "economics", None) or {}).get("dte"))
 
 
+def _away(cand, held) -> float:
+    """The away-from-the-money direction for the rolled leg: calls +1 (higher
+    strikes), puts −1 (lower) — for a short leg the assignment-risk-reducing
+    move, for a long leg the premium-at-risk-reducing one. Keyed on the OPENED
+    leg's right (same as the held leg's on a roll), so overlays need no held."""
+    opts = _opt_legs(cand)
+    right = (opts[0].get("opt_type") if opts else None) or (held or {}).get("right")
+    return -1.0 if str(right).upper().startswith("P") else 1.0
+
+
 def _relief(cand, held) -> Optional[float]:
-    """Up-and-out relief — strike increase plus scaled added tenor. The driver for the
-    Roll up & out and Costless objectives (higher = more room bought)."""
+    """Away-and-out relief — strike distance in the money-reducing direction plus
+    scaled added tenor. The driver for the Roll away & out objective (higher =
+    more room bought)."""
     nk = _new_strike(cand)
     hk = _num((held or {}).get("strike"))
     dte = _cand_dte(cand)
     hdte = _num((held or {}).get("dte"))
-    strike_relief = (nk - hk) if (nk is not None and hk is not None) else 0.0
+    strike_relief = ((nk - hk) * _away(cand, held)
+                     if (nk is not None and hk is not None) else 0.0)
     tenor = _OUT_W * ((dte - hdte) if (dte is not None and hdte is not None) else 0.0)
     return strike_relief + tenor
 
@@ -189,15 +221,26 @@ def _relief(cand, held) -> Optional[float]:
 def _driver(cand, objective, held) -> Optional[float]:
     """The single objective driver, oriented so higher is always better."""
     if objective == MAX_PREMIUM:
-        # Credit per dollar of cap surrendered (the new strike) — not raw credit.
+        # Calls: credit per dollar of cap surrendered (the new strike). Puts: raw
+        # credit — a put's strike is no surrendered upside, so no normalization.
         nc = _num(getattr(cand, "net_credit", None))
+        if _away(cand, held) < 0:
+            return nc
         k = _new_strike(cand)
         return (nc / k) if (nc is not None and k) else nc
     if objective in (ROLL_FOR_CREDIT, ADD_HEDGE):
         # roll-for-credit = raw credit collected; add-hedge = cheaper/financed protection.
         return _num(getattr(cand, "net_credit", None))
-    if objective in (ROLL_UP_OUT, COSTLESS):
+    if objective == ROLL_UP_OUT:
         return _relief(cand, held)
+    if objective == COSTLESS:
+        # The costless solve: NEAREST expiry first; the priced upside cap
+        # (economics.max_profit — never a raw strike) breaks ties within a day.
+        # Strictly lexicographic — see _cap_term's bounds.
+        dte = _cand_dte(cand)
+        if dte is None:
+            return None
+        return -dte + _cap_term(cand)
     if objective == EXTEND_DURATION:
         return _cand_dte(cand)                       # more tenor on the rolled leg
     if objective == DEFEND_CUT_DELTA:
@@ -215,7 +258,9 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
     if driver is None:
         return None
     if objective in (ROLL_FOR_CREDIT, MAX_PREMIUM):
-        return f"{_money(driver)} net credit ({_pctl(pct)})"
+        # Always the transaction's dollars — the max-premium CALL driver is a
+        # credit-per-$-of-cap ratio and must not render as money.
+        return f"{_money(_num(getattr(cand, 'net_credit', None)))} net credit ({_pctl(pct)})"
     if objective == ADD_HEDGE:
         return f"{_money(driver)} to establish ({_pctl(pct)})"
     if objective == EXTEND_DURATION:
@@ -223,12 +268,18 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
         held_dte = (held or {}).get("dte")
         added = f", +{dte - int(held_dte)}d added" if held_dte is not None else ""
         return f"{dte}d to expiry{added} ({_pctl(pct)})"
-    if objective in (ROLL_UP_OUT, COSTLESS):
+    if objective == ROLL_UP_OUT:
         nk = _new_strike(cand)
         hk = _num((held or {}).get("strike"))
-        relief = f" +{nk - hk:g} strike" if (nk is not None and hk is not None) else ""
-        lead = "costless roll" if objective == COSTLESS else "up & out"
-        return f"{lead}{relief} ({_pctl(pct)})"
+        relief = f" {nk - hk:+g} strike" if (nk is not None and hk is not None) else ""
+        return f"away & out{relief} ({_pctl(pct)})"
+    if objective == COSTLESS:
+        dte = _cand_dte(cand)
+        e = getattr(cand, "economics", None) or {}
+        cap_txt = ("∞" if e.get("unbounded_gain")
+                   else _money(_num(e.get("max_profit"))))
+        dte_txt = f"{int(round(dte))}d" if dte is not None else "—"
+        return f"costless — {dte_txt} to expiry, cap {cap_txt} ({_pctl(pct)})"
     if objective == DEFEND_CUT_DELTA:
         nd = _num(getattr(cand, "new_leg_delta", None))
         hd = _num((held or {}).get("delta"))
@@ -393,8 +444,8 @@ def rank_candidates(candidates, *, objective, client_profile=None, iv_pp=None,
 
     ``candidates`` may contain other objectives — only those tagged ``objective`` are
     ranked. ``iv_pp`` is the slice's IV+pp rows (``[{ticker, iv_excess, ...}]``);
-    ``held`` is ``{delta, dte}`` for the held leg (rolls) or None (stock overlays).
-    Pure — no Bloomberg, no state writes."""
+    ``held`` is ``{delta, dte, strike, right}`` for the held leg (rolls) or None
+    (stock overlays). Pure — no Bloomberg, no state writes."""
     cands = [c for c in (candidates or []) if getattr(c, "objective", None) == objective]
     if not cands:
         return []

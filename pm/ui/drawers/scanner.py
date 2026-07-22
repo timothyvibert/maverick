@@ -27,7 +27,7 @@ from pm.ui.deepdive.aggregations import _fmt_money
 # Objective labels + the order the pills read in (the recommender seed picks the default,
 # the pills override). Any objective the ranker emits that is not listed still shows.
 _OBJ_LABEL = {
-    "roll-up-out": "Roll up & out",
+    "roll-up-out": "Roll away & out",
     "costless": "Costless",
     "roll-for-credit": "Roll for credit",
     "defend-cut-delta": "Defend / cut Δ",
@@ -174,20 +174,22 @@ def _ordered_objectives(ranked) -> list:
 
 def _seed_objective(account, position_id, objectives) -> str:
     """The default pill, in priority order: the held option's moneyness (an ITM short
-    call leads with Roll up & out, an OTM one with Max premium), then the recommender's
+    call leads with Roll away & out, an OTM one with Max premium), then the recommender's
     action, then the first present objective. Best-effort — any gap falls back cleanly."""
     try:
         state = sa.get_state()
         acc = state.accounts.get(account) if state else None
         pos = sa.position_by_id(state, account, position_id) if state else None
         if acc is not None and pos is not None:
-            # Moneyness lead — a held short call: ITM (spot above strike) -> roll up & out;
-            # OTM -> collect premium.
+            # Moneyness lead — a held SHORT option: ITM -> roll away & out (calls:
+            # spot above strike; puts: spot below); OTM -> collect premium.
+            right = (pos.right or "").upper()
             if (getattr(pos, "asset_class", None) == "option" and pos.strike is not None
-                    and (pos.right or "").upper() == "CALL" and (pos.quantity or 0) < 0):
+                    and right in ("CALL", "PUT") and (pos.quantity or 0) < 0):
                 spot = sa._spot_from_snapshot(acc, getattr(pos, "underlying_bbg_ticker", None))
                 if spot is not None:
-                    lead = "roll-up-out" if spot > pos.strike else "max-premium"
+                    itm = spot > pos.strike if right == "CALL" else spot < pos.strike
+                    lead = "roll-up-out" if itm else "max-premium"
                     if lead in objectives:
                         return lead
             tickers = {t for t in (getattr(pos, "bbg_ticker", None),

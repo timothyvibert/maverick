@@ -734,7 +734,7 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
         iv_pp = sl.get("iv_pp") if sl else None
         held = {"delta": _held_option_delta(acc, pos),
                 "dte": (pos.expiry - date.today()).days if pos.expiry else None,
-                "strike": pos.strike}
+                "strike": pos.strike, "right": pos.right}
 
     from pm.candidates.ranking import rank_candidates
     by_objective: dict = {}

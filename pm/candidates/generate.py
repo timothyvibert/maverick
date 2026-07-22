@@ -134,7 +134,8 @@ def _option_leg(sc: SliceContract, qty, spot, *, curve, r_scalar, q, today, role
     }
 
 
-def _stock_leg(qty, cost_basis_per_share, position_id="held_stock", role="long_stock") -> dict:
+def _stock_leg(qty, cost_basis_per_share, position_id="held_stock", role=None) -> dict:
+    role = role or ("long_stock" if (_num(qty) or 0) >= 0 else "short_stock")
     return {"opt_type": "Stock", "K": None, "expiry": None, "T": None, "sigma": None,
             "style": None, "qty": int(qty), "mid": None,
             "cost_basis": float(cost_basis_per_share), "r": None, "q": None,
@@ -268,11 +269,15 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
         return [(c, _roll_kind(held, c)) for _, c in scored[:cap]]
 
     if objective == ROLL_UP_OUT:
-        # Raise the strike AND extend — the ITM short-call workflow. The cap keeps the
-        # cheapest (near-costless) up-and-out rolls; the ranker orders by strike relief.
+        # Roll AWAY from the money AND extend — direction keyed on the rolled leg's
+        # right (calls: higher strikes; puts: lower), which for a short leg is
+        # exactly the assignment-risk-reducing move (the ITM-short workflow) and
+        # for a long leg the premium-at-risk-reducing one. The cap keeps the
+        # cheapest (near-costless) rolls; the ranker orders by directional relief.
+        away = 1.0 if held.right == "CALL" else -1.0
         picks = []
         for c in later:
-            if c.strike <= held.strike:
+            if (c.strike - held.strike) * away <= 0:
                 continue
             nm = _num(c.mid)
             cost = (abs(held_qty * (hm - nm) * _MULT)
@@ -282,6 +287,12 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
         return [(c, _roll_kind(held, c)) for _, c in picks[:cap]]
 
     if objective == COSTLESS:
+        # The costless solve: inside the band, NEAREST expiry first — the ranker
+        # then breaks ties within a day by the priced upside cap (max_profit).
+        # Nearest-term picks fill the cap slice before any farther expiry, so no
+        # NEARER-expiry candidate is ever discarded in favour of a farther one.
+        # (Within one overfull expiry the slice keeps the furthest-from-money
+        # strikes — a pre-pricing proxy; the band bounds what it can mis-keep.)
         band = _COSTLESS_PER_SHARE * _MULT * max(abs(held_qty), 1)
         picks = []
         for c in later:
@@ -289,10 +300,10 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
             if nm is None or hm is None:
                 continue
             if abs(held_qty * (hm - nm) * _MULT) <= band:
-                relief = (c.strike - held.strike) + 0.05 * (c.expiry - held.expiry).days
-                picks.append((relief, c))
-        picks.sort(key=lambda x: -x[0])
-        return [(c, _roll_kind(held, c)) for _, c in picks[:cap]]
+                picks.append(c)
+        away = 1.0 if held.right == "CALL" else -1.0
+        picks.sort(key=lambda c: (c.expiry, -(c.strike - held.strike) * away))
+        return [(c, _roll_kind(held, c)) for c in picks[:cap]]
 
     return []
 
@@ -375,10 +386,12 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
 def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
                         risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
                         today=None, cap=_CAP_DEFAULT) -> list:
-    """Single-leg (and collar) overlays on a held stock position: covered call
-    (max-premium), protective put and collar (add-hedge).
+    """Overlays on a held stock position. Long stock: covered call (max-premium),
+    protective put and collar (add-hedge). SHORT stock: the mirror income write —
+    the covered put (sell an OTM put against the short, max-premium); a hedge
+    (protective call) is deliberately not generated.
 
-    Overlays are sized to the POSITION: ``floor(shares / 100)`` contracts on
+    Overlays are sized to the POSITION: ``floor(|shares| / 100)`` contracts on
     every option leg, with ``net_credit`` scaled to match — one contract against
     a 1,000-share holding is not a covered call, and its economics/greeks/PoP
     would describe mostly-uncovered stock. The stock leg keeps the FULL share
@@ -386,12 +399,28 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
     honestly with its residual uncovered shares. Under 100 shares there is
     nothing writable — returns no candidates."""
     today = today or date.today()
-    n_contracts = int(_num(stock_shares) or 0) // 100
+    shares = _num(stock_shares) or 0
+    n_contracts = int(abs(shares)) // 100
     if n_contracts < 1:
         return []
     contracts = _parse_slice(slice_df)
     stock_leg = _stock_leg(stock_shares, stock_basis)
     kw = dict(spot=spot, curve=risk_free_curve, r_scalar=risk_free_rate, q=div_yield, today=today)
+
+    if shares < 0:
+        # Covered put (sell an at/below-spot put against short stock) — most
+        # premium first. The long-stock overlays don't apply to a short.
+        out = []
+        for c in sorted([c for c in contracts
+                         if c.right == "PUT" and c.strike <= spot and c.mid],
+                        key=lambda c: -(c.mid or 0))[:cap]:
+            leg = _option_leg(c, -n_contracts, role="short_put", **kw)
+            out.append(_finish(MAX_PREMIUM, "covered_put",
+                               f"covered put {c.strike:g} @ {c.expiry:%Y-%m-%d}",
+                               [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts,
+                               spot, today, new_leg=leg))
+        return out
+
     calls = [c for c in contracts if c.right == "CALL" and c.strike >= spot and c.mid]
     puts = [c for c in contracts if c.right == "PUT" and c.strike <= spot and c.mid]
     out = []
