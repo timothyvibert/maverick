@@ -126,11 +126,16 @@ def _breakevens(c) -> str:
 
 
 def _primary_leg(c):
-    """The candidate's contract for the Contract columns — its short option leg (the
-    roll/write target), else the first option leg. None for a stock-only candidate."""
+    """The candidate's contract for the Contract columns — the short option leg the
+    transaction OPENS (the roll/write target), else its first opened option leg. A
+    structure-anchored roll carries the enclosing structure's kept legs too; those
+    never key the row (a put-side roll must not key on the kept short call).
+    Candidates without the marker fall back over all option legs. None for a
+    stock-only candidate."""
     opts = [lg for lg in (getattr(c, "legs", None) or []) if lg.get("opt_type") in ("Call", "Put")]
-    shorts = [lg for lg in opts if (lg.get("qty") or 0) < 0]
-    return (shorts or opts or [None])[0]
+    pool = [lg for lg in opts if lg.get("opened")] or opts
+    shorts = [lg for lg in pool if (lg.get("qty") or 0) < 0]
+    return (shorts or pool or [None])[0]
 
 
 def _identity(pos) -> str:
@@ -430,8 +435,9 @@ def _smile_figure(contracts, surface, expiry_iso, spot, held_strike):
 def render_scanner(account: str, *, position_id: str, structure_id=None) -> html.Div:
     """The drawer body for ``view='scanner'``. Opens immediately with a placeholder; the
     one-shot ``scanner-load`` interval then pulls + fills the ranked candidates.
-    ``structure_id`` is reserved context — the candidates are position-anchored (covered
-    vs naked is already resolved in generation), so v1 does not read it.
+    ``structure_id`` is carried for the compare's current side; the drawer itself does
+    not read it — candidate generation resolves the enclosing structure in the service
+    layer, so a leg inside a structure already prices as the resulting structure.
 
     ``position_id=None`` (a structure with no scannable anchor — no short option
     leg and no stock leg, e.g. a long straddle) renders an explicit no-roll-target
@@ -516,12 +522,15 @@ def _empty_fig():
 
 
 def _scan_view(account, position_id, *, active_hint=None, expiry_hint=None, refresh=False,
-               n_expiries=_BASE_EXPIRIES):
+               n_expiries=_BASE_EXPIRIES, structure_id=sa.STRUCTURE_AUTO):
     """A fresh scanner read → all rendered pieces. Cheap on a cache hit (the ranking is
     cached at pull time), so pill/expiry switches don't re-price; a refresh re-pulls.
     ``active_hint`` keeps the objective across a refresh, ``expiry_hint`` the smile expiry,
-    ``n_expiries`` the active (base or expanded) slice window."""
-    data = sa.scanner_view_data(account, position_id, refresh=refresh, n_expiries=n_expiries)
+    ``n_expiries`` the active (base or expanded) slice window. ``structure_id`` is
+    drawer-state's, passed verbatim so the scan anchors on the SAME structure the
+    compare's current side prices (None = the leg standalone)."""
+    data = sa.scanner_view_data(account, position_id, refresh=refresh, n_expiries=n_expiries,
+                                structure_id=structure_id)
     if data is None:
         return {"unavailable": True}
     ranked = data.get("ranked") or {}
@@ -568,7 +577,8 @@ def register_scanner_callbacks(app) -> None:
     def _load(_n, ds):
         if not ds or ds.get("view") != "scanner":
             return (no_update,) * 7
-        v = _scan_view(ds.get("account"), ds.get("position_id"))
+        v = _scan_view(ds.get("account"), ds.get("position_id"),
+                       structure_id=ds.get("structure_id"))
         if v.get("unavailable"):
             empty = html.Div("Scanner unavailable — market data required (Bloomberg off) or no "
                              "priceable slice for this position.", className="scanner-empty")
@@ -594,7 +604,8 @@ def register_scanner_callbacks(app) -> None:
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
             return no_update, no_update, no_update
         v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=trig.get("obj"),
-                       n_expiries=window or _BASE_EXPIRIES)
+                       n_expiries=window or _BASE_EXPIRIES,
+                       structure_id=ds.get("structure_id"))
         if v.get("unavailable") or v.get("empty"):
             return no_update, no_update, no_update
         return v["pills"], v["table"], v["active"]
@@ -611,7 +622,8 @@ def register_scanner_callbacks(app) -> None:
         if not ds or ds.get("view") != "scanner" or not exp_val:
             return no_update
         v = _scan_view(ds.get("account"), ds.get("position_id"), expiry_hint=exp_val,
-                       n_expiries=window or _BASE_EXPIRIES)
+                       n_expiries=window or _BASE_EXPIRIES,
+                       structure_id=ds.get("structure_id"))
         return no_update if v.get("unavailable") else v["smile"]
 
     @app.callback(
@@ -631,7 +643,8 @@ def register_scanner_callbacks(app) -> None:
         if not ds or ds.get("view") != "scanner" or not n:
             return (no_update,) * 6
         v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=active,
-                       refresh=True, n_expiries=window or _BASE_EXPIRIES)
+                       refresh=True, n_expiries=window or _BASE_EXPIRIES,
+                       structure_id=ds.get("structure_id"))
         if v.get("unavailable"):
             return (no_update,) * 6
         return v["stamp"], v["table"], v["pills"], v["smile"], v["exp_opts"], v["exp_val"]
@@ -666,7 +679,8 @@ def register_scanner_callbacks(app) -> None:
         if wider == (window or _BASE_EXPIRIES):
             return nop                      # already at the ceiling
         v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=active,
-                       refresh=True, n_expiries=wider)
+                       refresh=True, n_expiries=wider,
+                       structure_id=ds.get("structure_id"))
         if v.get("unavailable"):
             return nop
         return (wider, v["stamp"], v["table"], v["pills"], v["smile"], v["exp_opts"], v["exp_val"])
@@ -801,10 +815,11 @@ def _comparison_body(ds, obj, rank, shock, n_expiries=_BASE_EXPIRIES):
     ranking) is keyed by window, so the comparison must resolve (obj, rank) against
     the same window the clicked table rendered from — not the base default."""
     account, sid, pid = ds.get("account"), ds.get("structure_id"), ds.get("position_id")
-    rc = sa.scanner_candidate(account, pid, obj, rank, n_expiries=n_expiries)
+    rc = sa.scanner_candidate(account, pid, obj, rank, n_expiries=n_expiries,
+                              structure_id=sid)
     current = sa.price_payoff(account, structure_id=sid, position_id=pid, shock=shock)
     candidate = sa.price_candidate(account, pid, obj, rank, shock=shock,
-                                   n_expiries=n_expiries)
+                                   n_expiries=n_expiries, structure_id=sid)
     if rc is None or current is None or candidate is None:
         return html.Div("Comparison unavailable for this candidate.", className="scanner-empty")
     net_to_roll = getattr(rc.candidate, "net_credit", None)

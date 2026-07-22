@@ -3,7 +3,10 @@
 For a held position, generate the certain-core adjustment candidates — rolls of a
 held option and single-leg overlays on held stock — drawing each candidate's strikes
 and expiries from the cached slice, assembling it as a leg set, and pricing it through
-the validated payoff engine in ONE ``compute_payoff`` call. No new pricing math: the
+the validated payoff engine in ONE ``compute_payoff`` call. A held option that is a
+leg of a detected structure rolls WITHIN it: the caller threads the structure's kept
+legs through (entry-basis dicts from the payoff assembly) and each candidate prices
+as the resulting structure, not as an isolated leg. No new pricing math: the
 economics (max P/L, capital-at-risk, PoP, breakevens, net greeks) come straight from
 the engine; the only added arithmetic is the transaction's net credit/debit, computed
 from contemporaneous mids.
@@ -48,6 +51,14 @@ def _num(v) -> Optional[float]:
     return f if f == f else None
 
 
+def _qty(v):
+    """Leg quantity for the engine: integral values stay int; a fractional
+    standard-contract equivalent (non-100 multiplier) is preserved exactly,
+    mirroring the payoff assembly's qty scaling."""
+    f = float(v)
+    return int(f) if f.is_integer() else f
+
+
 @dataclass
 class SliceContract:
     strike: float
@@ -71,6 +82,10 @@ class Candidate:
     breakevens: Optional[list] = None
     warnings: list = field(default_factory=list)
     new_leg_delta: Optional[float] = None  # the new option leg's own per-contract delta
+    # The OPENED leg's own days-to-expiry. The economics dte is the RESULTING
+    # position's nearest expiry — on a structure-anchored roll that is often a KEPT
+    # sibling's — so every tenor read (drivers, client fit, reasons) keys on this.
+    new_leg_dte: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +124,13 @@ def _option_leg(sc: SliceContract, qty, spot, *, curve, r_scalar, q, today, role
     return {
         "opt_type": "Call" if sc.right == "CALL" else "Put",
         "K": float(sc.strike), "expiry": sc.expiry, "T": T, "sigma": sigma,
-        "style": "American", "qty": int(qty), "mid": mid, "r": float(r), "q": float(q),
+        "style": "American", "qty": _qty(qty), "mid": mid, "r": float(r), "q": float(q),
         "priceable": bool(sigma is not None and T > 0), "position_id": sc.ticker,
         "role": role, "delta": _num(sc.delta),
+        # Every option leg this module builds is OPENED by the transaction; held
+        # sibling legs (an enclosing structure's kept legs) enter from the payoff
+        # assembly without the marker, so consumers can tell the two apart.
+        "opened": True,
     }
 
 
@@ -151,18 +170,22 @@ def _price(legs, spot, today) -> dict:
         return {}
 
 
-def _finish(objective, kind, description, legs, net_credit, spot, today) -> Candidate:
+def _finish(objective, kind, description, legs, net_credit, spot, today,
+            new_leg=None, extra_warnings=None) -> Candidate:
     res = _price(legs, spot, today)
-    # The new option leg's own delta (assignment proxy) — carried through for the
-    # defend-cut-delta ranking driver and the "new Δ" decision column. A single-option
-    # candidate (every roll, covered call, protective put) reports it; a two-option
-    # overlay (collar) leaves it None, having no single new-leg delta to name.
-    opt_legs = [lg for lg in legs if lg.get("opt_type") in ("Call", "Put")]
-    new_leg_delta = _num(opt_legs[0].get("delta")) if len(opt_legs) == 1 else None
+    # The rolled/new option leg's own delta (assignment proxy) and tenor — carried
+    # through for the ranking drivers, client tenor fit and the "new Δ" decision
+    # column. Keyed on the leg the transaction OPENS (kept sibling legs from an
+    # enclosing structure may ride along in ``legs``); a two-option overlay (collar)
+    # passes none, having no single new leg to name.
+    new_leg_delta = _num(new_leg.get("delta")) if new_leg is not None else None
+    new_leg_dte = ((new_leg["expiry"] - today).days
+                   if new_leg is not None and new_leg.get("expiry") is not None else None)
     return Candidate(objective=objective, kind=kind, description=description, legs=legs,
                      net_credit=net_credit, economics=res.get("economics"),
                      greeks=res.get("greeks_now"), breakevens=res.get("breakevens"),
-                     warnings=list(res.get("warnings") or []), new_leg_delta=new_leg_delta)
+                     warnings=list(extra_warnings or []) + list(res.get("warnings") or []),
+                     new_leg_delta=new_leg_delta, new_leg_dte=new_leg_dte)
 
 
 # ---------------------------------------------------------------------------
@@ -275,13 +298,23 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
 
 
 def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
+                          sibling_legs=None, rolled_qty=None, context_warnings=None,
                           risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
                           today=None, objectives=None, cap=_CAP_DEFAULT) -> list:
     """Roll candidates for a held OPTION. ``held`` is a dict
-    ``{strike, expiry, right, quantity, delta}``; ``held_mid`` its contemporaneous
-    buy-to-close mid; ``held_stock`` an optional ``(shares, cost_basis_per_share)`` when
-    the option is covered. Each candidate is the resulting position priced through
-    compute_payoff, plus the roll's net credit/debit."""
+    ``{strike, expiry, right, quantity, delta[, multiplier]}``; ``held_mid`` its
+    contemporaneous buy-to-close mid; ``held_stock`` an optional
+    ``(shares, cost_basis_per_share)`` when the option is covered.
+
+    When the held option is a leg of a detected structure, the caller passes
+    ``sibling_legs`` — the structure's KEPT legs as entry-basis payoff leg dicts
+    (the same assembly the payoff panel prices) — and ``rolled_qty``, the rolled
+    leg's signed standard-contract slice. Each candidate then prices as the
+    RESULTING STRUCTURE: kept legs at entry basis, the new leg at the current
+    slice mid, sized to the rolled slice. Without a structure the resulting
+    position falls back to the covered-call special case (covering stock enters
+    only for a short call + long stock). Each candidate is priced through
+    compute_payoff, plus the roll transaction's own net credit/debit."""
     today = today or date.today()
     objectives = list(objectives) if objectives else list(_DEFAULT_ROLL_OBJECTIVES)
     contracts = _parse_slice(slice_df)
@@ -289,12 +322,28 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
     held_delta = _num(held.get("delta"))
     held_sc = SliceContract(strike=float(held["strike"]), expiry=held["expiry"],
                             right=held["right"], mid=held_mid, delta=held_delta)
-    # The covering stock enters the resulting position only for a covered-call roll
-    # (short call + long stock); a long-option roll is just the new option leg.
+    # The transaction's size in standard-contract equivalents: the enclosing
+    # structure's allocated slice when threaded through, else the full position
+    # scaled by its own contract multiplier (100 -> unchanged).
+    mult = _num(held.get("multiplier")) or 100.0
+    qty_std = _qty(rolled_qty) if rolled_qty is not None else _qty(held_qty * (mult / 100.0))
+    # A structure holding only a slice of the position rolls the SLICE — say so on
+    # every candidate (the remainder sits outside this structure's economics).
+    warns = list(context_warnings or [])
+    full_std = abs(_num(held.get("quantity")) or 0.0) * (mult / 100.0)
+    if rolled_qty is not None and full_std and abs(qty_std) + 1e-9 < full_std:
+        warns.insert(0, (f"rolls the structure's {abs(qty_std):g}-contract slice of a "
+                         f"{full_std:g}-contract position — the remainder sits outside "
+                         "this structure"))
+    # The resulting position's held side: the structure's kept legs when provided;
+    # else the covering stock enters only for a covered-call roll (short call +
+    # long stock) — a long-option roll is just the new option leg.
     stock_leg = None
-    if held_stock and held_qty < 0 and held_sc.right == "CALL":
+    if sibling_legs is None and held_stock and held_qty < 0 and held_sc.right == "CALL":
         shares, basis = held_stock
         stock_leg = _stock_leg(shares, basis)
+    base_legs = list(sibling_legs) if sibling_legs is not None \
+        else ([stock_leg] if stock_leg else [])
 
     later = [c for c in contracts if c.right == held_sc.right
              and c.expiry > held_sc.expiry and c.mid is not None]
@@ -302,19 +351,20 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
     out = []
     hm = _num(held_mid)
     for obj in objectives:
-        picks = _select_roll(obj, held_sc, held_qty, held_mid, held_delta, later, cap)
+        picks = _select_roll(obj, held_sc, qty_std, held_mid, held_delta, later, cap)
         if not picks:
             continue
         for sc, kind in picks:
-            new_leg = _option_leg(sc, held_qty, spot, curve=risk_free_curve,
+            new_leg = _option_leg(sc, qty_std, spot, curve=risk_free_curve,
                                   r_scalar=risk_free_rate, q=div_yield, today=today,
-                                  role=_role_for(held_qty, sc.right))
-            legs = ([stock_leg] if stock_leg else []) + [new_leg]
+                                  role=_role_for(qty_std, sc.right))
+            legs = base_legs + [new_leg]
             nm = _num(sc.mid)
-            net_credit = held_qty * (hm - nm) * _MULT if (hm is not None and nm is not None) else None
+            net_credit = qty_std * (hm - nm) * _MULT if (hm is not None and nm is not None) else None
             desc = (f"{kind.replace('_', ' ')} {held_sc.right.lower()} "
                     f"{held_sc.strike:g}->{sc.strike:g} @ {sc.expiry:%Y-%m-%d}")
-            out.append(_finish(obj, kind, desc, legs, net_credit, spot, today))
+            out.append(_finish(obj, kind, desc, legs, net_credit, spot, today,
+                               new_leg=new_leg, extra_warnings=warns))
     return out
 
 
@@ -351,14 +401,16 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
         leg = _option_leg(c, -n_contracts, role="short_call", **kw)
         out.append(_finish(MAX_PREMIUM, "covered_call",
                            f"covered call {c.strike:g} @ {c.expiry:%Y-%m-%d}",
-                           [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts, spot, today))
+                           [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts, spot, today,
+                           new_leg=leg))
 
     # Protective put (buy an OTM put) — closest to spot first.
     for c in sorted(puts, key=lambda c: abs(c.strike - spot))[:cap]:
         leg = _option_leg(c, n_contracts, role="long_put", **kw)
         out.append(_finish(ADD_HEDGE, "protective_put",
                            f"protective put {c.strike:g} @ {c.expiry:%Y-%m-%d}",
-                           [stock_leg, leg], -(c.mid or 0) * _MULT * n_contracts, spot, today))
+                           [stock_leg, leg], -(c.mid or 0) * _MULT * n_contracts, spot, today,
+                           new_leg=leg))
 
     # Collar (buy put + sell call at the same expiry) — pair the nearest of each.
     by_exp: dict = {}

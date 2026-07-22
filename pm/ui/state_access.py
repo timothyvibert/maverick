@@ -102,6 +102,13 @@ _RUNTIME: dict = {"state": None, "active_account": None}
 # The two locks never nest.
 _RELOAD_LOCK = threading.Lock()
 _WRITE_LOCK = threading.Lock()
+
+# Sentinel for the scanner's structure anchor: "no explicit structure given —
+# resolve it the same way the payoff tab does" (structure_for_position). The drawer
+# always passes drawer-state's structure_id VERBATIM (None means scan the leg
+# standalone — e.g. the scenario drill route's own-axis contract), so every open
+# route's scan and its compare's current side read ONE structure by construction.
+STRUCTURE_AUTO = object()
 _RELOAD_SEQ = 0   # bumped after each completed load; lets a queued caller see one finished while it waited
 
 
@@ -235,7 +242,7 @@ def price_payoff(
 
 
 def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
-                      *, n_expiries: int = 3):
+                      *, n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
     """The cached ranked scanner candidate at ``(objective, rank)`` for a held position,
     or None. Reads the slice the scanner already pulled + ranked — but a COLD
     cache (fresh reload, first touch) resolves through ``pull_slice``, which
@@ -255,8 +262,12 @@ def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
     if pos is None:
         return None
     if pos.asset_class == "option":
+        # Same sentinel contract as the scan itself: the drawer passes drawer-state's
+        # structure_id verbatim (None = standalone), so the (obj, rank) lookup lands
+        # on the ranking the clicked table was rendered from.
+        sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
         sl = pull_slice(account, position_id, n_expiries=n_expiries)  # cache hit after the scan
-        ranked_map = sl.get("candidates_ranked") if sl else None
+        ranked_map = (sl.get("candidates_ranked") or {}).get((account, position_id, sid)) if sl else None
     else:
         ranked_map = state.slice_cache.get("overlay_ranked", {}).get(position_id)
     ranked = (ranked_map or {}).get(objective) or []
@@ -264,7 +275,7 @@ def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
 
 
 def price_candidate(account: str, position_id: str, objective: str, rank: int, *,
-                    shock=None, n_expiries: int = 3):
+                    shock=None, n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
     """The candidate side of the current-vs-candidate comparison — a read-only payoff
     reprice of a ranked candidate's resulting position under a shock. Prices the
     candidate's engine legs through the pure ``compute_payoff`` (the same engine the
@@ -273,7 +284,8 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     ``n_expiries`` is the scanner's active window (see ``scanner_candidate``).
     No Bloomberg beyond the already-cached slice, no reload, no ``_RUNTIME`` write,
     no engine change. Returns the ``compute_payoff`` dict or None."""
-    rc = scanner_candidate(account, position_id, objective, rank, n_expiries=n_expiries)
+    rc = scanner_candidate(account, position_id, objective, rank, n_expiries=n_expiries,
+                           structure_id=structure_id)
     if rc is None:
         return None
     state = _RUNTIME.get("state")
@@ -527,6 +539,60 @@ def _contemporaneous_mid(pos, sl) -> Optional[float]:
         return None
 
 
+def _drop_candidate_caches(state, account: str) -> None:
+    """Drop the account's cached scanner candidates/rankings (raw slices stay).
+    The cached rankings embed structure context — kept legs, allocated slices — so
+    a structure confirm/reject/choose/edit must invalidate them or a reopened scan
+    serves candidates priced against a resolution the user just changed."""
+    for entry in (getattr(state, "slice_cache", None) or {}).get("slices", {}).values():
+        for cache_name in ("candidates_ranked", "candidates_priced"):
+            m = entry.get(cache_name)
+            if m:
+                for k in [k for k in m if k[0] == account]:
+                    m.pop(k, None)
+
+
+def _resolve_scan_structure_id(state, account: str, position_id: str, structure_id):
+    if structure_id is STRUCTURE_AUTO:
+        return structure_for_position(state, account, position_id)
+    return structure_id
+
+
+def _structure_roll_context(state: PortfolioState, acc: AccountState, pos, sid):
+    """(sibling_legs, rolled_qty, warnings) for rolling ``pos`` inside structure
+    ``sid``: the structure's OTHER legs as entry-basis payoff leg dicts — the same
+    assembly the payoff panel prices (allocated slices, contract-multiplier
+    normalized) — plus the rolled leg's own signed standard-contract slice and the
+    assembly's warnings for the KEPT side. ``(None, None, None)`` when there is no
+    structure, the assembly is degraded, or it cannot name a non-zero rolled slice
+    (degrade to the position-anchored scan rather than guess)."""
+    if not sid:
+        return None, None, None
+    struct = next((s for s in (getattr(acc, "structures", None) or [])
+                   if s.structure_id == sid), None)
+    if struct is None:
+        return None, None, None
+    try:
+        from pm.risk.payoff import build_structure_payoff_legs
+        asm = build_structure_payoff_legs(state, acc, struct)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("structure context failed for %s", pos.position_id)
+        return None, None, None
+    if asm.get("degraded"):
+        return None, None, None      # a partial read must not masquerade as the structure
+    legs = list(asm.get("leg_dicts") or [])
+    rolled = [d for d in legs
+              if d.get("position_id") == pos.position_id
+              and d.get("opt_type") in ("Call", "Put")]
+    if len(rolled) != 1 or not rolled[0].get("qty"):
+        return None, None, None
+    kept = [d for d in legs if d is not rolled[0]]
+    pid_prefix = f"{pos.position_id}:"
+    kept_warns = [w for w in (asm.get("warnings") or []) if not w.startswith(pid_prefix)]
+    return kept, rolled[0].get("qty"), kept_warns
+
+
 def _spot_slice_df(state: PortfolioState, underlier: str, spot: float):
     """A spot-centered near-dated slice frame for a stock overlay (there is no held
     strike/expiry to anchor on). Reuses the per-underlier chain cache."""
@@ -548,7 +614,7 @@ def _spot_slice_df(state: PortfolioState, underlier: str, spot: float):
 
 
 def generate_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
-                              n_expiries: int = 3):
+                              n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
     """Generate + price the adjustment candidates for a held position — rolls for a held
     option, single-leg overlays for held stock. Attaches the priced candidates to the
     slice cache entry and returns them (or None)."""
@@ -574,12 +640,24 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
                 return None
             q = _div_yield(acc, sl["underlier"])
             held = {"strike": pos.strike, "expiry": pos.expiry, "right": pos.right,
-                    "quantity": pos.quantity, "delta": _held_option_delta(acc, pos)}
+                    "quantity": pos.quantity, "delta": _held_option_delta(acc, pos),
+                    "multiplier": getattr(pos, "multiplier", None)}
+            # A leg inside a detected structure rolls WITHIN it: the kept sibling
+            # legs (entry basis, allocated slices) ride into generation so every
+            # candidate prices as the resulting structure. A standalone option
+            # keeps the covered-call heuristic (held_stock).
+            sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+            sibling_legs, rolled_qty, ctx_warns = _structure_roll_context(state, acc, pos, sid)
             cands = candidates_from_slice(
                 sl["df"], held, _contemporaneous_mid(pos, sl), sl["spot"],
-                held_stock=_held_stock(acc, pos), risk_free_curve=curve,
+                held_stock=_held_stock(acc, pos), sibling_legs=sibling_legs,
+                rolled_qty=rolled_qty, context_warnings=ctx_warns, risk_free_curve=curve,
                 risk_free_rate=rfr, div_yield=q, objectives=objectives, cap=cap)
-            sl["candidates_priced"] = cands
+            # Keyed per position AND structure anchor: the raw slice is shared
+            # across positions/accounts holding the same contract, but the priced
+            # candidates embed ONE position's structure context and must never
+            # leak across positions, accounts, or open routes.
+            sl.setdefault("candidates_priced", {})[(account, position_id, sid)] = cands
         elif pos.asset_class in ("equity", "fund_etf"):
             spot = _spot_from_snapshot(acc, pos.bbg_ticker)
             basis = _per_share_basis(pos)
@@ -601,7 +679,7 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
 
 
 def rank_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
-                          n_expiries: int = 3):
+                          n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
     """Generate + price + rank the adjustment candidates for a held position, grouped
     by objective. Reads the account's client profile and the slice's IV+pp rows and
     ranks each objective's candidates through ``pm.candidates.ranking``; the only
@@ -625,17 +703,21 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     # scan has no option slice). Either way a pill change reads the cache rather than
     # re-generating + re-pricing — and the comparison tab resolves clicked rows from the
     # SAME cache, so the overlay path is no longer compare-dead.
+    sid = (_resolve_scan_structure_id(state, account, position_id, structure_id)
+           if pos.asset_class == "option" else None)
     if pos.asset_class == "option":
         cached_sl = pull_slice(account, position_id, n_expiries=n_expiries)
-        if cached_sl and cached_sl.get("candidates_ranked"):
-            return cached_sl["candidates_ranked"]
+        cached_ranked = ((cached_sl.get("candidates_ranked") or {}).get((account, position_id, sid))
+                         if cached_sl else None)
+        if cached_ranked:
+            return cached_ranked
     else:
         cached = state.slice_cache.get("overlay_ranked", {}).get(position_id)
         if cached:
             return cached
 
     cands = generate_slice_candidates(account, position_id, objectives=objectives, cap=cap,
-                                      n_expiries=n_expiries)
+                                      n_expiries=n_expiries, structure_id=sid)
     if not cands:
         return None
 
@@ -663,7 +745,9 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
               for obj, cs in by_objective.items()}
 
     if sl is not None:
-        sl["candidates_ranked"] = ranked
+        # Keyed per position + structure anchor (see generate_slice_candidates):
+        # the ranking embeds one structure context; same-contract slices are shared.
+        sl.setdefault("candidates_ranked", {})[(account, position_id, sid)] = ranked
     elif pos.asset_class in ("equity", "fund_etf"):
         # The overlay analog of the slice-attached ranking cache: keyed per
         # position beside overlay_dfs, read by scanner_candidate / the pill
@@ -673,7 +757,8 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
 
 
 def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: int = 15,
-                      refresh: bool = False, n_expiries: int = 3) -> Optional[dict]:
+                      refresh: bool = False, n_expiries: int = 3,
+                      structure_id=STRUCTURE_AUTO) -> Optional[dict]:
     """Read-only packaging for the scanner drawer: the ranked adjustment candidates for a
     held position, plus the slice metadata the view stamps. Delegates to
     ``rank_slice_candidates`` (the sanctioned on-demand pull + rank); ``refresh`` re-pulls
@@ -700,7 +785,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
         state.slice_cache.get("overlay_ranked", {}).pop(position_id, None)
 
     ranked = rank_slice_candidates(account, position_id, objectives=objectives, cap=cap,
-                                   n_expiries=n_expiries)
+                                   n_expiries=n_expiries, structure_id=structure_id)
     if ranked is None:
         return None
 
@@ -858,6 +943,11 @@ def resolve_structure(
         # path, reading only the persisted suppressions (no recompute).
         from pm.store import suppression_store
         suppression_store.remark_account(acc)
+        # The scanner's cached candidates embed structure context (kept legs,
+        # allocated slices) — a changed resolution invalidates them for this
+        # account. Raw slices stay; the next scan regenerates Bloomberg-free
+        # from the cached slice.
+        _drop_candidate_caches(state, account)
         return True
 
 

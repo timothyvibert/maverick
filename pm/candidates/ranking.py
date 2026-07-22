@@ -145,11 +145,33 @@ def _avg_rank_percentile(values) -> list:
 _OUT_W = 0.05
 
 
+def _opt_legs(cand) -> list:
+    """The candidate's option legs, narrowed to the legs the transaction OPENS when
+    the marker is present — a structure-anchored roll carries the enclosing
+    structure's kept legs too, and those must never key a driver, the IV+pp lookup
+    or the posture read. Candidates without the marker keep every option leg."""
+    opts = [lg for lg in (getattr(cand, "legs", None) or [])
+            if lg.get("opt_type") in ("Call", "Put")]
+    opened = [lg for lg in opts if lg.get("opened")]
+    return opened or opts
+
+
 def _new_strike(cand) -> Optional[float]:
-    for lg in (getattr(cand, "legs", None) or []):
-        if lg.get("opt_type") in ("Call", "Put") and lg.get("K") is not None:
+    for lg in _opt_legs(cand):
+        if lg.get("K") is not None:
             return _num(lg.get("K"))
     return None
+
+
+def _cand_dte(cand) -> Optional[float]:
+    """The candidate's OWN tenor — the OPENED leg's days-to-expiry. The economics
+    ``dte`` is the resulting position's nearest expiry, which on a structure-anchored
+    roll is often a KEPT sibling's (a collar's put outlives no roll); every tenor
+    read keys here so drivers, client fit and reasons describe the rolled leg."""
+    nd = _num(getattr(cand, "new_leg_dte", None))
+    if nd is not None:
+        return nd
+    return _num((getattr(cand, "economics", None) or {}).get("dte"))
 
 
 def _relief(cand, held) -> Optional[float]:
@@ -157,7 +179,7 @@ def _relief(cand, held) -> Optional[float]:
     Roll up & out and Costless objectives (higher = more room bought)."""
     nk = _new_strike(cand)
     hk = _num((held or {}).get("strike"))
-    dte = _num((getattr(cand, "economics", None) or {}).get("dte"))
+    dte = _cand_dte(cand)
     hdte = _num((held or {}).get("dte"))
     strike_relief = (nk - hk) if (nk is not None and hk is not None) else 0.0
     tenor = _OUT_W * ((dte - hdte) if (dte is not None and hdte is not None) else 0.0)
@@ -177,7 +199,7 @@ def _driver(cand, objective, held) -> Optional[float]:
     if objective in (ROLL_UP_OUT, COSTLESS):
         return _relief(cand, held)
     if objective == EXTEND_DURATION:
-        return _num((getattr(cand, "economics", None) or {}).get("dte"))   # more tenor
+        return _cand_dte(cand)                       # more tenor on the rolled leg
     if objective == DEFEND_CUT_DELTA:
         nd = _num(getattr(cand, "new_leg_delta", None))
         if nd is None:
@@ -222,11 +244,11 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _short_leg_excess(cand, excess_by_ticker):
-    """(iv_excess, status) for the candidate's short option leg — the leg being sold.
+    """(iv_excess, status) for the candidate's short option leg — the leg being SOLD
+    by this transaction (kept sibling shorts of an enclosing structure never key it).
     status: 'ok' (found), 'no_short' (no premium-selling leg), 'not_in_slice' (the
     short leg's contract fell outside the pulled slice, so no IV+pp)."""
-    shorts = [lg for lg in (getattr(cand, "legs", None) or [])
-              if lg.get("opt_type") in ("Call", "Put") and (lg.get("qty") or 0) < 0]
+    shorts = [lg for lg in _opt_legs(cand) if (lg.get("qty") or 0) < 0]
     if not shorts:
         return None, "no_short"
     tk = shorts[0].get("position_id")
@@ -249,11 +271,11 @@ def _iv_reason(status, excess, pct) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _candidate_posture(cand) -> Optional[str]:
-    """The candidate's resulting posture from its single option leg's role
-    (short_call / long_call / short_put / long_put). A collar / no-option candidate
+    """The candidate's posture from the single option leg the transaction OPENS
+    (short_call / long_call / short_put / long_put) — a structure-anchored roll
+    reads the rolled leg, not its kept siblings. A collar / no-option candidate
     has no single posture -> None (posture dimension skipped)."""
-    opt = [lg for lg in (getattr(cand, "legs", None) or [])
-           if lg.get("opt_type") in ("Call", "Put")]
+    opt = _opt_legs(cand)
     if len(opt) != 1:
         return None
     return opt[0].get("role")
@@ -323,7 +345,7 @@ def _client_fit(cand, profile):
         return True
 
     tenor_pref = getattr(profile, "tenor_pref", None)
-    cand_dte = _num((getattr(cand, "economics", None) or {}).get("dte"))
+    cand_dte = _cand_dte(cand)
     tfit, treason, over_msg = _tenor_fit(cand_dte, tenor_pref)
     if tfit is not None and _dim_ok(tenor_pref, "tenor"):
         dims.append(tfit)
