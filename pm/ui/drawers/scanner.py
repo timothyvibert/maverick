@@ -222,6 +222,11 @@ _ROSTER_COLS = [
     {"field": "p_assign", "headerName": "P(assign)", "width": 96, "type": "rightAligned",
      "headerTooltip": "the short leg's own |Δ| — a proxy, not a model probability",
      "checkboxSelection": False},
+    {"field": "close", "headerName": "Close", "width": 62,
+     "cellClass": "scanner-close-cell",
+     "headerTooltip": "mark a leg to capture/close in the ticket — priced at its "
+                      "contemporaneous mid, run/decay shown vs entry basis; a leg "
+                      "already ticked to roll is closed by the roll itself"},
 ]
 
 
@@ -449,7 +454,8 @@ def _payoff_fig(res) -> "object":
 # Row + block builders
 # ---------------------------------------------------------------------------
 
-def _roster_rows(roster) -> list:
+def _roster_rows(roster, captures=None) -> list:
+    marked = set(captures or [])
     rows = []
     for r in (roster or {}).get("rows", []):
         rows.append({
@@ -461,6 +467,7 @@ def _roster_rows(roster) -> list:
             "delta": _delta(r.get("delta")),
             "mid": _px(r.get("mid")),
             "p_assign": f"{r['p_assign']:.2f}" if r.get("p_assign") is not None else "—",
+            "close": "✓" if r["position_id"] in marked else "·",
         })
     return rows
 
@@ -653,6 +660,79 @@ def _cmp_table(current, candidate, rc, nav) -> html.Table:
                       children=[html.Thead(head), html.Tbody(body)])
 
 
+_TICKET_EMPTY = ("Select a candidate — or mark a roster leg Close — to build the "
+                 "ticket here.")
+
+
+def _ticket_row(lg, flag=None):
+    """One executable line: action · signed trade qty · contract @ mid · cash.
+    Captures carry their run/decay vs entry; ``flag`` is the factual coverage
+    conversion attached to the line that causes it."""
+    cash_cls = _sign(lg.cash)
+    desc = [html.Span(lg.description),
+            html.Span(f" @ {_px(lg.mid)}", className="scanner-ticket-mid")]
+    if lg.is_capture and lg.pnl_vs_entry is not None:
+        desc.append(html.Span(f"{_tcash(lg.pnl_vs_entry)} vs entry",
+                              className=f"scanner-ticket-pnl {_sign(lg.pnl_vs_entry)}".strip()))
+    if flag:
+        desc.append(html.Span(f"→ {flag}", className="scanner-ticket-flag"))
+    if lg.note:
+        desc.append(html.Span("◆", className="scanner-ticket-notemark", title=lg.note))
+    return html.Tr([
+        html.Td(lg.action, className=f"scanner-ticket-act {cash_cls}".strip()),
+        html.Td(f"{lg.trade_qty:+g}", className="scanner-ticket-qty"),
+        html.Td(desc, className="scanner-ticket-desc"),
+        html.Td(_tcash(lg.cash), className=f"scanner-num {cash_cls}".strip()),
+    ])
+
+
+def _tcash(v) -> str:
+    from pm.candidates.ticket import _cash_str
+    return _cash_str(v, dash="—")
+
+
+def _ticket_block(t) -> html.Div:
+    """The ticket band: close lines, open lines, the NET row, then the resulting
+    line (label + priced economics + the mids' as-of) as a cap line. Warnings
+    render as the standing amber notes."""
+    legs = list(t.close_set) + list(t.open_set)
+    cap_idx = [i for i, lg in enumerate(legs) if lg.is_capture]
+    flag_idx = cap_idx[-1] if (t.conversion and cap_idx) else None
+    body = [_ticket_row(lg, flag=(t.conversion if i == flag_idx else None))
+            for i, lg in enumerate(legs)]
+    net = _tcash(t.net_cash)
+    if t.net_cash is not None:
+        net += " cr" if t.net_cash >= 0 else " dr"
+    body.append(html.Tr(className="scanner-ticket-net", children=[
+        html.Td(f"Net · {t.net_label}", colSpan=3, className="scanner-ticket-netlbl"),
+        html.Td(net, className=f"scanner-num {_sign(t.net_cash)}".strip()),
+    ]))
+    res = t.resulting or {}
+    cap = [_cap_pair("resulting", (res.get("label") or "—"))]
+    e = res.get("economics") or {}
+    if e:
+        cap += [html.Span(" · ", className="scanner-cap-sep"),
+                _cap_pair("max profit", _maxup(e)),
+                html.Span(" · ", className="scanner-cap-sep"),
+                _cap_pair("max loss", _maxdn(e))]
+        bes = e.get("breakevens")
+        be_txt = (" / ".join(f"{b:,.1f}" for b in bes) if bes
+                  else "always +" if e.get("always_profitable")
+                  else "always −" if e.get("always_loss") else "—")
+        cap += [html.Span(" · ", className="scanner-cap-sep"), _cap_pair("BE", be_txt)]
+    if t.conversion and flag_idx is None:
+        cap += [html.Span(" · ", className="scanner-cap-sep"),
+                html.Span(t.conversion, className="scanner-ticket-flag")]
+    asof = t.as_of.strftime("%H:%M") if t.as_of else "—"
+    cap += [html.Span(" · ", className="scanner-cap-sep"),
+            _cap_pair("mids as of", asof)]
+    kids = [html.Table(className="scanner-tbl scanner-ticket-tbl",
+                       children=[html.Tbody(body)]),
+            html.Div(cap, className="scanner-cap")]
+    kids += [html.Div(w, className="scanner-note") for w in (t.warnings or [])]
+    return html.Div(kids)
+
+
 def _notes_block(view, ranked_list) -> list:
     notes = []
     if view.get("note"):
@@ -804,9 +884,21 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
             _shock_dial("Time fwd (days)", "scanner-cmp-time", 0, 60, 1),
         ]),
 
+        _sec("Ticket", "scanner-ticket-ctx"),
+        html.Div(id="scanner-ticket-body",
+                 children=html.Div(_TICKET_EMPTY, className="scanner-empty")),
+        html.Div(className="scanner-more scanner-ticket-copyrow", children=[
+            dcc.Clipboard(id="scanner-ticket-copy", content="",
+                          title="Copy the ticket as plain text — carries the as-of; "
+                                "a proposal, not an order.",
+                          className="scanner-ticket-clip"),
+            html.Span("copy ticket", className="scanner-ticket-copylbl"),
+        ]),
+
         dcc.Store(id="scanner-controls", data=None),
         dcc.Store(id="scanner-active", data=None),
         dcc.Store(id="scanner-cmp-sel", data=None),
+        dcc.Store(id="scanner-captures", data=[]),
         dcc.Interval(id="scanner-load", interval=60, max_intervals=1),
         html.Div(_HONESTY, className="scanner-honesty"),
     ])
@@ -1084,6 +1176,34 @@ def register_scanner_callbacks(app) -> None:
             None)
 
     @app.callback(
+        Output("scanner-captures", "data"),
+        Output("scanner-roster-grid", "rowData", allow_duplicate=True),
+        Input("scanner-roster-grid", "cellClicked"),
+        State("scanner-captures", "data"),
+        State("drawer-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _toggle_capture(cell, captures, ds):
+        # The roster's Close column is a click toggle (the house cellClicked
+        # pattern) — marks feed the ticket's capture lines; the checkbox column
+        # (the rolled set) is untouched by these clicks.
+        if not ds or ds.get("view") != "scanner" or not cell:
+            return no_update, no_update
+        if cell.get("colId") != "close":
+            return no_update, no_update
+        pid = cell.get("rowId")
+        if not pid:
+            return no_update, no_update
+        captures = list(captures or [])
+        if pid in captures:
+            captures.remove(pid)
+        else:
+            captures.append(pid)
+        roster = sa.scanner_roster(ds.get("account"), ds.get("position_id"),
+                                   structure_id=ds.get("structure_id"))
+        return captures, _roster_rows(roster, captures)
+
+    @app.callback(
         Output("scanner-chain-wrap", "style"),
         Input("scanner-chain-toggle", "n_clicks"),
         State("scanner-chain-wrap", "style"),
@@ -1188,6 +1308,46 @@ def register_comparison_callbacks(app) -> None:
                     exp_hint = str(match.get("expiry")) or exp_hint
             smile = _smile_fig(view, exp_hint, sel)
         return cmp_body, _payoff_fig(candidate), smile, {"obj": obj, "rank": rank}
+
+    @app.callback(
+        Output("scanner-ticket-ctx", "children"),
+        Output("scanner-ticket-body", "children"),
+        Output("scanner-ticket-copy", "content"),
+        Input("scanner-cmp-sel", "data"),
+        Input("scanner-captures", "data"),
+        State("scanner-controls", "data"),
+        State("drawer-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _ticket(sel, captures, controls, ds):
+        # The ticket band: the selected candidate's close/open transaction plus
+        # the roster's capture marks, at contemporaneous mids — a PROPOSAL with
+        # copyable text; never routes an order. The shock dials do not touch it
+        # (mids are market marks, not hypotheticals). ``scanner-controls`` is
+        # deliberately a STATE: every rescan writes ``scanner-cmp-sel`` (to
+        # None), which re-fires this callback with the fresh controls — taking
+        # controls as an Input raced the rescan's own selection clear and could
+        # rebuild a ticket from the OLD selection against the NEW rolled set.
+        if not ds or ds.get("view") != "scanner":
+            return no_update, no_update, no_update
+        account, pid = ds.get("account"), ds.get("position_id")
+        empty = ("one net transaction",
+                 html.Div(_TICKET_EMPTY, className="scanner-empty"), "")
+        if pid is None:
+            return empty
+        rolled = (controls or {}).get("rolled") or [pid]
+        t = sa.build_adjustment_ticket(
+            account, pid, objective=(sel or {}).get("obj"),
+            rank=(sel or {}).get("rank"), structure_id=ds.get("structure_id"),
+            dte_range=(controls or {}).get("dte"),
+            delta_band=(controls or {}).get("band"),
+            rolled_pids=rolled, capture_pids=captures or [])
+        if t is None:
+            return empty
+        from pm.candidates.ticket import ticket_text
+        n = len(t.close_set) + len(t.open_set)
+        return (f"one net transaction · {n} leg{'s' if n != 1 else ''}",
+                _ticket_block(t), ticket_text(t))
 
     @app.callback(
         Output("scanner-cmp-body", "children", allow_duplicate=True),

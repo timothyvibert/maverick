@@ -1215,6 +1215,28 @@ html, body {
 .scanner-empty { padding: 34px 10px; text-align: center; color: var(--pm-grey-500); font-size: 13px; }
 .scanner-honesty { margin-top: 12px; font-size: 11px; color: var(--pm-grey-500); line-height: 1.5; }
 
+/* Ticket band — the one close/open transaction (proposal + copyable text). */
+.scanner-ticket-tbl td { padding: 3px 8px; border-bottom: 1px solid var(--pm-grey-100);
+    white-space: nowrap; }
+.scanner-ticket-act { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+    font-weight: 700; width: 52px; }
+.scanner-ticket-qty { text-align: right; font-variant-numeric: tabular-nums; width: 44px; }
+.scanner-ticket-desc { text-align: left; }
+.scanner-ticket-mid { color: var(--pm-grey-500); }
+.scanner-ticket-pnl { font-size: 11px; margin-left: 8px; }
+.scanner-ticket-flag { color: var(--pm-urgent); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.3px; margin-left: 8px; }
+.scanner-ticket-notemark { color: var(--pm-urgent); margin-left: 6px; cursor: help; }
+.scanner-ticket-net td { border-top: 2px solid var(--pm-charcoal); border-bottom: 0;
+    font-size: 15px; padding-top: 5px; }
+.scanner-ticket-netlbl { text-align: left; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; font-weight: 700; }
+.scanner-close-cell { cursor: pointer; text-align: center; color: var(--pm-urgent); }
+.scanner-ticket-copyrow { justify-content: flex-start; align-items: center; gap: 6px; }
+.scanner-ticket-copylbl { font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); }
+.scanner-ticket-clip { font-size: 13px; color: var(--pm-grey-700); cursor: pointer; }
+
 /* ---- Risk section — terminal idiom (bands over rules; no cards) ----------- */
 
 /* The header Net Greeks KPI doubles as the anchor into the Risk section. */

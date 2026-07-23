@@ -813,6 +813,10 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
             # scoped by the scan controls).
             state.slice_cache.setdefault("overlay_dfs", {})[
                 (position_id, _scan_sig(dte_range, delta_band))] = df
+            # The overlay slice's own as-of (the option path's pulled_at analog)
+            # — the adjustment ticket quotes it, so it must exist to be quoted.
+            state.slice_cache.setdefault("overlay_pulled", {})[
+                (position_id, _scan_sig(dte_range, delta_band))] = datetime.now()
             q = _div_yield(acc, pos.bbg_ticker)
             cands = overlays_from_slice(df, spot, int(pos.quantity), basis,
                                         risk_free_curve=curve, risk_free_rate=rfr,
@@ -1053,6 +1057,254 @@ def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
     return ranked
 
 
+def build_adjustment_ticket(account: str, position_id: str, *, objective=None,
+                            rank=None, structure_id=STRUCTURE_AUTO, dte_range=None,
+                            delta_band=None, rolled_pids=None, capture_pids=None,
+                            n_expiries: int = 3):
+    """The adjustment ticket for the scanner's selected candidate and/or the
+    roster's capture marks — the whole adjustment as ONE transaction: a
+    close-set plus an open-set at per-leg contemporaneous mids, the net cash,
+    the resulting position's priced economics, and a factual coverage flag when
+    the transaction leaves a short uncovered.
+
+    A PROPOSAL, read-only: composes the cached ranked candidate
+    (``scanner_candidate``), the structure assembly's ledger slices, the
+    sanctioned held-leg mid pull, the pure payoff engine and the pure structure
+    detector over COPIED positions — no ``_RUNTIME`` write-back, no reload,
+    nothing persisted, and never any order placement. ``capture_pids`` marks
+    roster legs to close OUTSIDE the rolled set; with no candidate selected the
+    ticket is close-only (captures alone). Returns an ``AdjustmentTicket`` or
+    None (no state / no candidate resolved / nothing to trade)."""
+    state = _RUNTIME.get("state")
+    if state is None:
+        return None
+    acc = state.accounts.get(account)
+    if acc is None:
+        return None
+    pos = position_by_id(state, account, position_id)
+    if pos is None:
+        return None
+    captures = [str(p) for p in (capture_pids or [])]
+    rc = None
+    if objective is not None and rank is not None:
+        rc = scanner_candidate(account, position_id, objective, rank,
+                               n_expiries=n_expiries, structure_id=structure_id,
+                               dte_range=dte_range, delta_band=delta_band,
+                               rolled_pids=(rolled_pids
+                                            if rolled_pids and len(set(rolled_pids)) > 1
+                                            else None))
+        if rc is None:
+            return None
+    cand = getattr(rc, "candidate", None)
+    if cand is None and not captures:
+        return None
+
+    from pm.candidates import ticket as tkt
+
+    by_id = {p.position_id: p for p in acc.positions}
+    sym = pos.underlying_symbol or pos.symbol
+    warnings: list = []
+
+    # Structure context — the ledger's allocated slices (REAL contracts), the
+    # same assembly every scan reads. A degraded read falls back to
+    # full-position semantics, matching the position-anchored scan, and says so.
+    sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+    struct = next((s for s in (getattr(acc, "structures", None) or [])
+                   if s.structure_id == sid), None) if sid else None
+    alloc_by_pid: dict = {}
+    asm_legs: list = []
+    if struct is not None:
+        try:
+            from pm.risk.payoff import build_structure_payoff_legs
+            asm = build_structure_payoff_legs(state, acc, struct)
+        except Exception:
+            asm = {"degraded": True}
+        if asm.get("degraded"):
+            struct = None
+            warnings.append("structure context degraded — the ticket uses "
+                            "full-position quantities")
+        else:
+            asm_legs = list(asm.get("leg_dicts") or [])
+            alloc_by_pid = {lg.position_id: lg.allocated_qty for lg in struct.legs}
+
+    sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                    dte_range=dte_range) if pos.asset_class == "option" else None
+    spot = (sl.get("spot") if sl else None) or _spot_from_snapshot(
+        acc, pos.underlying_bbg_ticker if pos.asset_class == "option" else pos.bbg_ticker)
+    as_of = (sl.get("pulled_at") if sl
+             else state.slice_cache.get("overlay_pulled", {}).get(
+                 (position_id, _scan_sig(dte_range, delta_band))))
+
+    def _desc(right, strike, expiry):
+        r = "C" if str(right or "").upper().startswith("C") else "P"
+        exp = f"{expiry:%Y-%m-%d}" if expiry is not None else "?"
+        k = f"{strike:g}" if strike is not None else "?"
+        return f"{sym} {exp} {k} {r}"
+
+    def _mid_for(p):
+        return _contemporaneous_mid(p, sl if sl is not None else {"df": None})
+
+    def _slice_note(p, held_qty, alloc, verb, noun):
+        full = abs(coerce_float(p.quantity) or 0.0)
+        if alloc is not None and abs(held_qty) + 1e-9 < full:
+            return (f"{verb} the structure's {abs(held_qty):g}-{noun} slice; "
+                    f"{full - abs(held_qty):g} {noun}s remain outside")
+        return None
+
+    # The close side of the ROLL — what the selected candidate replaces. Derived
+    # from the pids the RANKING actually rolled: the rolled set on the joint
+    # path, the scanned position on the single-leg path (the tick set does not
+    # re-anchor a single-leg scan).
+    pids = {str(p) for p in (rolled_pids or [])}
+    rolled = (sorted(pids) if len(pids) > 1 else [position_id]) \
+        if (cand is not None and pos.asset_class == "option") else []
+    close_set: list = []
+    for pid in rolled:
+        p = by_id.get(pid)
+        if p is None or p.asset_class != "option":
+            continue
+        alloc = alloc_by_pid.get(pid) if struct is not None else None
+        held_qty = coerce_float(alloc) if alloc is not None \
+            else (coerce_float(p.quantity) or 0.0)
+        if not held_qty:
+            continue
+        close_set.append(tkt.close_leg(
+            description=_desc(p.right, p.strike, p.expiry), held_qty=held_qty,
+            mid=_mid_for(p), multiplier=coerce_float(p.multiplier) or 100.0,
+            position_id=pid, right=(p.right or "").upper() or None,
+            strike=coerce_float(p.strike), expiry=p.expiry,
+            note=_slice_note(p, held_qty, alloc, "closes", "contract")))
+
+    # Capture/close lines — roster legs OUTSIDE the rolled set (a leg already in
+    # the roll is closed by the roll). Priced at the same contemporaneous marks;
+    # run/decay is stated vs ENTRY basis, the house accounting convention.
+    for pid in captures:
+        if pid in rolled:
+            continue
+        p = by_id.get(pid)
+        if p is None:
+            continue
+        alloc = alloc_by_pid.get(pid) if struct is not None else None
+        held_qty = coerce_float(alloc) if alloc is not None \
+            else (coerce_float(p.quantity) or 0.0)
+        if not held_qty:
+            continue
+        if p.asset_class == "option":
+            mult = coerce_float(p.multiplier) or 100.0
+            qf, cb = coerce_float(p.quantity), coerce_float(p.cost_basis)
+            entry = cb / (qf * mult) if (cb is not None and qf) else None
+            close_set.append(tkt.close_leg(
+                description=_desc(p.right, p.strike, p.expiry), held_qty=held_qty,
+                mid=_mid_for(p), multiplier=mult, position_id=pid,
+                right=(p.right or "").upper() or None,
+                strike=coerce_float(p.strike), expiry=p.expiry, is_capture=True,
+                entry_per_share=entry,
+                note=_slice_note(p, held_qty, alloc, "captures", "contract")))
+        elif p.asset_class in ("equity", "fund_etf"):
+            close_set.append(tkt.close_leg(
+                description=f"{sym} stock", held_qty=held_qty, mid=spot,
+                multiplier=1.0, position_id=pid, is_capture=True,
+                entry_per_share=_per_share_basis(p),
+                note=_slice_note(p, held_qty, alloc, "captures", "share")))
+
+    # The open side — the legs the candidate's transaction OPENS (standard
+    # listed contracts at the slice mid). A fractional standard-contract
+    # quantity (a non-100 held that does not map to whole contracts) is
+    # disclosed, never rounded.
+    open_set: list = []
+    if cand is not None:
+        for lg in (getattr(cand, "legs", None) or []):
+            if not lg.get("opened") or lg.get("opt_type") not in ("Call", "Put"):
+                continue
+            qty = coerce_float(lg.get("qty")) or 0.0
+            if not qty:
+                continue
+            note = None
+            if abs(qty - round(qty)) > 1e-9:
+                note = ("fractional standard-contract quantity — the held "
+                        "contract's size does not map to whole standard contracts")
+            right = "CALL" if lg["opt_type"] == "Call" else "PUT"
+            open_set.append(tkt.open_leg(
+                description=_desc(right, lg.get("K"), lg.get("expiry")), qty=qty,
+                mid=lg.get("mid"), position_id=lg.get("position_id"), right=right,
+                strike=coerce_float(lg.get("K")), expiry=lg.get("expiry"), note=note))
+
+    if not close_set and not open_set:
+        return None
+
+    # The RESULTING legs after the WHOLE transaction: the candidate's resulting
+    # structure minus any captured legs (or, close-only, the held legs minus the
+    # captures) — priced by the same pure engine call every candidate uses.
+    capture_ids = {lg.position_id for lg in close_set if lg.is_capture}
+    stock_captured = any(lg.is_capture and lg.right is None for lg in close_set)
+    if cand is not None:
+        base = list(getattr(cand, "legs", None) or [])
+    elif struct is not None:
+        base = asm_legs
+    else:
+        try:
+            from pm.risk.payoff import build_structure_payoff_legs
+            asm1 = build_structure_payoff_legs(state, acc, pos)
+            base = list(asm1.get("leg_dicts") or []) if not asm1.get("degraded") else []
+        except Exception:
+            base = []
+    resulting_legs = [d for d in base
+                      if d.get("position_id") not in capture_ids
+                      and not (stock_captured and d.get("position_id") == "held_stock")]
+
+    res_econ = None
+    if resulting_legs and spot and spot > 0:
+        try:
+            from pm.candidates.generate import _build_tier1
+            from pm.risk.payoff import compute_payoff
+            today = date.today()
+            r = compute_payoff(resulting_legs, float(spot),
+                               _build_tier1(resulting_legs, today), today=today)
+            res_econ = dict(r.get("economics") or {})
+            if r.get("breakevens") is not None:
+                res_econ["breakevens"] = [float(b) for b in r["breakevens"]]
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("ticket economics failed for %s",
+                                                  position_id)
+
+    # Coverage projection — the pure detector over a COPIED book, before vs
+    # after, at NAME level (stock seniority needs the whole book); the flag is
+    # factual role arithmetic, never advice. The resulting LABEL is scoped to
+    # exactly the legs the economics price — a name-level type here would name
+    # a different book than the numbers beside it.
+    conv = None
+    label = None
+    try:
+        closes_proj = [(lg.position_id, -lg.trade_qty) for lg in close_set
+                       if lg.position_id is not None]
+        opens_proj = [{"right": lg.right, "strike": lg.strike,
+                       "expiry": lg.expiry, "qty": lg.trade_qty}
+                      for lg in open_set]
+        trades = getattr(acc, "trades_by_underlying", None)
+        before = tkt.project_structures(account, acc.positions, trades, sym)
+        projected = tkt.apply_transaction(acc.positions, closes_proj, opens_proj,
+                                          underlying_symbol=sym)
+        after = tkt.project_structures(account, projected, trades, sym)
+        conv = tkt.coverage_conversion(tkt.uncovered_counts(before),
+                                       tkt.uncovered_counts(after))
+        label = tkt.resulting_label(resulting_legs, sym)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("ticket projection failed for %s",
+                                              position_id)
+
+    if not resulting_legs:
+        label, res_econ = "flat", None
+    elif not label:
+        label = f"{len(resulting_legs)}-leg position"
+    resulting = {"label": label, "economics": res_econ,
+                 "line": tkt.resulting_line(label, res_econ)}
+    return tkt.assemble(close_set, open_set, account=account, underlier=sym,
+                        as_of=as_of, resulting=resulting, conversion=conv,
+                        warnings=warnings)
+
+
 def scanner_roster(account: str, position_id: str, *, structure_id=STRUCTURE_AUTO):
     """The Managing band's data, read-only from loaded state: the enclosing
     structure's legs as roster rows (role · contract · DTE · Δ · morning-snapshot
@@ -1160,7 +1412,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
         pull_slice(account, position_id, refresh=True, n_expiries=n_expiries,
                    dte_range=dte_range)
     elif refresh:
-        for cname in ("overlay_dfs", "overlay_ranked"):
+        for cname in ("overlay_dfs", "overlay_ranked", "overlay_pulled"):
             m = state.slice_cache.get(cname, {})
             for k in [k for k in m if isinstance(k, tuple) and k[0] == position_id]:
                 m.pop(k, None)
