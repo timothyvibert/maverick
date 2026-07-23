@@ -1111,121 +1111,109 @@ html, body {
     .payoff-graph-wrap, .payoff-side { flex-basis: auto; width: 100%; }
 }
 
-/* Scanner drawer (view='scanner') — the ranked roll/overlay candidates for a held
-   position. Dense table (the am-table look), neutral chrome; sign colour only on the
-   P&L numbers, restrained amber for the recommended row. */
+/* Scanner drawer (view='scanner') — the order-entry surface. Bands over rules,
+   no cards; 11px labels / 13px data; sign colour only on data; restrained amber
+   for selection and truth flags. */
 .scanner-content { padding: 14px 18px 18px; }
 
-.scanner-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.scanner-head-left { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
-.scanner-identity { font-size: 15px; font-weight: 600; color: var(--pm-charcoal);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.scanner-stamp { font-size: 11.5px; color: var(--pm-grey-500); font-style: italic; white-space: nowrap; }
-.scanner-head-btns { display: flex; gap: 6px; }
+/* Identity line: ticker · spot · day move · account · as-of. */
+.scanner-hd { display: flex; align-items: baseline; gap: 12px; }
+.scanner-hd-tk { font-size: 15px; font-weight: 700; color: var(--pm-charcoal); }
+.scanner-hd-px { font-size: 15px; color: var(--pm-charcoal);
+    font-variant-numeric: tabular-nums; }
+.scanner-hd-day { font-size: 13px; font-variant-numeric: tabular-nums; }
+.scanner-hd-acct { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--pm-grey-500); }
+.scanner-hd-asof { margin-left: auto; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); white-space: nowrap; }
 .scanner-refresh-btn {
-    padding: 3px 12px; font-size: 12px; border: 1px solid var(--pm-grey-300);
+    padding: 3px 12px; font-size: 11px; border: 1px solid var(--pm-grey-300);
     background: #fff; color: var(--pm-charcoal); border-radius: 3px; cursor: pointer;
 }
 .scanner-refresh-btn:hover { background: var(--pm-grey-50); }
 
-.scanner-pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 10px; }
-.scanner-pill {
-    padding: 3px 12px; font-size: 12px; border: 1px solid var(--pm-grey-300);
-    background: #fff; color: var(--pm-grey-700); border-radius: 14px; cursor: pointer;
-}
-.scanner-pill:hover { background: var(--pm-grey-50); }
-.scanner-pill-active {
-    background: var(--pm-charcoal); color: #fff; border-color: var(--pm-charcoal);
-}
+/* Section band: 11px uppercase label + right-aligned context over a 1px rule. */
+.scanner-sec { display: flex; align-items: center; gap: 8px; font-size: 11px;
+    font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+    color: var(--pm-charcoal); border-bottom: 1px solid var(--pm-grey-300);
+    padding: 14px 0 3px; }
+.scanner-sec-ctx { margin-left: auto; font-weight: 400; color: var(--pm-grey-500);
+    letter-spacing: 0.3px; text-transform: none; font-size: 11px; }
 
-.scanner-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.scanner-th {
-    text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); border-bottom: 1px solid var(--pm-grey-300); padding: 6px 8px;
-}
-.scanner-th-num { text-align: right; }
-.scanner-th-rank { text-align: center; width: 34px; }
-.scanner-th-grp { text-align: center; font-weight: 700; color: var(--pm-accent);
-    border-bottom: 1px solid var(--pm-grey-300); font-size: 10px; }
-.scanner-grouprow th { padding: 4px 8px 2px; }
-.scanner-grp { border-left: 1px solid var(--pm-grey-300); }
-.scanner-mono { font-family: "Consolas", monospace; white-space: nowrap;
+/* Cap line under a grid/chart: 11px labels, 13px mono values. */
+.scanner-cap { margin-top: 5px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); }
+.scanner-cap-k { color: var(--pm-grey-500); }
+.scanner-cap-v { color: var(--pm-charcoal); font-family: "Consolas", monospace;
+    font-size: 13px; letter-spacing: 0; text-transform: none;
     font-variant-numeric: tabular-nums; }
+.scanner-cap-sep { color: var(--pm-grey-300); padding: 0 4px; }
 
-/* Vol smile + full-slice browse (redesign). */
-.scanner-smile-wrap { margin: 10px 0; }
-.scanner-smile-head { display: flex; align-items: center; justify-content: space-between; }
-.scanner-smile-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); }
-.scanner-smile-ctrl { display: flex; align-items: center; gap: 8px; }
-.scanner-smile-lbl { font-size: 11px; color: var(--pm-grey-700); }
-.scanner-expiry-dd { min-width: 140px; font-size: 12px; }
-.scanner-smile-graph { width: 100%; height: 280px; }
+/* Objective tokens — flat, joined, charcoal when active. */
+.scanner-toks { display: flex; flex-wrap: wrap; margin: 9px 0 0; }
+.scanner-tok { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--pm-grey-500); padding: 4px 10px; border: 1px solid var(--pm-grey-300);
+    background: #fff; margin-right: -1px; cursor: pointer; }
+.scanner-tok:hover { background: var(--pm-grey-50); }
+.scanner-tok-on { background: var(--pm-charcoal); color: #fff;
+    border-color: var(--pm-charcoal); }
 
-/* Compact fit indicator (replaces the stacked reason chips in-row). */
-.scanner-fit { display: flex; align-items: center; gap: 5px; }
-.scanner-fit-rank { min-width: 14px; text-align: right; color: var(--pm-grey-700);
+/* Scan controls: label · typed lo · range slider · typed hi, plus Scan. */
+.scanner-ctrls { display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+    margin-top: 9px; }
+.scanner-ctrl { display: flex; align-items: center; gap: 8px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.4px; color: var(--pm-grey-500); }
+.scanner-ctrl-lbl { font-size: 11px; }
+.scanner-ctrl-num { width: 64px; font-size: 13px; padding: 2px 5px;
+    border: 1px solid var(--pm-grey-300); border-radius: 3px;
     font-variant-numeric: tabular-nums; }
-.scanner-row-rec .scanner-fit-rank { color: var(--pm-urgent); font-weight: 700; }
-.scanner-fit-bar { flex: 1; height: 5px; min-width: 26px; background: var(--pm-grey-100);
-    border-radius: 3px; overflow: hidden; }
-.scanner-fit-fill { height: 100%; background: var(--pm-accent); }
-/* A ranked candidate carrying a suitability flag (over-extends, degraded
-   pricing): the computed warning is visible, full text in the title. */
-.scanner-fit-flag { color: var(--pm-urgent); font-weight: 700; flex: none; }
-.scanner-row-rec .scanner-fit-fill { background: var(--pm-urgent); }
+.scanner-ctrl-slider { width: 190px; }
+.scanner-scan-btn { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    background: var(--pm-charcoal); color: #fff; border: 0; padding: 7px 18px;
+    cursor: pointer; }
+.scanner-scan-btn:hover { background: var(--pm-accent); }
 
-/* Browse rows: candidates highlighted, the held strike marked, candidate rows clickable. */
-.scanner-row-cand { background: var(--pm-grey-50); }
-.scanner-row-held td { border-top: 1px solid var(--pm-urgent); }
-.scanner-clickable { cursor: pointer; }
-.scanner-clickable:hover { background: var(--pm-grey-100); }
-.scanner-tag { text-align: center; }
-.scanner-tag-costless { display: inline-block; padding: 1px 6px; font-size: 10px;
-    background: rgba(30, 126, 52, 0.12); color: var(--pos); border-radius: 3px; }
-.scanner-row { border-bottom: 1px solid var(--pm-grey-100); vertical-align: top; }
-.scanner-row:hover { background: var(--pm-grey-50); }
-.scanner-row td { padding: 6px 8px; }
-.scanner-row-rec { background: rgba(183, 121, 31, 0.06); }
-.scanner-row-rec:hover { background: rgba(183, 121, 31, 0.10); }
-.scanner-row-rec td { box-shadow: none; }
-.scanner-row-rec .scanner-rank { color: var(--pm-urgent); }
-.scanner-rank { text-align: center; font-variant-numeric: tabular-nums; color: var(--pm-grey-700);
-    border-left: 3px solid transparent; }
-.scanner-row-rec .scanner-rank { border-left-color: var(--pm-urgent); font-weight: 700; }
-.scanner-desc { font-family: "Consolas", monospace; color: var(--pm-charcoal); white-space: nowrap; }
+/* Charts: width from the class, HEIGHT from the component's explicit style —
+   never a CSS pin racing dcc.Graph's responsive inline height. */
+.scanner-smile-head { display: flex; align-items: center; justify-content: flex-end; }
+.scanner-expiry-dd { min-width: 140px; font-size: 13px; }
+.scanner-smile-graph { width: 100%; }
+.scanner-payoff-graph { width: 100%; }
+
+/* Honest-state notes: amber, one line each, never hidden. */
+.scanner-note { font-size: 13px; color: var(--pm-urgent); padding: 4px 0; }
+
+/* The "+N in chain · widen" line under the candidates grid. */
+.scanner-more { display: flex; justify-content: space-between; border: 1px solid
+    var(--pm-grey-300); border-top: 0; }
+.scanner-more-btn { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--pm-grey-500); background: #fff; border: 0; padding: 4px 10px;
+    cursor: pointer; }
+.scanner-more-btn:hover { color: var(--pm-charcoal); }
+
+/* Grid accents: rank/tag cells; the selected candidate row (pale amber). */
+.scanner-rank-cell { color: var(--pm-grey-700); font-variant-numeric: tabular-nums; }
+.scanner-tag-cell { color: var(--pos); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.3px; }
+.scanner-roster-role { text-transform: uppercase; font-size: 11px;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); }
+.scanner-content .ag-row-selected { background: rgba(183, 121, 31, 0.10) !important; }
+
+/* Current-vs-adjusted table. */
+.scanner-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cmp-tbl th { text-align: right; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); padding: 4px 8px;
+    border-bottom: 1px solid var(--pm-grey-300); }
+.cmp-tbl td { padding: 4px 8px; text-align: right; font-variant-numeric: tabular-nums; }
+.scanner-cmp-k { text-align: left !important; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--pm-grey-500); }
+.scanner-cmp-cur { color: var(--pm-grey-700); }
+
 .scanner-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .scanner-pos { color: var(--pos); }
 .scanner-neg { color: var(--neg); }
-.scanner-why { max-width: 340px; }
-.scanner-chip {
-    display: inline-block; margin: 0 4px 3px 0; padding: 1px 7px; font-size: 11px;
-    background: var(--pm-grey-50); color: var(--pm-grey-700); border-radius: 3px;
-}
-.scanner-chip-flag { background: rgba(183, 121, 31, 0.12); color: var(--pm-urgent); }
-
-/* Current-vs-candidate comparison (payoff popup's Scanner tab). */
-.scanner-compare:not(:empty) { margin-top: 14px; padding-top: 12px;
-    border-top: 1px solid var(--pm-grey-300); }
-.scanner-cmp-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--pm-grey-500); margin-bottom: 8px; }
-.scanner-cmp-title { font-size: 13px; font-weight: 600; color: var(--pm-charcoal); margin-bottom: 8px; }
-.scanner-cmp-dial { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-bottom: 10px; }
-.scanner-cmp-graph { width: 100%; height: 300px; }
-.scanner-compare-hidden { display: none; }
-.scanner-cmp-cols { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 8px; }
-.cmp-tbl { min-width: 300px; flex: 1; }
-.cmp-tbl th { text-align: right; font-size: 10.5px; text-transform: uppercase;
-    letter-spacing: 0.4px; color: var(--pm-grey-500); padding: 4px 8px;
-    border-bottom: 1px solid var(--pm-grey-300); }
-.cmp-lbl { text-align: left; color: var(--pm-grey-700); }
-.cmp-tbl td { padding: 4px 8px; }
-.cmp-foot td { border-top: 1px solid var(--pm-grey-300); font-weight: 600; }
-
 .scanner-empty { padding: 34px 10px; text-align: center; color: var(--pm-grey-500); font-size: 13px; }
-.scanner-loading { padding: 34px 10px; text-align: center; color: var(--pm-grey-500);
-    font-size: 13px; font-style: italic; }
-.scanner-footer { margin-top: 12px; font-size: 11px; color: var(--pm-grey-500); line-height: 1.5; }
+.scanner-honesty { margin-top: 12px; font-size: 11px; color: var(--pm-grey-500); line-height: 1.5; }
 
 /* ---- Risk section — terminal idiom (bands over rules; no cards) ----------- */
 

@@ -1,36 +1,41 @@
-"""Scanner drawer — the ranked roll/overlay candidates for a held position.
+"""Scanner drawer — the order-entry surface for rolling a position or a structure.
 
-Renders the candidate layer the compute side already produced (``pull_slice`` ->
-``generate_slice_candidates`` -> ``rank_slice_candidates`` on the cached slice) as a new
-``view='scanner'`` in the shared drawer: an identity header + the "pulled N min ago"
-stamp, the objective pills, and a dense ranked-candidate table with each row's plain
-reasons/flags. The rank-1 row is the recommended default.
+Layout (the approved order-entry idiom): identity header (ticker · spot · day move ·
+account · as-of) → MANAGING (the structure's legs as a roster grid whose checkboxes
+ARE the rolled set, plus the structure's stored current economics) → SCAN (objective
+tokens, the shared DTE and |Δ| range dials, Scan) → RICHNESS (the full-width smile:
+in-fit dots filled, filtered hollow, the fitted line dashed, the selected candidate
+ringed; IV-rank · IV/RV · fit R² beneath) → CANDIDATES (the ranked answer set as a
+grid, the full chain collapsed behind a "+N in chain" line, the widen-window pull) →
+CURRENT VS ADJUSTED (kept legs at entry, new legs at mid — one accounting basis) →
+PAYOFF (the adjusted structure at expiry and today) → the shock dials.
 
-The drawer opens immediately with a "scanning…" placeholder; a one-shot loader then
-runs the on-demand chain pull (the sanctioned owned-state write path) and fills the
-table — so a slow first pull never blocks the drawer from appearing. Objective-pill
-switches read the cached ranking with no recompute; Refresh re-pulls the slice.
-
-Render-only: the view reads through ``state_access.scanner_view_data`` and never prices
-or ranks anything itself. All colour is the shared --pm-*/--pos/--neg tokens.
+One rolled leg scans the single-leg path; two or more drive the joint path (one
+common new expiry, spreads keep their width). Render-only: every number comes from
+``state_access`` (the sanctioned on-demand pull + the cached rankings); the view
+never prices or ranks anything itself. Honest states render — a joint roll with no
+admissible target, a truncated enumeration, a partial-slice remainder, a degraded
+fit — they are never hidden. All colour is the shared --pm-*/--pos/--neg tokens.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
+import dash_ag_grid as dag
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
 from pm.candidates.generate import _COSTLESS_PER_SHARE
 from pm.ui import state_access as sa
 from pm.ui.deepdive.aggregations import _fmt_money
+from pm.ui.dial_sync import register_dial_sync, register_range_dial_sync
 
-# Objective labels + the order the pills read in (the recommender seed picks the default,
-# the pills override). Any objective the ranker emits that is not listed still shows.
+# Objective labels + the order the tokens read in (the recommender seed picks the
+# default, the tokens override). Any objective the ranker emits still shows.
 _OBJ_LABEL = {
     "roll-up-out": "Roll away & out",
-    "costless": "Costless",
+    "costless": "Costless · near · max cap",
     "roll-for-credit": "Roll for credit",
-    "defend-cut-delta": "Defend / cut Δ",
+    "defend-cut-delta": "Cut Δ",
     "extend-duration": "Extend duration",
     "max-premium": "Max premium",
     "add-hedge": "Add hedge",
@@ -38,14 +43,9 @@ _OBJ_LABEL = {
 _OBJ_ORDER = ["roll-up-out", "costless", "roll-for-credit", "defend-cut-delta",
               "extend-duration", "max-premium", "add-hedge"]
 
-# Slice window: base expiries pulled, and the Expand ceiling (bounded — never the full
-# chain). Each Expand click adds one expiry, reusing the already-enumerated chain.
-_BASE_EXPIRIES = 3
-_MAX_EXPIRIES = 6
-
-# The recommender's action -> the default objective pill (action-level; the rule_id
-# sub-splits stay a later refinement). An unmapped / neutral label (CLOSE, HARVEST_THETA,
-# TRIM, ADD, MONITOR) opens on the first present objective.
+# The recommender's action -> the default objective token (action-level; the rule_id
+# sub-splits stay a later refinement). An unmapped / neutral label (CLOSE,
+# HARVEST_THETA, TRIM, ADD, MONITOR) opens on the first present objective.
 _SEED = {
     "ROLL_OUT": "roll-for-credit",
     "ROLL_OUT_AND_DOWN": "defend-cut-delta",
@@ -54,10 +54,20 @@ _SEED = {
     "ADD_HEDGE": "defend-cut-delta",
 }
 
-_HONESTY = ("Ranked by objective-fit and client-fit — advisory, not an order. Economics and "
-            "PoP use the live American pricer; IV+pp is the within-set short-leg richness "
-            "percentile (the raw ±pp is in each row's reason); the chain is on-demand (see the "
-            "stamp), not streaming.")
+_HONESTY = ("Ranked by objective-fit and client-fit — advisory, not an order. Economics "
+            "and PoP use the live American pricer; P(assign) is the short leg's own |Δ|, "
+            "a proxy; IV+pp is richness vs this chain's own fitted smile (shape) and "
+            "IV-rank the 52-week level; the chain is on-demand (see the as-of), not "
+            "streaming.")
+
+_TOP_N = 5              # the ranked answer set above the collapsed chain
+_CHARCOAL = "#2B2B2B"
+_GREY5 = "#6E6E6E"
+_GRID = "#E8E8E8"
+_HOLLOW = "#B5B5B5"
+_AMBER = "#B7791F"
+_FONT = {"family": "Segoe UI, Helvetica Neue, Arial, sans-serif",
+         "size": 11, "color": _CHARCOAL}
 
 
 # ---------------------------------------------------------------------------
@@ -75,15 +85,11 @@ def _sign(v) -> str:
 
 
 def _maxup(e) -> str:
-    """Profit-only max-upside cell: '∞' for an unbounded-gain candidate (whose
-    max_profit is the None sentinel — a bare _money would show the missing-data
-    dash where infinity is meant)."""
     return "∞" if e.get("unbounded_gain") else _money(e.get("max_profit"))
 
 
-def _maxpl(e) -> str:
-    ml = "−∞" if e.get("unbounded_loss") else _money(e.get("max_loss"))
-    return f"{_maxup(e)} / {ml}"
+def _maxdn(e) -> str:
+    return "−∞" if e.get("unbounded_loss") else _money(e.get("max_loss"))
 
 
 def _pop(v) -> str:
@@ -92,10 +98,6 @@ def _pop(v) -> str:
 
 def _delta(v) -> str:
     return f"{v:+.2f}" if v is not None else "—"
-
-
-def _ivpp(v) -> str:
-    return f"{round(v * 100)}%ile" if v is not None else "—"
 
 
 def _px(v) -> str:
@@ -121,68 +123,47 @@ def _exp(d) -> str:
         return "—"
 
 
-def _breakevens(c) -> str:
-    return " / ".join(f"{b:,.2f}" for b in (getattr(c, "breakevens", None) or [])) or "—"
-
-
 def _primary_leg(c):
-    """The candidate's contract for the Contract columns — the short option leg the
-    transaction OPENS (the roll/write target), else its first opened option leg. A
-    structure-anchored roll carries the enclosing structure's kept legs too; those
-    never key the row (a put-side roll must not key on the kept short call).
-    Candidates without the marker fall back over all option legs. None for a
-    stock-only candidate."""
+    """The candidate's contract — the short option leg the transaction OPENS (the
+    roll/write target), else its first opened option leg. Kept sibling legs of an
+    enclosing structure never key the row. None for a stock-only candidate."""
     opts = [lg for lg in (getattr(c, "legs", None) or []) if lg.get("opt_type") in ("Call", "Put")]
     pool = [lg for lg in opts if lg.get("opened")] or opts
     shorts = [lg for lg in pool if (lg.get("qty") or 0) < 0]
     return (shorts or pool or [None])[0]
 
 
-def _identity(pos) -> str:
-    if pos is None:
-        return "Scan candidates"
-    name = pos.underlying_symbol or pos.symbol or "—"
-    if pos.asset_class == "option":
-        right = (pos.right or "")[:1]
-        strike = f"{pos.strike:g}" if pos.strike is not None else "?"
-        expiry = pos.expiry.strftime("%b-%y") if pos.expiry else ""
-        return f"{name} {strike}{right} {expiry}".strip()
-    return f"{name} · {pos.asset_class}"
+def _is_costless(c) -> bool:
+    """True when the candidate's TRANSACTION is (near-)costless — reads the
+    roll/overlay's own net, never the resulting position's entry cost."""
+    nc = getattr(c, "net_credit", None)
+    if nc is None:
+        return False
+    opts = [lg for lg in (getattr(c, "legs", None) or [])
+            if lg.get("opt_type") in ("Call", "Put")]
+    pool = [lg for lg in opts if lg.get("opened")] or opts
+    contracts = sum(abs(int(lg.get("qty") or 0)) for lg in pool) or 1
+    return abs(nc) <= _COSTLESS_PER_SHARE * 100 * max(contracts, 1)
 
 
-def _stamp(pulled_at, kind, spot_asof=None) -> str:
+def _stamp(pulled_at, kind, spot_asof) -> str:
     if pulled_at is None:
-        # The overlay path prices off the morning snapshot, not a stamped chain pull.
-        return "spot from snapshot" if (kind and kind != "option") else "—"
-    mins = int((datetime.now() - pulled_at).total_seconds() // 60)
-    rel = "just now" if mins <= 0 else ("1 min ago" if mins == 1 else f"{mins} min ago")
-    # The spot's own as-of, disclosed beside the pull time: "live" means the
-    # underlier rode in the same snapshot request as the candidate quotes.
-    spot_note = {"live": " · spot live", "snapshot": " · spot from morning snapshot"}.get(spot_asof, "")
-    return f"pulled {rel} · this name only{spot_note}"
-
-
-# ---------------------------------------------------------------------------
-# Pills + table
-# ---------------------------------------------------------------------------
-
-def _ordered_objectives(ranked) -> list:
-    present = [o for o in _OBJ_ORDER if ranked.get(o)]
-    present += [o for o in ranked if o not in _OBJ_ORDER and ranked.get(o)]
-    return present
+        return "spot from morning snapshot" if kind != "option" else "—"
+    mins = max(int((datetime.now() - pulled_at).total_seconds() // 60), 0)
+    ago = "just now" if mins == 0 else f"{mins} min ago"
+    tail = {"live": " · spot live", "snapshot": " · spot from morning snapshot"}.get(spot_asof, "")
+    return f"pulled {ago} · this name only{tail}"
 
 
 def _seed_objective(account, position_id, objectives) -> str:
-    """The default pill, in priority order: the held option's moneyness (an ITM short
-    call leads with Roll away & out, an OTM one with Max premium), then the recommender's
-    action, then the first present objective. Best-effort — any gap falls back cleanly."""
+    """The default token: the held option's moneyness (an ITM short leads with the
+    away roll, OTM with premium), then the recommender's action, then the first
+    present objective. Best-effort — any gap falls back cleanly."""
     try:
         state = sa.get_state()
         acc = state.accounts.get(account) if state else None
         pos = sa.position_by_id(state, account, position_id) if state else None
         if acc is not None and pos is not None:
-            # Moneyness lead — a held SHORT option: ITM -> roll away & out (calls:
-            # spot above strike; puts: spot below); OTM -> collect premium.
             right = (pos.right or "").upper()
             if (getattr(pos, "asset_class", None) == "option" and pos.strike is not None
                     and right in ("CALL", "PUT") and (pos.quantity or 0) < 0):
@@ -203,252 +184,549 @@ def _seed_objective(account, position_id, objectives) -> str:
     return objectives[0]
 
 
-def _pills(ranked, objectives, active) -> list:
+def _ordered_objectives(ranked) -> list:
+    present = [o for o in _OBJ_ORDER if ranked.get(o)]
+    present += [o for o in ranked if o not in _OBJ_ORDER and ranked.get(o)]
+    return present
+
+
+def _tokens(ranked, objectives, active) -> list:
     out = []
     for o in objectives:
         n = len(ranked.get(o) or [])
-        cls = "scanner-pill" + (" scanner-pill-active" if o == active else "")
+        cls = "scanner-tok" + (" scanner-tok-on" if o == active else "")
         out.append(html.Button(f"{_OBJ_LABEL.get(o, o)} · {n}",
-                               id={"type": "scanner-obj", "obj": o}, n_clicks=0, className=cls))
+                               id={"type": "scanner-obj", "obj": o}, n_clicks=0,
+                               className=cls))
     return out
 
 
-# Costless band: |the ROLL TRANSACTION's net| within _COSTLESS_PER_SHARE (× 100 ×
-# contracts) reads "costless" — the constant is single-sourced from the generation
-# layer (imported above) so the tag and the COSTLESS objective share one band.
+# ---------------------------------------------------------------------------
+# Grids
+# ---------------------------------------------------------------------------
+
+_GRID_OPTS = {"rowHeight": 28, "headerHeight": 32, "suppressCellFocus": True,
+              "enableCellTextSelection": True, "ensureDomOrder": True,
+              "domLayout": "autoHeight"}
+
+_ROSTER_COLS = [
+    {"field": "role", "headerName": "Leg", "width": 110,
+     "cellClass": "scanner-roster-role"},
+    {"field": "contract", "headerName": "Contract", "flex": 2, "minWidth": 130,
+     "tooltipField": "contract"},
+    {"field": "qty", "headerName": "Qty", "width": 70, "type": "rightAligned"},
+    {"field": "dte", "headerName": "DTE", "width": 70, "type": "rightAligned"},
+    {"field": "delta", "headerName": "Δ", "width": 80, "type": "rightAligned"},
+    {"field": "mid", "headerName": "Mid", "width": 80, "type": "rightAligned",
+     "headerTooltip": "morning-snapshot mid"},
+    {"field": "p_assign", "headerName": "P(assign)", "width": 96, "type": "rightAligned",
+     "headerTooltip": "the short leg's own |Δ| — a proxy, not a model probability",
+     "checkboxSelection": False},
+]
 
 
-def _is_costless(c) -> bool:
-    """True when the candidate's TRANSACTION is (near-)costless.
-
-    Reads ``Candidate.net_credit`` — the roll/overlay's own net, the number the
-    row's Net column shows — NOT ``economics.net_debit_credit``, which is the
-    RESULTING position's entry cost (stock basis included): that number tagged a
-    deeply-debit roll "costless" (tiny resulting entry) while genuinely costless
-    rolls never tagged (the new leg's whole premium)."""
-    nc = getattr(c, "net_credit", None)
-    if nc is None:
-        return False
-    leg = _primary_leg(c)
-    contracts = abs(int(leg.get("qty") or 1)) if leg else 1
-    return abs(nc) <= _COSTLESS_PER_SHARE * 100 * max(contracts, 1)
-
-
-def _right(r) -> str:
-    return {"CALL": "C", "PUT": "P"}.get(r, r or "")
+def _roster_grid():
+    cols = [{"headerName": "Roll", "checkboxSelection": True, "width": 62,
+             "headerTooltip": "legs ticked here roll together — one is the "
+                              "single-leg scan, two or more roll jointly to one "
+                              "shared new expiry"}] + _ROSTER_COLS
+    return dag.AgGrid(
+        id="scanner-roster-grid", className="ag-theme-balham blotter-grid",
+        columnDefs=cols, rowData=[],
+        getRowId="params.data.position_id",
+        dashGridOptions={**_GRID_OPTS, "rowSelection": "multiple",
+                         "suppressRowClickSelection": True},
+        style={"width": "100%"},
+    )
 
 
-def _exp_ord(d) -> int:
-    try:
-        return d.toordinal()
-    except Exception:
-        return 0
+def _cand_grid():
+    return dag.AgGrid(
+        id="scanner-cand-grid", className="ag-theme-balham blotter-grid",
+        columnDefs=_cand_cols("New legs", "BE"), rowData=[],
+        getRowId="params.data.row_id",
+        dashGridOptions={**_GRID_OPTS, "rowSelection": "single"},
+        style={"width": "100%"},
+    )
 
 
-def _fit_indicator(rc):
-    """A compact strength mark for a ranked candidate — the rank (★ on rank 1) beside a
-    small fit bar from the combined score. The ranking's computed reasons and flags
-    surface HERE: an amber ⚠ when any flag is present (over-extends, degraded
-    pricing) with the full flag + reason text in the title — a computed suitability
-    warning must never stay invisible. The full inline render belongs to the
-    compare-step redesign."""
-    score = rc.score if rc.score is not None else 0.0
-    pct = max(0, min(100, round(score * 100)))
-    label = "★" if rc.rank == 1 else str(rc.rank)
-    flags = list(getattr(rc, "flags", None) or [])
-    reasons = list(getattr(rc, "reasons", None) or [])
-    tip = f"rank {rc.rank} · fit {pct}"
-    detail = "\n".join(flags + reasons)
-    if detail:
-        tip += "\n" + detail
-    children = [
-        html.Span(label, className="scanner-fit-rank"),
-        html.Div(className="scanner-fit-bar",
-                 children=html.Div(className="scanner-fit-fill", style={"width": f"{pct}%"})),
+def _cand_cols(move_hdr: str, be_hdr: str) -> list:
+    return [
+        {"field": "rank", "headerName": "#", "width": 58,
+         "tooltipField": "flags",
+         "cellClass": "scanner-rank-cell"},
+        {"field": "move", "headerName": move_hdr, "flex": 2, "minWidth": 170,
+         "tooltipField": "reasons"},
+        {"field": "dte", "headerName": "DTE", "width": 66, "type": "rightAligned"},
+        {"field": "net", "headerName": "Net", "width": 92, "type": "rightAligned",
+         "headerTooltip": "the transaction's own net cash — credit positive",
+         "cellClass": {"function": "params.data.net_sign"}},
+        {"field": "tag", "headerName": "", "width": 84,
+         "cellClass": "scanner-tag-cell"},
+        {"field": "ivpp", "headerName": "IV+pp", "width": 78, "type": "rightAligned",
+         "headerTooltip": "the opened short leg's IV minus the fitted smile, vol points"},
+        {"field": "maxp", "headerName": "Max profit", "width": 130, "type": "rightAligned",
+         "headerTooltip": "resulting structure · $ and % of NAV"},
+        {"field": "maxl", "headerName": "Max loss", "width": 100, "type": "rightAligned",
+         "cellClass": {"function": "params.data.maxl_cls"}},
+        {"field": "be", "headerName": be_hdr, "width": 88, "type": "rightAligned",
+         "headerTooltip": "the breakeven on the rolled side — upper for call rolls, "
+                          "lower for put rolls, both when mixed"},
+        {"field": "passign", "headerName": "P(assign)", "width": 92, "type": "rightAligned",
+         "headerTooltip": "per opened short leg, its own |Δ| — two shorts show both"},
+        {"field": "ndelta", "headerName": "Δ", "width": 104, "type": "rightAligned",
+         "headerTooltip": "resulting structure net delta, share-equivalents"},
     ]
-    if flags:
-        children.append(html.Span("⚠", className="scanner-fit-flag"))
-    return html.Div(className="scanner-fit", title=tip, children=children)
 
 
-def _cand_by_ticker(ranked_active) -> dict:
-    """{contract ticker -> RankedCandidate} for the active objective, so a browse row can
-    tell whether it is an actionable candidate (its short leg's contract)."""
-    out: dict = {}
-    for rc in (ranked_active or []):
-        leg = _primary_leg(rc.candidate)
-        tk = leg.get("position_id") if leg else None
-        if tk and tk not in out:
-            out[tk] = rc
-    return out
+_CHAIN_COLS = [
+    {"field": "strike", "headerName": "Strike", "width": 84, "type": "rightAligned"},
+    {"field": "expiry", "headerName": "Exp", "width": 100},
+    {"field": "right", "headerName": "C/P", "width": 56},
+    {"field": "bid", "headerName": "Bid", "width": 76, "type": "rightAligned"},
+    {"field": "ask", "headerName": "Ask", "width": 76, "type": "rightAligned"},
+    {"field": "mid", "headerName": "Mid", "width": 76, "type": "rightAligned"},
+    {"field": "iv", "headerName": "IV", "width": 70, "type": "rightAligned"},
+    {"field": "delta", "headerName": "Δ", "width": 76, "type": "rightAligned"},
+    {"field": "oi", "headerName": "OI", "width": 84, "type": "rightAligned"},
+    {"field": "fit", "headerName": "Fit", "flex": 2, "minWidth": 90,
+     "headerTooltip": "in the smile regression, or the exclusion reason class"},
+]
 
 
-def _browse_row(ct, rc, held_strike) -> html.Tr:
-    is_cand = rc is not None
-    cls = "scanner-row"
-    if is_cand and rc.rank == 1:
-        cls += " scanner-row-rec"
-    elif is_cand:
-        cls += " scanner-row-cand"
-    if held_strike is not None and ct.get("strike") == held_strike:
-        cls += " scanner-row-held"
-    e = (rc.candidate.economics or {}) if is_cand else {}
-    nc = rc.candidate.net_credit if is_cand else None
-    cells = [
-        html.Td(_fit_indicator(rc) if is_cand else "", className="scanner-rank"),
-        # Contract (every snapshotted contract)
-        html.Td(_strike(ct.get("strike")), className="scanner-num scanner-grp"),
-        html.Td(_exp(ct.get("expiry")), className="scanner-mono"),
-        html.Td(_right(ct.get("right")), className="scanner-num"),
-        html.Td(_px(ct.get("bid")), className="scanner-num"),
-        html.Td(_px(ct.get("ask")), className="scanner-num"),
-        html.Td(_px(ct.get("mid")), className="scanner-num"),
-        html.Td(_iv(ct.get("iv")), className="scanner-num"),
-        html.Td(_delta(ct.get("delta")), className="scanner-num"),
-        html.Td(_int(ct.get("oi")), className="scanner-num"),
-        # Roll · resulting position (candidates only)
-        html.Td(_money(nc) if is_cand else "",
-                className=f"scanner-num scanner-grp {_sign(nc) if is_cand else ''}".strip()),
-        html.Td(_pop(e.get("pop")) if is_cand else "", className="scanner-num"),
-        html.Td(_maxup(e) if is_cand else "", className="scanner-num"),
-        html.Td(html.Span("costless", className="scanner-tag-costless")
-                if (is_cand and _is_costless(rc.candidate)) else "", className="scanner-tag"),
-    ]
-    if is_cand:
-        return html.Tr(id={"type": "scanner-cand", "obj": rc.candidate.objective, "rank": rc.rank},
-                       className=cls + " scanner-clickable", children=cells)
-    return html.Tr(className=cls, children=cells)
-
-
-def _browse_table(contracts, ranked_active, held_strike) -> html.Div:
-    """Every snapshotted contract in the slice as a browse row; the active objective's
-    ranked candidates float to the top and carry the roll economics + a compact fit mark."""
-    if not contracts:
-        return html.Div("No contracts in the slice.", className="scanner-empty")
-    cbt = _cand_by_ticker(ranked_active)
-
-    def key(ct):
-        rc = cbt.get(ct.get("ticker"))
-        if rc is not None:
-            return (0, rc.rank, 0.0)
-        return (1, _exp_ord(ct.get("expiry")), float(ct.get("strike") or 0))
-
-    rows = sorted(contracts, key=key)
-    group_head = html.Tr(className="scanner-grouprow", children=[
-        html.Th("Fit", className="scanner-th-rank"),
-        html.Th("Contract", colSpan=9, className="scanner-th scanner-th-grp"),
-        html.Th("Roll · resulting", colSpan=4, className="scanner-th scanner-th-grp"),
-    ])
-    cols = [("", "scanner-th-rank"), ("Strike", "scanner-th-num scanner-grp"), ("Exp", ""),
-            ("C/P", "scanner-th-num"), ("Bid", "scanner-th-num"), ("Ask", "scanner-th-num"),
-            ("Mid", "scanner-th-num"), ("IV", "scanner-th-num"), ("Δ", "scanner-th-num"),
-            ("OI", "scanner-th-num"), ("Net", "scanner-th-num scanner-grp"),
-            ("PoP", "scanner-th-num"), ("Max upside", "scanner-th-num"), ("", "")]
-    col_head = html.Tr([html.Th(h, className=f"scanner-th {cls}".strip()) for h, cls in cols])
-    return html.Table(className="scanner-tbl",
-                      children=[html.Thead([group_head, col_head]),
-                                html.Tbody([_browse_row(ct, cbt.get(ct.get("ticker")), held_strike)
-                                            for ct in rows])])
+def _chain_grid():
+    return dag.AgGrid(
+        id="scanner-chain-grid", className="ag-theme-balham blotter-grid",
+        columnDefs=_CHAIN_COLS, rowData=[], dashGridOptions=dict(_GRID_OPTS),
+        style={"width": "100%"},
+    )
 
 
 # ---------------------------------------------------------------------------
-# Vol smile — single expiry, reusing the fitted vol surface + per-contract IV+pp
+# Figures (house-token Plotly; explicit inline heights — the responsive:True
+# inline height:100% race against a CSS pin is closed by pinning the STYLE)
 # ---------------------------------------------------------------------------
 
-def _expiry_options(contracts) -> list:
-    exps = sorted({c.get("expiry") for c in contracts if c.get("expiry") is not None}, key=_exp_ord)
-    return [{"label": e.strftime("%d-%b-%y"), "value": e.isoformat()} for e in exps]
-
-
-# Fewer than this many listed strikes on an expiry can't support a smile — show the honest
-# message rather than a near-empty plot.
-_SMILE_MIN_POINTS = 4
-
-
-def _smile_message(text):
+def _fig_base(height):
     import plotly.graph_objects as go
-
-    from pm.ui.drawers.payoff import _FONT, _MUTED
     fig = go.Figure()
-    fig.add_annotation(text=text, showarrow=False, xref="paper", yref="paper", x=0.5, y=0.5,
-                       align="center", font=dict(family=_FONT, color=_MUTED, size=12))
     fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      autosize=True, margin=dict(l=8, r=8, t=8, b=8),
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
+                      font=_FONT, margin=dict(l=44, r=14, t=8, b=34),
+                      showlegend=False, hovermode="closest", height=height)
     return fig
 
 
-def _smile_figure(contracts, surface, expiry_iso, spot, held_strike):
-    import math
-    from datetime import date
+def _msg_fig(text, height=230):
+    fig = _fig_base(height)
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False),
+                      annotations=[dict(text=text, showarrow=False,
+                                        font={**_FONT, "color": _GREY5})])
+    return fig
 
+
+def _smile_fig(view, expiry_iso, selected) -> "object":
+    """The Richness chart: dots per snapshotted contract at the shown expiry
+    (filled = in the fit), the fitted line DASHED, spot + each rolled strike as
+    dotted verticals, the selected candidate ringed amber with its label. A
+    degraded fit draws dots and says so — never a fake line."""
     import plotly.graph_objects as go
-
-    from pm.ui.drawers.payoff import _AMBER, _CHARCOAL, _FONT, _GREY3, _GRID, _MUTED
-    pts = [c for c in contracts if c.get("expiry") is not None
-           and c["expiry"].isoformat() == expiry_iso
+    contracts = view.get("contracts") or []
+    pts = [c for c in contracts
+           if str(c.get("expiry")) == str(expiry_iso)
            and c.get("iv") is not None and c.get("strike")]
-    if len(pts) < _SMILE_MIN_POINTS:
-        return _smile_message("Too few listed strikes to fit a smile for this expiry — "
-                              "see the chain below.")
-    fig = go.Figure()
-    hollow = [c for c in pts if not c.get("in_fit")]
+    if len(pts) < 4:
+        return _msg_fig("Too few listed strikes to draw a smile for this expiry — "
+                        "see the chain below.")
+    fig = _fig_base(230)
     filled = [c for c in pts if c.get("in_fit")]
-    if hollow:
-        fig.add_trace(go.Scatter(x=[c["strike"] for c in hollow], y=[c["iv"] for c in hollow],
-            mode="markers", name="excluded", marker=dict(color=_GREY3, size=7, symbol="circle-open"),
-            hovertemplate="K %{x:g}<br>IV %{y:.1f}<extra></extra>"))
+    hollow = [c for c in pts if not c.get("in_fit")]
     if filled:
-        fig.add_trace(go.Scatter(x=[c["strike"] for c in filled], y=[c["iv"] for c in filled],
-            mode="markers", name="in fit", marker=dict(color=_CHARCOAL, size=8),
-            hovertemplate="K %{x:g}<br>IV %{y:.1f}<extra></extra>"))
-    if surface is not None and not getattr(surface, "degraded", True) and spot and pts:
-        dte = max((pts[0]["expiry"] - date.today()).days, 1)
-        T = dte / 365.0
-        xy = []
-        for k in sorted(c["strike"] for c in pts):
-            try:
-                v = surface.evaluate(math.log(k / spot), T)
-            except Exception:
-                v = None
-            if v is not None:
-                xy.append((k, v))
-        if xy:
-            fig.add_trace(go.Scatter(x=[p[0] for p in xy], y=[p[1] for p in xy], mode="lines",
-                name="fitted", line=dict(color=_AMBER, width=2)))
-    if held_strike is not None:
-        fig.add_vline(x=held_strike, line=dict(color=_MUTED, width=1.5, dash="dash"))
-    if spot is not None:
-        fig.add_vline(x=spot, line=dict(color=_MUTED, width=1))
+        fig.add_scatter(x=[c["strike"] for c in filled], y=[c["iv"] for c in filled],
+                        mode="markers", marker=dict(color=_CHARCOAL, size=6),
+                        hovertemplate="%{x} · IV %{y:.1f}%<extra></extra>")
+    if hollow:
+        fig.add_scatter(x=[c["strike"] for c in hollow], y=[c["iv"] for c in hollow],
+                        mode="markers",
+                        marker=dict(color="rgba(0,0,0,0)", size=6,
+                                    line=dict(color=_HOLLOW, width=1)),
+                        hovertemplate="%{x} · filtered from fit<extra></extra>")
+    surface, spot = view.get("surface"), view.get("spot")
+    degraded = surface is None or getattr(surface, "degraded", True)
+    if not degraded and spot:
+        import math
+        ks = sorted(c["strike"] for c in pts)
+        exp_d = pts[0].get("expiry")
+        try:
+            dte = max((exp_d - date.today()).days, 1)
+        except Exception:
+            dte = 30
+        t = dte / 365.0
+        lo, hi = ks[0], ks[-1]
+        xs = [lo + (hi - lo) * i / 60.0 for i in range(61)]
+        ys = [surface.evaluate(math.log(x / spot), t) for x in xs]
+        fig.add_scatter(x=xs, y=ys, mode="lines",
+                        line=dict(color=_CHARCOAL, width=1.4, dash="dash"),
+                        hoverinfo="skip")
+    shapes, annotations = [], []
+    if spot:
+        shapes.append(dict(type="line", x0=spot, x1=spot, yref="paper", y0=0, y1=1,
+                           line=dict(color=_GREY5, width=1, dash="dot")))
+        annotations.append(dict(x=spot, y=1, yref="paper", text="spot",
+                                showarrow=False, font={**_FONT, "color": _GREY5},
+                                yshift=8))
+    for mark in (view.get("rolled_marks") or []):
+        shapes.append(dict(type="line", x0=mark["strike"], x1=mark["strike"],
+                           yref="paper", y0=0, y1=1,
+                           line=dict(color=_AMBER, width=1, dash="dot")))
+        annotations.append(dict(x=mark["strike"], y=1, yref="paper",
+                                text=mark["label"], showarrow=False,
+                                font={**_FONT, "color": _AMBER}, yshift=8))
+    if selected and selected.get("strike") is not None and selected.get("iv") is not None:
+        fig.add_scatter(x=[selected["strike"]], y=[selected["iv"]],
+                        mode="markers+text",
+                        marker=dict(color="rgba(0,0,0,0)", size=14,
+                                    line=dict(color=_AMBER, width=2)),
+                        text=[selected.get("label") or ""],
+                        textposition="top center",
+                        textfont={**_FONT, "color": _AMBER}, hoverinfo="skip")
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family=_FONT, color=_CHARCOAL, size=11),
-        margin=dict(l=48, r=12, t=22, b=36), height=270,
-        legend=dict(orientation="h", y=1.18, x=0, font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(title="strike", gridcolor=_GRID, zeroline=False),
-        yaxis=dict(title="IV %", gridcolor=_GRID, zeroline=False))
+        xaxis=dict(title={"text": "strike", "font": _FONT}, gridcolor=_GRID,
+                   zeroline=False, tickfont=_FONT),
+        yaxis=dict(title={"text": "IV", "font": _FONT}, ticksuffix="%",
+                   gridcolor=_GRID, zeroline=False, tickfont=_FONT),
+        shapes=shapes, annotations=annotations)
+    if degraded:
+        fig.add_annotation(text="fit degraded — no surface line",
+                           xref="paper", yref="paper", x=0.99, y=0.02,
+                           showarrow=False, font={**_FONT, "color": _AMBER})
+    return fig
+
+
+def _payoff_fig(res) -> "object":
+    """The adjusted structure at expiry (solid) and today (dashed), breakevens as
+    dotted verticals labeled at the axis, the current spot dotted on P&L = 0."""
+    if not res:
+        return _msg_fig("Select a candidate above to draw the adjusted payoff.", 240)
+    grid = res.get("grid")
+    exp_curve = res.get("expiry_curve")
+    if grid is None or len(grid) == 0 or exp_curve is None:
+        return _msg_fig("Payoff unavailable for this candidate (pricing degraded).", 240)
+    # The candidate result is the raw engine dict — its arrays are numpy; Dash's
+    # JSON layer wants plain floats.
+    xs = [float(v) for v in grid]
+    fig = _fig_base(240)
+    fig.add_scatter(x=xs, y=[float(v) for v in exp_curve], mode="lines",
+                    line=dict(color=_CHARCOAL, width=2),
+                    hovertemplate="%{x:.2f} · $%{y:,.0f}<extra>at expiry</extra>")
+    hz = res.get("horizon_curve")
+    if hz is not None:
+        fig.add_scatter(x=xs, y=[float(v) for v in hz], mode="lines",
+                        line=dict(color=_GREY5, width=1.3, dash="dash"),
+                        hoverinfo="skip")
+    spot = res.get("spot")
+    if spot:
+        fig.add_scatter(x=[float(spot)], y=[0], mode="markers+text",
+                        marker=dict(color=_CHARCOAL, size=7), text=["now"],
+                        textposition="top center", textfont=_FONT, hoverinfo="skip")
+    shapes, annotations = [], []
+    for b in (res.get("breakevens") or []):
+        b = float(b)
+        shapes.append(dict(type="line", x0=b, x1=b, yref="paper", y0=0, y1=1,
+                           line=dict(color=_HOLLOW, width=1, dash="dot")))
+        annotations.append(dict(x=b, y=0, text=f"{b:,.0f} BE", showarrow=False,
+                                font={**_FONT, "color": _GREY5}, yshift=-12))
+    fig.update_layout(
+        xaxis=dict(title={"text": "underlying", "font": _FONT}, gridcolor=_GRID,
+                   zeroline=False, tickfont=_FONT),
+        yaxis=dict(title={"text": "P&L $", "font": _FONT}, gridcolor=_GRID,
+                   zeroline=True, zerolinecolor=_CHARCOAL, zerolinewidth=1,
+                   tickfont=_FONT),
+        shapes=shapes, annotations=annotations)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Body + fill
+# Row + block builders
+# ---------------------------------------------------------------------------
+
+def _roster_rows(roster) -> list:
+    rows = []
+    for r in (roster or {}).get("rows", []):
+        rows.append({
+            "position_id": r["position_id"],
+            "role": (r.get("role") or "").replace("_", " "),
+            "contract": (r.get("contract") or "—") + (" ◂" if r.get("anchor") else ""),
+            "qty": f"{r['qty']:g}" if r.get("qty") is not None else "—",
+            "dte": _int(r.get("dte")) if r.get("dte") is not None else "—",
+            "delta": _delta(r.get("delta")),
+            "mid": _px(r.get("mid")),
+            "p_assign": f"{r['p_assign']:.2f}" if r.get("p_assign") is not None else "—",
+        })
+    return rows
+
+
+def _roster_cap(roster, rolled_pids) -> list:
+    econ = (roster or {}).get("econ") or {}
+    t2 = econ.get("tier2") or {}
+    bits = []
+    stype = (econ.get("structure_type") or "").replace("_", " ")
+    if stype:
+        status = econ.get("status") or ""
+        bits.append(html.Span(f"{stype} · {status}", className="scanner-cap-k"))
+    nd = econ.get("net_delta")
+    bits.append(_cap_pair("Δ", f"{nd:+,.0f}" if nd is not None else "—"))
+    ndc = t2.get("net_debit_credit")
+    if ndc is not None:
+        lbl = "net credit" if ndc < 0 else "net debit"
+        bits.append(_cap_pair(lbl, _money(abs(ndc))))
+    mp, ml = t2.get("max_profit"), t2.get("max_loss")
+    bits.append(_cap_pair("max profit", "∞" if t2.get("unbounded_gain") else _money(mp)))
+    bits.append(_cap_pair("max loss", "−∞" if t2.get("unbounded_loss") else _money(ml)))
+    bes = t2.get("breakevens")
+    bits.append(_cap_pair("BE", " / ".join(f"{b:,.0f}" for b in bes) if bes else "—"))
+    n = len(rolled_pids or [])
+    bits.append(_cap_pair("rolling", f"{n} leg{'s' if n != 1 else ''}"))
+    out = []
+    for i, b in enumerate(bits):
+        if i:
+            out.append(html.Span(" · ", className="scanner-cap-sep"))
+        out.append(b)
+    return out
+
+
+def _cap_pair(label, value):
+    return html.Span([html.Span(f"{label} ", className="scanner-cap-k"),
+                      html.Span(value, className="scanner-cap-v")])
+
+
+def _smile_cap(view) -> list:
+    ivr = (view.get("iv_rank") or {})
+    pct = ivr.get("percentile")
+    ivr_txt = f"{round(pct * 100)}" if pct is not None else "—"
+    ratio = view.get("iv_rv_ratio")
+    r2 = view.get("fit_r2")
+    return [
+        _cap_pair("IVR 1y", ivr_txt), html.Span(" · ", className="scanner-cap-sep"),
+        _cap_pair("IV / 30d RV", f"{ratio:.2f}" if ratio is not None else "—"),
+        html.Span(" · ", className="scanner-cap-sep"),
+        _cap_pair("fit R²", f"{r2:.2f}" if r2 is not None else "—"),
+    ]
+
+
+def _opened_legs(c):
+    return [lg for lg in (getattr(c, "legs", None) or [])
+            if lg.get("opened") and lg.get("opt_type") in ("Call", "Put")]
+
+
+def _move_label(c) -> str:
+    d = getattr(c, "description", "") or ""
+    return d.split(" @ ")[0].replace("joint roll ", "").replace("roll ", "")
+
+
+def _be_for_side(c, rights) -> str:
+    bes = getattr(c, "breakevens", None) or []
+    if not bes:
+        e = getattr(c, "economics", None) or {}
+        if e.get("always_profitable"):
+            return "always +"
+        if e.get("always_loss"):
+            return "always −"
+        return "—"
+    if rights == {"CALL"}:
+        return f"{bes[-1]:,.1f}"
+    if rights == {"PUT"}:
+        return f"{bes[0]:,.1f}"
+    return " / ".join(f"{b:,.0f}" for b in bes[:2])
+
+
+def _cand_rows(ranked_list, view, nav) -> list:
+    excess = {r.get("ticker"): r.get("iv_excess") for r in (view.get("iv_pp") or [])}
+    rows = []
+    for rc in (ranked_list or []):
+        c = rc.candidate
+        e = getattr(c, "economics", None) or {}
+        opened = _opened_legs(c)
+        shorts = [lg for lg in opened if (lg.get("qty") or 0) < 0]
+        pa = " · ".join(f"{abs(lg['delta']):.2f}" for lg in shorts
+                        if lg.get("delta") is not None) or "—"
+        prim = _primary_leg(c)
+        ipp = excess.get(prim.get("position_id")) if prim else None
+        g = getattr(c, "greeks", None) or {}
+        mp = "∞" if e.get("unbounded_gain") else _money(e.get("max_profit"))
+        if nav and e.get("max_profit") is not None and not e.get("unbounded_gain"):
+            mp += f" · {abs(e['max_profit']) / nav * 100:.1f}%"
+        flags = list(getattr(rc, "flags", None) or [])
+        rows.append({
+            "row_id": f"{c.objective}::{rc.rank}",
+            "obj": c.objective, "rank_n": rc.rank,
+            "rank": ("★" if rc.rank == 1 else str(rc.rank)) + (" ⚠" if flags else ""),
+            "move": _move_label(c),
+            "dte": _int(getattr(c, "new_leg_dte", None)),
+            "net": _money(c.net_credit),
+            "net_sign": ("scanner-pos" if (c.net_credit or 0) > 0
+                         else "scanner-neg" if (c.net_credit or 0) < 0 else ""),
+            "tag": "costless" if _is_costless(c) else "",
+            "ivpp": f"{ipp:+.1f}" if ipp is not None else "—",
+            "maxp": mp, "maxl": _maxdn(e),
+            # Red only for a genuinely negative worst case — an always-profitable
+            # structure's positive "max loss" must not wear the loss colour.
+            "maxl_cls": ("scanner-neg" if (e.get("unbounded_loss")
+                                           or (e.get("max_loss") or 0) < 0)
+                         else "scanner-pos" if (e.get("max_loss") or 0) > 0 else ""),
+            "be": _be_for_side(c, {"CALL" if lg["opt_type"] == "Call" else "PUT"
+                                   for lg in opened}),
+            "passign": pa,
+            "ndelta": f"{g.get('delta'):+,.0f}" if g.get("delta") is not None else "—",
+            "flags": "\n".join(flags) or "",
+            "reasons": "\n".join(getattr(rc, "reasons", None) or []) or "",
+        })
+    return rows
+
+
+def _chain_rows(view) -> list:
+    out = []
+    for c in (view.get("contracts") or []):
+        fit = "in fit" if c.get("in_fit") else "filtered"
+        out.append({"strike": _strike(c.get("strike")), "expiry": str(c.get("expiry") or "—"),
+                    "right": {"CALL": "C", "PUT": "P"}.get(c.get("right"), c.get("right") or "—"),
+                    "bid": _px(c.get("bid")), "ask": _px(c.get("ask")),
+                    "mid": _px(c.get("mid")), "iv": _iv(c.get("iv")),
+                    "delta": _delta(c.get("delta")), "oi": _int(c.get("oi")),
+                    "fit": fit})
+    return out
+
+
+def _field(res, key):
+    if isinstance(res, dict):
+        return res.get(key)
+    return getattr(res, key, None)
+
+
+def _cmp_row(label, cur, adj, adj_cls=""):
+    return html.Tr([html.Td(label, className="scanner-cmp-k"),
+                    html.Td(cur, className="scanner-cmp-cur"),
+                    html.Td(adj, className=f"scanner-num {adj_cls}".strip())])
+
+
+def _cmp_table(current, candidate, rc, nav) -> html.Table:
+    ce = _field(current, "economics") or {}
+    ne = _field(candidate, "economics") or {}
+    cg = _field(current, "greeks_now") or {}
+    ng = _field(candidate, "greeks_now") or {}
+    c = rc.candidate
+    opened = _opened_legs(c)
+    shorts = [lg for lg in opened if (lg.get("qty") or 0) < 0]
+    pa_new = " · ".join(f"{abs(lg['delta']):.2f}" for lg in shorts
+                        if lg.get("delta") is not None) or "—"
+    cur_bes = _field(current, "breakevens") or []
+    new_bes = _field(candidate, "breakevens") or []
+    mp_new = "∞" if ne.get("unbounded_gain") else _money(ne.get("max_profit"))
+    if nav and ne.get("max_profit") is not None and not ne.get("unbounded_gain"):
+        mp_new += f" · {abs(ne['max_profit']) / nav * 100:.1f}% NAV"
+    nc = getattr(c, "net_credit", None)
+    head = html.Tr([html.Th(getattr(c, "description", ""), className="scanner-cmp-k"),
+                    html.Th("Current"), html.Th("Adjusted")])
+    body = [
+        _cmp_row("Net Δ",
+                 f"{cg.get('delta'):+,.0f}" if cg.get("delta") is not None else "—",
+                 f"{ng.get('delta'):+,.0f}" if ng.get("delta") is not None else "—"),
+        _cmp_row("Max profit",
+                 "∞" if ce.get("unbounded_gain") else _money(ce.get("max_profit")), mp_new),
+        _cmp_row("Max loss",
+                 "−∞" if ce.get("unbounded_loss") else _money(ce.get("max_loss")),
+                 "−∞" if ne.get("unbounded_loss") else _money(ne.get("max_loss")),
+                 adj_cls="scanner-neg"),
+        _cmp_row("Breakevens",
+                 " / ".join(f"{b:,.0f}" for b in cur_bes) or "—",
+                 " / ".join(f"{b:,.0f}" for b in new_bes) or "—"),
+        _cmp_row("PoP", _pop(ce.get("pop")), _pop(ne.get("pop"))),
+        _cmp_row("P(assign) new shorts", "—", pa_new),
+        # Adjusted tenor = the ROLLED legs' new expiry (the roll's own clock) — the
+        # resulting structure's economics dte is its nearest expiry, often a KEPT
+        # sibling's, and would read as "nothing changed" on a PMCC-style roll.
+        _cmp_row("Days to expiry", _int(ce.get("dte")),
+                 _int(getattr(c, "new_leg_dte", None) or ne.get("dte"))),
+        _cmp_row("Net cash to adjust", "—", _money(nc),
+                 adj_cls=_sign(nc)),
+    ]
+    return html.Table(className="scanner-tbl cmp-tbl",
+                      children=[html.Thead(head), html.Tbody(body)])
+
+
+def _notes_block(view, ranked_list) -> list:
+    notes = []
+    if view.get("note"):
+        notes.append(view["note"])
+    seen = set()
+    for rc in (ranked_list or []):
+        for w in (getattr(rc.candidate, "warnings", None) or []):
+            if ("truncated" in w or "slice of a" in w or "not maintained" in w) and w not in seen:
+                seen.add(w)
+                notes.append(w)
+    if not notes:
+        return []
+    return [html.Div(n, className="scanner-note") for n in notes]
+
+
+# ---------------------------------------------------------------------------
+# The dial pairs (shared dial_sync seam — typed entry commits like a drag)
+# ---------------------------------------------------------------------------
+
+def _range_dial(label, sid, lo, hi, step, value):
+    # Range bounds commit on Enter/blur (debounce=True): a per-keystroke commit
+    # would cross-clamp a half-typed number against the other bound and write
+    # the box back mid-edit, eating the user's typing.
+    return html.Div(className="scanner-ctrl", children=[
+        html.Label(label, className="scanner-ctrl-lbl"),
+        dcc.Input(id=f"{sid}-lo", type="number", value=value[0], step=step,
+                  debounce=True, className="scanner-ctrl-num"),
+        html.Div(dcc.RangeSlider(id=sid, min=lo, max=hi, step=step, value=list(value),
+                                 marks=None, allowCross=False,
+                                 tooltip={"placement": "bottom", "always_visible": False},
+                                 allow_direct_input=False),
+                 className="scanner-ctrl-slider"),
+        dcc.Input(id=f"{sid}-hi", type="number", value=value[1], step=step,
+                  debounce=True, className="scanner-ctrl-num"),
+    ])
+
+
+def _shock_dial(label, sid, lo, hi, step, value=0):
+    return html.Div(className="scanner-ctrl", children=[
+        html.Label(label, className="scanner-ctrl-lbl"),
+        html.Div(dcc.Slider(id=sid, min=lo, max=hi, step=step, value=value,
+                            marks={int(lo): str(int(lo)), 0: "0", int(hi): str(int(hi))},
+                            tooltip={"placement": "bottom", "always_visible": False},
+                            allow_direct_input=False),
+                 className="scanner-ctrl-slider"),
+        dcc.Input(id=f"{sid}-num", type="number", value=value, step=step,
+                  debounce=False, className="scanner-ctrl-num"),
+    ])
+
+
+def _sec(title, ctx_id=None, ctx_text=""):
+    kids = [html.Span(title)]
+    kids.append(html.Span(ctx_text, id=ctx_id, className="scanner-sec-ctx")
+                if ctx_id else html.Span(ctx_text, className="scanner-sec-ctx"))
+    return html.Div(className="scanner-sec", children=kids)
+
+
+# ---------------------------------------------------------------------------
+# Body
 # ---------------------------------------------------------------------------
 
 def render_scanner(account: str, *, position_id: str, structure_id=None) -> html.Div:
-    """The drawer body for ``view='scanner'``. Opens immediately with a placeholder; the
-    one-shot ``scanner-load`` interval then pulls + fills the ranked candidates.
-    ``structure_id`` is carried for the compare's current side; the drawer itself does
-    not read it — candidate generation resolves the enclosing structure in the service
-    layer, so a leg inside a structure already prices as the resulting structure.
+    """The drawer body for ``view='scanner'``. Opens immediately; the one-shot
+    ``scanner-load`` interval fills the roster, bounds the dials from the chain's
+    LISTED expiries, and runs the default scan. ``structure_id`` is drawer-state's,
+    read verbatim by every scan so the roster, the candidates and the compare's
+    current side all describe ONE structure (None = the leg standalone).
 
-    ``position_id=None`` (a structure with no scannable anchor — no short option
-    leg and no stock leg, e.g. a long straddle) renders an explicit no-roll-target
-    state instead of a dead tab: the scan never starts, so no misleading
-    market-data message can appear."""
+    ``position_id=None`` (a structure with no scannable anchor) renders an explicit
+    no-roll-target state instead of a dead tab."""
     if position_id is None:
         return html.Div(className="drawer-content scanner-content", children=[
-            html.Div(className="scanner-head", children=[
-                html.Div("Scan candidates", className="scanner-identity")]),
+            html.Div(className="scanner-hd", children=[
+                html.Span("Scan", className="scanner-hd-tk")]),
             html.Div("No roll target in this structure — a scan anchors on a "
                      "short option leg (or held stock, for an overlay write); "
                      "this structure has neither. Open a leg position directly "
@@ -456,437 +734,484 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
         ])
     state = sa.get_state()
     pos = sa.position_by_id(state, account, position_id) if state else None
-    # Expand exists only for option rolls: it widens the slice by one expiry
-    # around the HELD contract, and the slice cache is keyed by that window. An
-    # overlay scan (held stock) is spot-anchored at a fixed near-dated window —
-    # its caches ignore the window entirely, so an Expand there used to force a
-    # Bloomberg re-snapshot that returned identical data. No window, no button.
-    head_btns = ([html.Button("Expand ▸", id="scanner-expand", n_clicks=0,
-                              className="scanner-refresh-btn",
-                              title="Pull one more expiry into the slice — bounded, reuses the "
-                                    "enumerated chain (no full-chain pull).")]
-                 if getattr(pos, "asset_class", None) == "option" else []) + [
-        html.Button("Refresh", id="scanner-refresh", n_clicks=0, className="scanner-refresh-btn",
-                    title="Re-pull this name's chain slice and re-rank."),
-    ]
+    name = (getattr(pos, "underlying_symbol", None) or getattr(pos, "symbol", None) or "—")
     return html.Div(className="drawer-content scanner-content", children=[
-        html.Div(className="scanner-head", children=[
-            html.Div(className="scanner-head-left", children=[
-                html.Div(_identity(pos), className="scanner-identity"),
-                html.Span("scanning…", id="scanner-stamp", className="scanner-stamp"),
-            ]),
-            html.Div(className="scanner-head-btns", children=head_btns),
+        # Identity: ticker · spot · day % · account · as-of
+        html.Div(className="scanner-hd", children=[
+            html.Span(name, className="scanner-hd-tk"),
+            html.Span("—", id="scanner-spot", className="scanner-hd-px"),
+            html.Span("", id="scanner-day", className="scanner-hd-day"),
+            html.Span(account, className="scanner-hd-acct"),
+            html.Span("scanning…", id="scanner-stamp", className="scanner-hd-asof"),
+            html.Button("Refresh", id="scanner-refresh", n_clicks=0,
+                        className="scanner-refresh-btn",
+                        title="Re-pull this name's chain slice and re-rank."),
         ]),
-        html.Div(id="scanner-pills", className="scanner-pills"),
-        # Vol smile over the cached slice — a selectable expiry, the fitted line, and a
-        # dot per snapshotted contract (offset above the line = IV+pp).
-        html.Div(className="scanner-smile-wrap", children=[
-            html.Div(className="scanner-smile-head", children=[
-                html.Span("Vol smile", className="scanner-smile-title"),
-                html.Div(className="scanner-smile-ctrl", children=[
-                    html.Label("Expiry", className="scanner-smile-lbl"),
-                    dcc.Dropdown(id="scanner-smile-expiry", options=[], clearable=False,
-                                 className="scanner-expiry-dd"),
-                ]),
-            ]),
-            dcc.Graph(id="scanner-smile", figure=_empty_fig(),
-                      config={"displayModeBar": False, "responsive": True},
-                      className="scanner-smile-graph"),
+
+        _sec("Managing", "scanner-managing-ctx"),
+        _roster_grid(),
+        html.Div(id="scanner-roster-cap", className="scanner-cap"),
+
+        _sec("Scan", "scanner-scan-ctx"),
+        html.Div(id="scanner-pills", className="scanner-toks"),
+        html.Div(className="scanner-ctrls", children=[
+            _range_dial("DTE", "scanner-dte", 1, 730, 1, (30, 180)),
+            _range_dial("|Δ| band", "scanner-band", 0.02, 0.98, 0.01, (0.02, 0.98)),
+            html.Button("Scan", id="scanner-scan", n_clicks=0, className="scanner-scan-btn",
+                        title="Apply the DTE / |Δ| controls — pulls only expiries "
+                              "not already fetched."),
         ]),
-        html.Div(id="scanner-table", className="scanner-table-wrap",
-                 children=html.Div("Scanning the chain…", className="scanner-loading")),
-        # Current-vs-candidate comparison — the sliders + body live here from the start, always
-        # rendered (stable ids so the recompute wires; never inside display:none, where a
-        # dcc.Slider fails to initialise and won't drag). The body fills when a row is selected.
-        html.Div(id="scanner-compare", className="scanner-compare", children=[
-            html.Div("Compare a candidate vs the current position", className="scanner-cmp-header"),
-            _comparison_sliders(),
-            html.Div(id="scanner-cmp-body",
-                     children=html.Div("Select a candidate row above to compare it here.",
-                                       className="scanner-empty")),
+
+        _sec("Richness", ctx_text="IV+pp vs fitted smile · filled = in fit"),
+        html.Div(className="scanner-smile-head", children=[
+            dcc.Dropdown(id="scanner-smile-expiry", options=[], value=None,
+                         clearable=False, searchable=False,
+                         className="scanner-expiry-dd"),
         ]),
-        dcc.Store(id="scanner-cmp-sel"),
-        dcc.Store(id="scanner-active"),
-        # The active slice window (number of expiries pulled); Expand widens it.
-        dcc.Store(id="scanner-window", data=_BASE_EXPIRIES),
-        dcc.Interval(id="scanner-load", interval=60, max_intervals=1, n_intervals=0),
-        html.Div(_HONESTY, className="scanner-footer"),
+        dcc.Graph(id="scanner-smile", figure=_msg_fig("scanning…"),
+                  config={"displayModeBar": False},
+                  className="scanner-smile-graph", style={"height": "230px"}),
+        html.Div(id="scanner-smile-cap", className="scanner-cap"),
+
+        _sec("Candidates", "scanner-cand-ctx"),
+        html.Div(id="scanner-notes"),
+        _cand_grid(),
+        html.Div(className="scanner-more", children=[
+            html.Button("", id="scanner-chain-toggle", n_clicks=0,
+                        className="scanner-more-btn"),
+            html.Button("widen window ▸", id="scanner-widen", n_clicks=0,
+                        className="scanner-more-btn",
+                        title="Extend the DTE range to the next listed expiry and "
+                              "pull just that expiry."),
+        ]),
+        html.Div(id="scanner-chain-wrap", style={"display": "none"},
+                 children=_chain_grid()),
+
+        _sec("Current vs adjusted", ctx_text="kept legs @ entry · new legs @ mid"),
+        html.Div(id="scanner-cmp-body",
+                 children=html.Div("Select a candidate row above to compare it here.",
+                                   className="scanner-empty")),
+
+        _sec("Payoff", ctx_text="adjusted structure · at expiry & today"),
+        dcc.Graph(id="scanner-payoff",
+                  figure=_msg_fig("Select a candidate above to draw the adjusted payoff.", 240),
+                  config={"displayModeBar": False},
+                  className="scanner-payoff-graph", style={"height": "240px"}),
+        html.Div(className="scanner-ctrls", children=[
+            _shock_dial("Underlying move %", "scanner-cmp-spot", -30, 30, 1),
+            _shock_dial("Vol shift (pts)", "scanner-cmp-vol", -10, 10, 0.5),
+            _shock_dial("Rate shift (bps)", "scanner-cmp-rate", -50, 50, 5),
+            _shock_dial("Time fwd (days)", "scanner-cmp-time", 0, 60, 1),
+        ]),
+
+        dcc.Store(id="scanner-controls", data=None),
+        dcc.Store(id="scanner-active", data=None),
+        dcc.Store(id="scanner-cmp-sel", data=None),
+        dcc.Interval(id="scanner-load", interval=60, max_intervals=1),
+        html.Div(_HONESTY, className="scanner-honesty"),
     ])
 
 
-def _empty_fig():
-    import plotly.graph_objects as go
-    fig = go.Figure()
-    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      margin=dict(l=8, r=8, t=8, b=8), height=270,
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
-    return fig
+# ---------------------------------------------------------------------------
+# The one scan -> render packager
+# ---------------------------------------------------------------------------
+
+def _controls_from(dte_value, band_value):
+    dte = [int(dte_value[0]), int(dte_value[1])] if dte_value else None
+    band = None
+    if band_value and not (band_value[0] <= 0.021 and band_value[1] >= 0.979):
+        band = [round(float(band_value[0]), 2), round(float(band_value[1]), 2)]
+    return dte, band
 
 
-def _scan_view(account, position_id, *, active_hint=None, expiry_hint=None, refresh=False,
-               n_expiries=_BASE_EXPIRIES, structure_id=sa.STRUCTURE_AUTO):
-    """A fresh scanner read → all rendered pieces. Cheap on a cache hit (the ranking is
-    cached at pull time), so pill/expiry switches don't re-price; a refresh re-pulls.
-    ``active_hint`` keeps the objective across a refresh, ``expiry_hint`` the smile expiry,
-    ``n_expiries`` the active (base or expanded) slice window. ``structure_id`` is
-    drawer-state's, passed verbatim so the scan anchors on the SAME structure the
-    compare's current side prices (None = the leg standalone)."""
-    data = sa.scanner_view_data(account, position_id, refresh=refresh, n_expiries=n_expiries,
-                                structure_id=structure_id)
+def _default_dte(listed, pos) -> tuple:
+    """The default DTE window: the same three forward monthlies the scanner always
+    pulled (held-expiry-forward for a roll; ~30d out for an overlay) — so the
+    opening scan costs exactly the historical pull."""
+    today = date.today()
+    if not listed:
+        return (30, 180)
+    anchor = getattr(pos, "expiry", None)
+    floor_d = anchor if (anchor and getattr(pos, "asset_class", "") == "option") \
+        else today + timedelta(days=30)
+    fwd = [e for e in listed if e >= floor_d] or listed
+    chosen = fwd[:3]
+    lo = max((chosen[0] - today).days - 1, 1)
+    hi = (chosen[-1] - today).days + 1
+    return (lo, hi)
+
+
+def _scan_view(account, position_id, *, structure_id, rolled_pids, dte_range,
+               delta_band, active_hint=None, expiry_hint=None, refresh=False):
+    data = sa.scanner_view_data(account, position_id, structure_id=structure_id,
+                                rolled_pids=rolled_pids, dte_range=dte_range,
+                                delta_band=delta_band, refresh=refresh)
     if data is None:
         return {"unavailable": True}
+    state = sa.get_state()
+    acc = state.accounts.get(account) if state else None
+    data["nav"] = getattr(acc, "nav", None)
     ranked = data.get("ranked") or {}
-    contracts = data.get("contracts") or []
-    surface, spot, held_strike = data.get("surface"), data.get("spot"), data.get("held_strike")
     objectives = _ordered_objectives(ranked)
-    stamp = _stamp(data.get("pulled_at"), data.get("kind"), data.get("spot_asof"))
-    exp_opts = _expiry_options(contracts)
-    exp_val = (expiry_hint if any(o["value"] == expiry_hint for o in exp_opts)
-               else (exp_opts[0]["value"] if exp_opts else None))
-    active = (active_hint if active_hint in ranked
+    active = (active_hint if active_hint in ranked and ranked.get(active_hint)
               else (_seed_objective(account, position_id, objectives) if objectives else None))
+    data["objectives"], data["active"] = objectives, active
+    # Rolled-strike references for the smile.
+    roster = sa.scanner_roster(account, position_id, structure_id=structure_id) or {}
+    data["roster"] = roster
+    marks = []
+    for r in roster.get("rows", []):
+        if r["position_id"] in set(rolled_pids or []) and r.get("is_option"):
+            try:
+                marks.append({"strike": float((r.get("contract") or "0").split()[0]),
+                              "label": r.get("contract", "").replace(" ◂", "")})
+            except Exception:
+                pass
+    data["rolled_marks"] = marks
+    return data
+
+
+def _render_pack(view, account, position_id, rolled_pids, expiry_hint=None,
+                 selected=None):
+    """Everything the fill callbacks output, from one view read."""
+    ranked = view.get("ranked") or {}
+    active = view.get("active")
+    ranked_list = ranked.get(active) or []
+    nav = view.get("nav")
+    contracts = view.get("contracts") or []
+    exps = sorted({str(c.get("expiry")) for c in contracts if c.get("expiry")})
+    exp_opts = [{"label": e, "value": e} for e in exps]
+    exp_val = (expiry_hint if expiry_hint in exps
+               else (exps[0] if exps else None))
+    n_cand = len(ranked_list)
+    n_chain = len(contracts)
+    top_rows = _cand_rows(ranked_list[:_TOP_N], view, nav)
+    joint = view.get("joint")
+    rights = {r.get("right") for r in (view.get("roster") or {}).get("rows", [])
+              if r["position_id"] in set(rolled_pids or [])} if joint else set()
+    spot = view.get("spot")
+    day = view.get("day_pct")
     return {
-        "unavailable": False, "empty": (not objectives and not contracts),
-        "pills": _pills(ranked, objectives, active) if objectives else [],
-        "stamp": stamp, "active": active,
-        "table": _browse_table(contracts, ranked.get(active, []) if active else [], held_strike),
-        "smile": _smile_figure(contracts, surface, exp_val, spot, held_strike),
+        "spot": f"{spot:,.2f}" if spot is not None else "—",
+        "day": (f"{day:+.2f}%" if day is not None else ""),
+        "day_cls": ("scanner-pos" if (day or 0) > 0 else "scanner-neg" if (day or 0) < 0 else ""),
+        "stamp": f"as of {_stamp(view.get('pulled_at'), view.get('kind'), view.get('spot_asof'))}",
+        "managing_ctx": _managing_ctx(view),
+        "roster_rows": _roster_rows(view.get("roster")),
+        "roster_cap": _roster_cap(view.get("roster"), rolled_pids),
+        "scan_ctx": (f"roll targets for the {len(rolled_pids)} selected leg"
+                     f"{'s' if len(rolled_pids) != 1 else ''}"
+                     + (" · shared expiry" if len(rolled_pids) > 1 else "")),
+        "pills": _tokens(ranked, view.get("objectives") or [], active),
+        "active": active,
+        "smile": _smile_fig(view, exp_val, selected),
+        "smile_cap": _smile_cap(view),
+        "cand_ctx": _cand_ctx(view, active),
+        "notes": _notes_block(view, ranked_list),
+        "cand_rows": top_rows,
+        "more": f"+ {max(n_chain - n_cand, 0)} in chain · show ▸",
+        "chain_rows": _chain_rows(view),
         "exp_opts": exp_opts, "exp_val": exp_val,
     }
 
 
-# ---------------------------------------------------------------------------
-# Callbacks — load / pill / refresh (all guarded on view == 'scanner')
-# ---------------------------------------------------------------------------
+def _managing_ctx(view) -> str:
+    econ = (view.get("roster") or {}).get("econ") or {}
+    stype = (econ.get("structure_type") or "").replace("_", " ")
+    return stype if stype else "standalone position"
+
+
+def _cand_ctx(view, active) -> str:
+    econ = (view.get("roster") or {}).get("econ") or {}
+    stype = (econ.get("structure_type") or "").replace("_", " ") or "position"
+    lbl = _OBJ_LABEL.get(active, active or "—")
+    return f"resulting {stype} · {lbl}"
+
+
+_FILL_OUTPUTS = None  # documented in register_scanner_callbacks
+
 
 def register_scanner_callbacks(app) -> None:
-    """Wire the scanner drawer: the one-shot load pull, the objective pills (cache read),
-    and Refresh (re-pull). Each reads the target from ``drawer-state`` and outputs to the
-    scanner's own inner ids — never ``drawer-body`` (owned by the open-site handler)."""
+    """Wire the scanner surface: the one-shot load (roster + dial bounds + the
+    default scan), the re-scan triggers (Scan, roster toggles, objective tokens,
+    Refresh, widen), the chain expand, and the smile expiry override. The range
+    dials and the shock dials register through the shared dial_sync seam — typed
+    entry commits exactly like a drag."""
+    register_range_dial_sync(app, ("scanner-dte", "scanner-band"))
+    register_dial_sync(app, ("scanner-cmp-spot", "scanner-cmp-vol",
+                             "scanner-cmp-rate", "scanner-cmp-time"))
 
-    @app.callback(
-        Output("scanner-pills", "children"),
+    fill_outputs = [
+        Output("scanner-spot", "children"),
+        Output("scanner-day", "children"),
+        Output("scanner-day", "className"),
         Output("scanner-stamp", "children"),
-        Output("scanner-table", "children"),
+        Output("scanner-managing-ctx", "children"),
+        Output("scanner-roster-cap", "children"),
+        Output("scanner-scan-ctx", "children"),
+        Output("scanner-pills", "children"),
         Output("scanner-active", "data"),
         Output("scanner-smile", "figure"),
+        Output("scanner-smile-cap", "children"),
+        Output("scanner-cand-ctx", "children"),
+        Output("scanner-notes", "children"),
+        Output("scanner-cand-grid", "rowData"),
+        Output("scanner-chain-toggle", "children"),
+        Output("scanner-chain-grid", "rowData"),
         Output("scanner-smile-expiry", "options"),
         Output("scanner-smile-expiry", "value"),
+        Output("scanner-controls", "data"),
+    ]
+
+    def _pack_tuple(pack, controls):
+        return (pack["spot"], pack["day"], f"scanner-hd-day {pack['day_cls']}".strip(),
+                pack["stamp"], pack["managing_ctx"], pack["roster_cap"],
+                pack["scan_ctx"], pack["pills"], pack["active"], pack["smile"],
+                pack["smile_cap"], pack["cand_ctx"], pack["notes"], pack["cand_rows"],
+                pack["more"], pack["chain_rows"], pack["exp_opts"], pack["exp_val"],
+                controls)
+
+    @app.callback(
+        *fill_outputs,
+        Output("scanner-roster-grid", "rowData"),
+        Output("scanner-roster-grid", "selectedRows"),
+        Output("scanner-dte", "min"), Output("scanner-dte", "max"),
+        Output("scanner-dte", "value"),
+        Output("scanner-dte-lo", "value"), Output("scanner-dte-hi", "value"),
         Input("scanner-load", "n_intervals"),
         State("drawer-state", "data"),
         prevent_initial_call=True,
     )
     def _load(_n, ds):
         if not ds or ds.get("view") != "scanner":
-            return (no_update,) * 7
-        v = _scan_view(ds.get("account"), ds.get("position_id"),
-                       structure_id=ds.get("structure_id"))
-        if v.get("unavailable"):
-            empty = html.Div("Scanner unavailable — market data required (Bloomberg off) or no "
-                             "priceable slice for this position.", className="scanner-empty")
-            return [], "—", empty, None, _empty_fig(), [], None
-        return (v["pills"], v["stamp"], v["table"], v["active"], v["smile"],
-                v["exp_opts"], v["exp_val"])
+            return (no_update,) * (len(fill_outputs) + 7)
+        account, pid = ds.get("account"), ds.get("position_id")
+        sid = ds.get("structure_id")
+        state = sa.get_state()
+        pos = sa.position_by_id(state, account, pid) if state else None
+        listed = sa.chain_expiries(account, pid)
+        dte = _default_dte(listed, pos)
+        rolled = [pid]
+        view = _scan_view(account, pid, structure_id=sid, rolled_pids=rolled,
+                          dte_range=dte, delta_band=None)
+        if view.get("unavailable"):
+            empty = html.Div("Scanner unavailable — market data required "
+                             "(Bloomberg off) or no priceable slice for this "
+                             "position.", className="scanner-empty")
+            return (no_update, no_update, no_update, "—", no_update, no_update,
+                    no_update, [], None, _msg_fig("no market data"), [], no_update,
+                    empty, [], "", [], [], None,
+                    {"dte": list(dte), "band": None, "rolled": rolled},
+                    [], {"ids": []}, no_update, no_update, no_update,
+                    no_update, no_update)
+        pack = _render_pack(view, account, pid, rolled)
+        controls = {"dte": list(dte), "band": None, "rolled": rolled}
+        today = date.today()
+        dmax = max(((listed[-1] - today).days + 1) if listed else 730, dte[1])
+        return _pack_tuple(pack, controls) + (
+            pack["roster_rows"], {"ids": [pid]},
+            1, dmax, list(dte), dte[0], dte[1])
 
-    # Objective pill → re-filter the browse table + pills (cache read, no re-price); the
-    # smile is objective-independent, so it is left as-is.
     @app.callback(
-        Output("scanner-pills", "children", allow_duplicate=True),
-        Output("scanner-table", "children", allow_duplicate=True),
-        Output("scanner-active", "data", allow_duplicate=True),
+        *[Output(o.component_id, o.component_property, allow_duplicate=True)
+          for o in fill_outputs],
+        Output("scanner-cmp-body", "children", allow_duplicate=True),
+        Output("scanner-payoff", "figure", allow_duplicate=True),
+        Output("scanner-cmp-sel", "data", allow_duplicate=True),
+        Input("scanner-scan", "n_clicks"),
+        Input("scanner-refresh", "n_clicks"),
+        Input("scanner-widen", "n_clicks"),
+        Input("scanner-roster-grid", "selectedRows"),
         Input({"type": "scanner-obj", "obj": ALL}, "n_clicks"),
         State("drawer-state", "data"),
-        State("scanner-window", "data"),
+        State("scanner-controls", "data"),
+        State("scanner-active", "data"),
+        State("scanner-dte", "value"),
+        State("scanner-band", "value"),
+        State("scanner-smile-expiry", "value"),
         prevent_initial_call=True,
     )
-    def _pick(_clicks, ds, window):
+    def _rescan(_s, _r, _w, sel_rows, _obj_clicks, ds, controls, active,
+                dte_value, band_value, exp_hint):
+        if not ds or ds.get("view") != "scanner" or controls is None:
+            return (no_update,) * (len(fill_outputs) + 3)
         trig = ctx.triggered_id
-        if not ds or ds.get("view") != "scanner" or not isinstance(trig, dict):
-            return no_update, no_update, no_update
-        if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
-            return no_update, no_update, no_update
-        v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=trig.get("obj"),
-                       n_expiries=window or _BASE_EXPIRIES,
-                       structure_id=ds.get("structure_id"))
-        if v.get("unavailable") or v.get("empty"):
-            return no_update, no_update, no_update
-        return v["pills"], v["table"], v["active"]
+        account, pid = ds.get("account"), ds.get("position_id")
+        sid = ds.get("structure_id")
+        refresh = trig == "scanner-refresh"
+        active_hint = active
+        rolled = list(controls.get("rolled") or [pid])
+        dte, band = controls.get("dte"), controls.get("band")
 
-    # Expiry selector → redraw the smile for that expiry (cache read).
+        if isinstance(trig, dict) and trig.get("type") == "scanner-obj":
+            if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
+                return (no_update,) * (len(fill_outputs) + 3)
+            active_hint = trig.get("obj")
+        elif trig == "scanner-roster-grid":
+            new_rolled = sorted(r.get("position_id") for r in (sel_rows or []))
+            if not new_rolled or new_rolled == sorted(rolled):
+                return (no_update,) * (len(fill_outputs) + 3)
+            rolled = new_rolled
+        elif trig == "scanner-scan":
+            if not _s:
+                return (no_update,) * (len(fill_outputs) + 3)
+            dte, band = _controls_from(dte_value, band_value)
+        elif trig == "scanner-widen":
+            if not _w:
+                return (no_update,) * (len(fill_outputs) + 3)
+            listed = sa.chain_expiries(account, pid)
+            today = date.today()
+            beyond = [e for e in listed if (e - today).days > (dte[1] if dte else 0)]
+            if not beyond:
+                return (no_update,) * (len(fill_outputs) + 3)
+            dte = [dte[0] if dte else 1, (beyond[0] - today).days + 1]
+        elif trig == "scanner-refresh":
+            if not _r:
+                return (no_update,) * (len(fill_outputs) + 3)
+
+        view = _scan_view(account, pid, structure_id=sid, rolled_pids=rolled,
+                          dte_range=dte, delta_band=band, active_hint=active_hint,
+                          expiry_hint=exp_hint, refresh=refresh)
+        if view.get("unavailable"):
+            return (no_update,) * (len(fill_outputs) + 3)
+        pack = _render_pack(view, account, pid, rolled, expiry_hint=exp_hint)
+        controls = {"dte": list(dte) if dte else None,
+                    "band": list(band) if band else None, "rolled": rolled}
+        cleared = html.Div("Select a candidate row above to compare it here.",
+                           className="scanner-empty")
+        return _pack_tuple(pack, controls) + (
+            cleared, _msg_fig("Select a candidate above to draw the adjusted payoff.", 240),
+            None)
+
+    @app.callback(
+        Output("scanner-chain-wrap", "style"),
+        Input("scanner-chain-toggle", "n_clicks"),
+        State("scanner-chain-wrap", "style"),
+        prevent_initial_call=True,
+    )
+    def _chain_toggle(n, style):
+        if not n:
+            return no_update
+        hidden = (style or {}).get("display") == "none"
+        return {"display": "block"} if hidden else {"display": "none"}
+
     @app.callback(
         Output("scanner-smile", "figure", allow_duplicate=True),
         Input("scanner-smile-expiry", "value"),
         State("drawer-state", "data"),
-        State("scanner-window", "data"),
+        State("scanner-controls", "data"),
+        State("scanner-active", "data"),
         prevent_initial_call=True,
     )
-    def _expiry(exp_val, ds, window):
-        if not ds or ds.get("view") != "scanner" or not exp_val:
+    def _expiry(exp_val, ds, controls, active):
+        if not ds or ds.get("view") != "scanner" or not exp_val or not controls:
             return no_update
-        v = _scan_view(ds.get("account"), ds.get("position_id"), expiry_hint=exp_val,
-                       n_expiries=window or _BASE_EXPIRIES,
-                       structure_id=ds.get("structure_id"))
-        return no_update if v.get("unavailable") else v["smile"]
-
-    @app.callback(
-        Output("scanner-stamp", "children", allow_duplicate=True),
-        Output("scanner-table", "children", allow_duplicate=True),
-        Output("scanner-pills", "children", allow_duplicate=True),
-        Output("scanner-smile", "figure", allow_duplicate=True),
-        Output("scanner-smile-expiry", "options", allow_duplicate=True),
-        Output("scanner-smile-expiry", "value", allow_duplicate=True),
-        Input("scanner-refresh", "n_clicks"),
-        State("drawer-state", "data"),
-        State("scanner-active", "data"),
-        State("scanner-window", "data"),
-        prevent_initial_call=True,
-    )
-    def _refresh(n, ds, active, window):
-        if not ds or ds.get("view") != "scanner" or not n:
-            return (no_update,) * 6
-        v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=active,
-                       refresh=True, n_expiries=window or _BASE_EXPIRIES,
-                       structure_id=ds.get("structure_id"))
-        if v.get("unavailable"):
-            return (no_update,) * 6
-        return v["stamp"], v["table"], v["pills"], v["smile"], v["exp_opts"], v["exp_val"]
-
-    # Expand → widen the slice by one expiry (bounded), re-pull, and re-fill
-    # everything. Option rolls only — the button is not rendered for overlay
-    # scans (their spot-anchored slice ignores the window; see render_scanner),
-    # and the guard below covers a stale layout that still carries it.
-    @app.callback(
-        Output("scanner-window", "data"),
-        Output("scanner-stamp", "children", allow_duplicate=True),
-        Output("scanner-table", "children", allow_duplicate=True),
-        Output("scanner-pills", "children", allow_duplicate=True),
-        Output("scanner-smile", "figure", allow_duplicate=True),
-        Output("scanner-smile-expiry", "options", allow_duplicate=True),
-        Output("scanner-smile-expiry", "value", allow_duplicate=True),
-        Input("scanner-expand", "n_clicks"),
-        State("drawer-state", "data"),
-        State("scanner-active", "data"),
-        State("scanner-window", "data"),
-        prevent_initial_call=True,
-    )
-    def _expand(n, ds, active, window):
-        nop = (no_update,) * 7
-        if not ds or ds.get("view") != "scanner" or not n:
-            return nop
-        state = sa.get_state()
-        pos = sa.position_by_id(state, ds.get("account"), ds.get("position_id")) if state else None
-        if getattr(pos, "asset_class", None) != "option":
-            return nop      # no held-expiry window to widen on an overlay scan
-        wider = min((window or _BASE_EXPIRIES) + 1, _MAX_EXPIRIES)
-        if wider == (window or _BASE_EXPIRIES):
-            return nop                      # already at the ceiling
-        v = _scan_view(ds.get("account"), ds.get("position_id"), active_hint=active,
-                       refresh=True, n_expiries=wider,
-                       structure_id=ds.get("structure_id"))
-        if v.get("unavailable"):
-            return nop
-        return (wider, v["stamp"], v["table"], v["pills"], v["smile"], v["exp_opts"], v["exp_val"])
+        view = _scan_view(ds.get("account"), ds.get("position_id"),
+                          structure_id=ds.get("structure_id"),
+                          rolled_pids=controls.get("rolled") or [ds.get("position_id")],
+                          dte_range=controls.get("dte"), delta_band=controls.get("band"),
+                          active_hint=active)
+        return no_update if view.get("unavailable") else _smile_fig(view, exp_val, None)
 
 
 # ---------------------------------------------------------------------------
-# Current-vs-candidate comparison (the payoff popup's Scanner tab)
+# Current-vs-adjusted + payoff (candidate selection and the shock dials)
 # ---------------------------------------------------------------------------
 
-def _field(res, key):
-    """Read a curve/economics field from either a PayoffResult (current) or the
-    compute_payoff dict (candidate) — the two comparison sides."""
-    if isinstance(res, dict):
-        return res.get(key)
-    return getattr(res, key, None)
-
-
-def _comparison_figure(current, candidate):
-    """Current (dashed) vs candidate (solid) at-expiry payoff on one set of axes, with
-    the candidate's breakevens and the shared spot marked. Token-styled, lazy plotly."""
-    import plotly.graph_objects as go
-    from pm.ui.drawers.payoff import _AMBER, _CHARCOAL, _FONT, _GRID, _MUTED
-    fig = go.Figure()
-    fig.add_hline(y=0, line=dict(color=_GRID, width=1))
-    fig.add_trace(go.Scatter(
-        x=_field(current, "grid"), y=_field(current, "expiry_curve"), mode="lines",
-        name="Current", line=dict(color=_MUTED, width=1.8, dash="dash"),
-        hovertemplate="px %{x:,.2f}<br>current %{y:$,.0f}<extra></extra>"))
-    fig.add_trace(go.Scatter(
-        x=_field(candidate, "grid"), y=_field(candidate, "expiry_curve"), mode="lines",
-        name="Candidate", line=dict(color=_CHARCOAL, width=2.2),
-        hovertemplate="px %{x:,.2f}<br>candidate %{y:$,.0f}<extra></extra>"))
-    for be in (_field(candidate, "breakevens") or []):
-        fig.add_vline(x=be, line=dict(color=_AMBER, width=1, dash="dot"))
-    spot = _field(current, "spot")
-    if spot is not None:
-        fig.add_vline(x=spot, line=dict(color=_MUTED, width=1))
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family=_FONT, color=_CHARCOAL, size=11),
-        margin=dict(l=54, r=12, t=26, b=36), height=300,
-        legend=dict(orientation="h", y=1.15, x=0, font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(title="underlying price", gridcolor=_GRID, zeroline=False),
-        yaxis=dict(title="P&L $", gridcolor=_GRID, zeroline=True, zerolinecolor=_GRID))
-    return fig
-
-
-def _cmp_money_row(label, cur, new, cur_txt=None, new_txt=None):
-    """One economics comparison row. ``cur_txt`` / ``new_txt`` override the money
-    formatting for non-numeric truths (∞ / −∞ / 'unbounded'); with an unbounded
-    side the Δ is undefined and renders '—' (the None arithmetic already does)."""
-    d = (new - cur) if (cur is not None and new is not None) else None
-    return html.Tr([
-        html.Td(label, className="cmp-lbl"),
-        html.Td(cur_txt if cur_txt is not None else _money(cur), className="scanner-num"),
-        html.Td(new_txt if new_txt is not None else _money(new), className="scanner-num"),
-        html.Td(_money(d) if d is not None else "—", className=f"scanner-num {_sign(d)}".strip()),
-    ])
-
-
-def _side_by_side_econ(current, candidate, net_to_roll):
-    ce = _field(current, "economics") or {}
-    ne = _field(candidate, "economics") or {}
-    pc, pn = ce.get("pop"), ne.get("pop")
-    pop_d = (pn - pc) if (pc is not None and pn is not None) else None
-    pop_row = html.Tr([
-        html.Td("PoP", className="cmp-lbl"),
-        html.Td(_pop(pc), className="scanner-num"), html.Td(_pop(pn), className="scanner-num"),
-        html.Td((f"{pop_d * 100:+.0f} pp" if pop_d is not None else "—"), className="scanner-num")])
-    def _up_txt(e):
-        return "∞" if e.get("unbounded_gain") else None
-
-    def _dn_txt(e):
-        return "−∞" if e.get("unbounded_loss") else None
-
-    def _car_txt(e):
-        return ("unbounded" if (e.get("unbounded_loss")
-                                and e.get("capital_at_risk") is None) else None)
-
-    head = html.Tr([html.Th("Economics", className="cmp-lbl"), html.Th("Current"),
-                    html.Th("Candidate"), html.Th("Δ")])
-    body = [_cmp_money_row("Max profit", ce.get("max_profit"), ne.get("max_profit"),
-                           _up_txt(ce), _up_txt(ne)),
-            _cmp_money_row("Max loss", ce.get("max_loss"), ne.get("max_loss"),
-                           _dn_txt(ce), _dn_txt(ne)),
-            _cmp_money_row("Cap at risk", ce.get("capital_at_risk"), ne.get("capital_at_risk"),
-                           _car_txt(ce), _car_txt(ne)),
-            pop_row,
-            _cmp_money_row("Net premium", ce.get("net_premium"), ne.get("net_premium"))]
-    foot = html.Tr(className="cmp-foot", children=[
-        html.Td("Net to roll", className="cmp-lbl"), html.Td("", colSpan=2),
-        html.Td(_money(net_to_roll), className=f"scanner-num {_sign(net_to_roll)}".strip())])
-    return html.Table(className="scanner-tbl cmp-tbl",
-                      children=[html.Thead(head), html.Tbody(body), html.Tfoot(foot)])
-
-
-def _side_by_side_greeks(current, candidate):
-    cg = _field(current, "greeks_now") or {}
-    ng = _field(candidate, "greeks_now") or {}
-    head = html.Tr([html.Th("Greeks (engine)", className="cmp-lbl"), html.Th("Current"),
-                    html.Th("Candidate"), html.Th("Δ")])
-    body = [_cmp_money_row("Δ (per $1)", cg.get("delta"), ng.get("delta")),
-            _cmp_money_row("Γ (per $1²)", cg.get("gamma"), ng.get("gamma")),
-            _cmp_money_row("ν (per vol pt)", cg.get("vega"), ng.get("vega")),
-            _cmp_money_row("Θ (per day)", cg.get("theta"), ng.get("theta"))]
-    return html.Table(className="scanner-tbl cmp-tbl", children=[html.Thead(head), html.Tbody(body)])
-
-
-def _comparison_sliders(shock=None):
-    from pm.ui.drawers.payoff import _slider
-    sp = shock or {}
-    return html.Div(className="scanner-cmp-dial", children=[
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Underlying move %", className="payoff-ctrl-lbl"),
-            _slider("scanner-cmp-spot", -30, 30, 1, sp.get("spot_pct", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Vol shift (pts)", className="payoff-ctrl-lbl"),
-            _slider("scanner-cmp-vol", -10, 10, 0.5, sp.get("vol_pts", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Rate shift (bps)", className="payoff-ctrl-lbl"),
-            _slider("scanner-cmp-rate", -50, 50, 5, sp.get("rate_bps", 0))]),
-        html.Div(className="payoff-ctrl", children=[
-            html.Label("Time fwd (days)", className="payoff-ctrl-lbl"),
-            _slider("scanner-cmp-time", 0, 60, 1, sp.get("time_days", 0))]),
-    ])
-
-
-def _comparison_body(ds, obj, rank, shock, n_expiries=_BASE_EXPIRIES):
-    """Figure + side-by-side economics/greeks for one selected candidate at the given
-    shock. Both sides price at the slice's spot so the curves share a grid.
-    ``n_expiries`` is the scanner's ACTIVE window: the slice cache (and its attached
-    ranking) is keyed by window, so the comparison must resolve (obj, rank) against
-    the same window the clicked table rendered from — not the base default."""
-    account, sid, pid = ds.get("account"), ds.get("structure_id"), ds.get("position_id")
-    rc = sa.scanner_candidate(account, pid, obj, rank, n_expiries=n_expiries,
-                              structure_id=sid)
+def _cmp_pair(ds, controls, obj, rank, shock):
+    account, pid = ds.get("account"), ds.get("position_id")
+    sid = ds.get("structure_id")
+    rolled = (controls or {}).get("rolled") or [pid]
+    kw = dict(structure_id=sid, dte_range=(controls or {}).get("dte"),
+              delta_band=(controls or {}).get("band"),
+              rolled_pids=rolled if len(rolled) > 1 else None)
+    rc = sa.scanner_candidate(account, pid, obj, rank, **kw)
     current = sa.price_payoff(account, structure_id=sid, position_id=pid, shock=shock)
-    candidate = sa.price_candidate(account, pid, obj, rank, shock=shock,
-                                   n_expiries=n_expiries, structure_id=sid)
-    if rc is None or current is None or candidate is None:
-        return html.Div("Comparison unavailable for this candidate.", className="scanner-empty")
-    net_to_roll = getattr(rc.candidate, "net_credit", None)
-    desc = getattr(rc.candidate, "description", "")
-    return html.Div(children=[
-        html.Div(f"Current vs candidate — {desc}", className="scanner-cmp-title"),
-        dcc.Graph(figure=_comparison_figure(current, candidate),
-                  config={"displayModeBar": False, "responsive": True}, className="scanner-cmp-graph"),
-        html.Div(className="scanner-cmp-cols", children=[
-            _side_by_side_econ(current, candidate, net_to_roll),
-            _side_by_side_greeks(current, candidate),
-        ]),
-    ])
+    candidate = sa.price_candidate(account, pid, obj, rank, shock=shock, **kw)
+    return rc, current, candidate
 
 
 def register_comparison_callbacks(app) -> None:
-    """Wire the comparison: selecting a candidate row draws current vs candidate and
-    reveals the sliders; the sliders (stable ids in the scanner body) reprice both at one
-    shock. Independent of the payoff dial. Guarded on the scanner view."""
+    """Candidate row selection -> the Current-vs-adjusted table, the payoff pair
+    and the smile marker; the shock dials reprice both sides at one shock."""
 
     @app.callback(
-        Output("scanner-cmp-body", "children"),
-        Output("scanner-cmp-sel", "data"),
-        Input({"type": "scanner-cand", "obj": ALL, "rank": ALL}, "n_clicks"),
+        Output("scanner-cmp-body", "children", allow_duplicate=True),
+        Output("scanner-payoff", "figure", allow_duplicate=True),
+        Output("scanner-smile", "figure", allow_duplicate=True),
+        Output("scanner-cmp-sel", "data", allow_duplicate=True),
+        Input("scanner-cand-grid", "selectedRows"),
         State("drawer-state", "data"),
-        State("scanner-window", "data"),
+        State("scanner-controls", "data"),
+        State("scanner-smile-expiry", "value"),
         State("scanner-cmp-spot", "value"),
         State("scanner-cmp-vol", "value"),
         State("scanner-cmp-rate", "value"),
         State("scanner-cmp-time", "value"),
         prevent_initial_call=True,
     )
-    def _select(_clicks, ds, window, spot_pct, vol_pts, rate_bps, time_days):
-        trig = ctx.triggered_id
-        # The comparison works on any scanner tab; the "current" side prices the enclosing
-        # structure when the anchor carries a structure_id, else the standalone leg. Renders
-        # at the sliders' current shock so it agrees with what the dials show. The window
-        # store rides along so the clicked row resolves against the ranking it came from
-        # (after Expand, the base-window ranking is a DIFFERENT candidate list).
-        if not ds or ds.get("view") != "scanner" or not isinstance(trig, dict):
-            return no_update, no_update
-        if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
-            return no_update, no_update
-        obj, rank = trig.get("obj"), trig.get("rank")
+    def _select(rows, ds, controls, exp_hint, spot_pct, vol_pts, rate_bps, time_days):
+        if not ds or ds.get("view") != "scanner" or not rows:
+            return (no_update,) * 4
+        row = rows[0]
+        obj, rank = row.get("obj"), row.get("rank_n")
         shock = {"spot_pct": spot_pct or 0.0, "vol_pts": vol_pts or 0.0,
                  "rate_bps": rate_bps or 0.0, "time_days": int(time_days or 0)}
-        n_exp = int(window or _BASE_EXPIRIES)
-        return (_comparison_body(ds, obj, rank, shock, n_expiries=n_exp),
-                {"obj": obj, "rank": rank})
+        rc, current, candidate = _cmp_pair(ds, controls, obj, rank, shock)
+        if rc is None or candidate is None:
+            return (html.Div("Comparison unavailable for this candidate.",
+                             className="scanner-empty"),
+                    _msg_fig("Payoff unavailable for this candidate.", 240),
+                    no_update, no_update)
+        state = sa.get_state()
+        acc = state.accounts.get(ds.get("account")) if state else None
+        nav = getattr(acc, "nav", None)
+        cur = current if current is not None else {}
+        cmp_body = _cmp_table(cur, candidate, rc, nav)
+        # The smile marker follows the selection.
+        rolled = (controls or {}).get("rolled") or [ds.get("position_id")]
+        view = _scan_view(ds.get("account"), ds.get("position_id"),
+                          structure_id=ds.get("structure_id"), rolled_pids=rolled,
+                          dte_range=(controls or {}).get("dte"),
+                          delta_band=(controls or {}).get("band"))
+        smile = no_update
+        if not view.get("unavailable"):
+            prim = _primary_leg(rc.candidate)
+            sel = None
+            if prim is not None:
+                tk = prim.get("position_id")
+                match = next((c for c in view.get("contracts") or []
+                              if c.get("ticker") == tk), None)
+                if match:
+                    sel = {"strike": match.get("strike"), "iv": match.get("iv"),
+                           "label": f"#{rank}  {row.get('move', '')}"}
+                    exp_hint = str(match.get("expiry")) or exp_hint
+            smile = _smile_fig(view, exp_hint, sel)
+        return cmp_body, _payoff_fig(candidate), smile, {"obj": obj, "rank": rank}
 
     @app.callback(
         Output("scanner-cmp-body", "children", allow_duplicate=True),
+        Output("scanner-payoff", "figure", allow_duplicate=True),
         Input("scanner-cmp-spot", "value"),
         Input("scanner-cmp-vol", "value"),
         Input("scanner-cmp-rate", "value"),
         Input("scanner-cmp-time", "value"),
         State("drawer-state", "data"),
+        State("scanner-controls", "data"),
         State("scanner-cmp-sel", "data"),
-        State("scanner-window", "data"),
         prevent_initial_call=True,
     )
-    def _redial(spot_pct, vol_pts, rate_bps, time_days, ds, sel, window):
+    def _redial(spot_pct, vol_pts, rate_bps, time_days, ds, controls, sel):
         if not ds or ds.get("view") != "scanner" or not sel:
-            return no_update
+            return no_update, no_update
         shock = {"spot_pct": spot_pct or 0.0, "vol_pts": vol_pts or 0.0,
                  "rate_bps": rate_bps or 0.0, "time_days": int(time_days or 0)}
-        return _comparison_body(ds, sel.get("obj"), sel.get("rank"), shock,
-                                n_expiries=int(window or _BASE_EXPIRIES))
+        rc, current, candidate = _cmp_pair(ds, controls, sel.get("obj"),
+                                           sel.get("rank"), shock)
+        if rc is None or candidate is None:
+            return no_update, no_update
+        state = sa.get_state()
+        acc = state.accounts.get(ds.get("account")) if state else None
+        return (_cmp_table(current if current is not None else {}, candidate, rc,
+                           getattr(acc, "nav", None)),
+                _payoff_fig(candidate))

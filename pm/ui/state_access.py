@@ -12,7 +12,7 @@ canonical instance for both the entry point and every callback.
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -242,7 +242,8 @@ def price_payoff(
 
 
 def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
-                      *, n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
+                      *, n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
+                      dte_range=None, delta_band=None, rolled_pids=None):
     """The cached ranked scanner candidate at ``(objective, rank)`` for a held position,
     or None. Reads the slice the scanner already pulled + ranked — but a COLD
     cache (fresh reload, first touch) resolves through ``pull_slice``, which
@@ -261,21 +262,31 @@ def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
     pos = position_by_id(state, account, position_id)
     if pos is None:
         return None
-    if pos.asset_class == "option":
+    pids = {str(p) for p in (rolled_pids or [])}
+    if len(pids) > 1:
+        # A joint roll resolves from the joint cache (rank_joint_candidates owns it).
+        sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+        ranked_map = state.slice_cache.get("joint_ranked", {}).get(
+            (account, position_id, sid, frozenset(pids), _scan_sig(dte_range, delta_band)))
+    elif pos.asset_class == "option":
         # Same sentinel contract as the scan itself: the drawer passes drawer-state's
         # structure_id verbatim (None = standalone), so the (obj, rank) lookup lands
         # on the ranking the clicked table was rendered from.
         sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
-        sl = pull_slice(account, position_id, n_expiries=n_expiries)  # cache hit after the scan
-        ranked_map = (sl.get("candidates_ranked") or {}).get((account, position_id, sid)) if sl else None
+        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        ranked_map = ((sl.get("candidates_ranked") or {})
+                      .get((account, position_id, sid, _scan_sig(None, delta_band)))
+                      if sl else None)
     else:
-        ranked_map = state.slice_cache.get("overlay_ranked", {}).get(position_id)
+        ranked_map = state.slice_cache.get("overlay_ranked", {}).get(
+            (position_id, _scan_sig(dte_range, delta_band)))
     ranked = (ranked_map or {}).get(objective) or []
     return next((r for r in ranked if getattr(r, "rank", None) == rank), None)
 
 
 def price_candidate(account: str, position_id: str, objective: str, rank: int, *,
-                    shock=None, n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
+                    shock=None, n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
+                    dte_range=None, delta_band=None, rolled_pids=None):
     """The candidate side of the current-vs-candidate comparison — a read-only payoff
     reprice of a ranked candidate's resulting position under a shock. Prices the
     candidate's engine legs through the pure ``compute_payoff`` (the same engine the
@@ -285,7 +296,8 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     No Bloomberg beyond the already-cached slice, no reload, no ``_RUNTIME`` write,
     no engine change. Returns the ``compute_payoff`` dict or None."""
     rc = scanner_candidate(account, position_id, objective, rank, n_expiries=n_expiries,
-                           structure_id=structure_id)
+                           structure_id=structure_id, dte_range=dte_range,
+                           delta_band=delta_band, rolled_pids=rolled_pids)
     if rc is None:
         return None
     state = _RUNTIME.get("state")
@@ -294,7 +306,7 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     if acc is None or pos is None:
         return None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
         spot = sl.get("spot") if sl else None
     else:
         spot = _spot_from_snapshot(acc, pos.bbg_ticker)
@@ -331,10 +343,50 @@ def _spot_from_snapshot(acc: AccountState, underlier: str) -> Optional[float]:
     return coerce_float(df.loc[underlier, "PX_LAST"] if "PX_LAST" in df.columns else None)
 
 
+def chain_expiries(account: str, position_id: str) -> list:
+    """The underlier's LISTED monthly expiries (sorted dates) from the cached chain —
+    the DTE slider's bounds derive from these, so the control can never ask for an
+    expiry that doesn't exist. Enumerates the chain on first touch (the same cached
+    one-per-underlier pull the scan uses). Empty list when unavailable."""
+    state = _RUNTIME.get("state")
+    if state is None or not getattr(state, "bloomberg_ok", False):
+        return []
+    acc = state.accounts.get(account)
+    pos = next((p for p in (acc.positions if acc else [])
+                if p.position_id == position_id), None)
+    underlier = getattr(pos, "underlying_bbg_ticker", None) or getattr(pos, "bbg_ticker", None)
+    if not underlier:
+        return []
+    from pm.core.ticker_utils import _is_third_friday, parse_option_description
+    chains = state.slice_cache.setdefault("chains", {})
+    entry = chains.get(underlier)
+    if entry is None:
+        from pm.core.bloomberg_client import fetch_option_chain
+        parsed = [d for d in (parse_option_description(s)
+                              for s in fetch_option_chain(underlier)) if d]
+        entry = {"chain": parsed, "pulled_at": datetime.now()}
+        chains[underlier] = entry
+    today = date.today()
+    return sorted({p["expiry"] for p in entry["chain"]
+                   if p.get("expiry") and p["expiry"] > today
+                   and _is_third_friday(p["expiry"])})
+
+
+def _resolve_expiry_range(dte_range) -> Optional[tuple]:
+    """(first, last) calendar window for a (lo, hi) DTE range — the chain filter
+    then intersects it with the LISTED expiries (client-side; chain overrides are
+    unavailable on this terminal)."""
+    if dte_range is None:
+        return None
+    lo, hi = dte_range
+    today = date.today()
+    return (today + timedelta(days=int(lo)), today + timedelta(days=int(hi)))
+
+
 def pull_slice(
     account: str, position_id: str, *, refresh: bool = False,
     refresh_chain: bool = False, n_expiries: int = 3, moneyness_pct: float = 0.15,
-    rights=("CALL", "PUT"), monthlies_only: bool = True,
+    rights=("CALL", "PUT"), monthlies_only: bool = True, dte_range=None,
 ) -> Optional[dict]:
     """Pull the targeted option-chain slice for a held position and cache it on the
     loaded state. A SANCTIONED owned-state WRITE path (parallel to ``resolve_structure``;
@@ -373,13 +425,15 @@ def pull_slice(
     chains = cache.setdefault("chains", {})
     slices = cache.setdefault("slices", {})
 
-    key = (underlier, round(float(pos.strike), 4), pos.expiry, int(n_expiries),
-           round(float(moneyness_pct), 4), bool(monthlies_only),
-           tuple(sorted(str(r).upper() for r in rights)))
-    if not refresh and key in slices:
-        return slices[key]
+    rights_key = tuple(sorted(str(r).upper() for r in rights))
+    if dte_range is None:
+        key = (underlier, round(float(pos.strike), 4), pos.expiry, int(n_expiries),
+               round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+        if not refresh and key in slices:
+            return slices[key]
 
-    from pm.core.ticker_utils import filter_chain_slice, parse_option_description
+    from pm.core.ticker_utils import (filter_chain_slice, _is_third_friday,
+                                      parse_option_description)
 
     chain_entry = chains.get(underlier)
     if chain_entry is None or refresh_chain:
@@ -388,30 +442,81 @@ def pull_slice(
         chain_entry = {"chain": parsed, "pulled_at": datetime.now()}
         chains[underlier] = chain_entry
 
-    candidates = filter_chain_slice(
-        chain_entry["chain"], spot, pos.strike, horizon_expiry=pos.expiry,
-        n_expiries=n_expiries, moneyness_pct=moneyness_pct, rights=rights,
-        monthlies_only=monthlies_only,
-    )
-
     from pm.core.bloomberg_client import fetch_option_snapshots
     df = None
     spot_asof = "snapshot"
-    if candidates:
-        # The underlier rides in the SAME batched snapshot request (one extra
-        # security, no extra round trip): its live PX_LAST re-anchors the slice
-        # spot so the candidate quotes and the spot they price against are
-        # contemporaneous. The chain window above is still cut on the
-        # morning-snapshot spot — the fresh value only exists once this fetch
-        # returns. On any fetch failure (empty frame, missing row/field) the
-        # snapshot spot stands and the stamp says so.
-        df = fetch_option_snapshots(list(candidates) + [underlier])
-        if df is not None and underlier in df.index:
-            live_spot = coerce_float(df.loc[underlier].get("PX_LAST"))
-            df = df.drop(index=underlier)
-            if live_spot is not None and live_spot > 0:
-                spot = live_spot
-                spot_asof = "live"
+
+    if dte_range is not None:
+        # The RANGE family: the DTE range resolves to LISTED monthlies from the
+        # cached chain (client-side — the control can never ask for an unlisted
+        # expiry), keyed by the resolved expiry tuple. Snapshots cache PER EXPIRY
+        # (``exp_frames``), so widening the range fetches exactly the missing
+        # expiries in one batched request and reuses every frame already pulled.
+        e_lo, e_hi = _resolve_expiry_range(dte_range)
+        today_d = date.today()
+        chosen = tuple(sorted({p["expiry"] for p in chain_entry["chain"]
+                               if p.get("expiry") and today_d < p["expiry"]
+                               and e_lo <= p["expiry"] <= e_hi
+                               and (not monthlies_only or _is_third_friday(p["expiry"]))}))
+        key = (underlier, round(float(pos.strike), 4), pos.expiry, ("rng",) + chosen,
+               round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+        if not refresh and key in slices:
+            return slices[key]
+        frames = cache.setdefault("exp_frames", {})
+
+        def _fkey(exp):
+            return (underlier, exp, round(float(pos.strike), 4),
+                    round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+
+        tickers_by_exp = {
+            exp: filter_chain_slice(chain_entry["chain"], spot, pos.strike,
+                                    expiry_range=(exp, exp), moneyness_pct=moneyness_pct,
+                                    rights=rights, monthlies_only=monthlies_only)
+            for exp in chosen}
+        missing = [exp for exp in chosen
+                   if refresh or _fkey(exp) not in frames]
+        if missing:
+            to_fetch = sorted({tk for exp in missing for tk in tickers_by_exp[exp]})
+            if to_fetch:
+                fetched = fetch_option_snapshots(to_fetch + [underlier])
+                if fetched is not None and underlier in fetched.index:
+                    live_spot = coerce_float(fetched.loc[underlier].get("PX_LAST"))
+                    fetched = fetched.drop(index=underlier)
+                    if live_spot is not None and live_spot > 0:
+                        spot = live_spot
+                        spot_asof = "live"
+                for exp in missing:
+                    tks = [t for t in tickers_by_exp[exp]
+                           if fetched is not None and t in fetched.index]
+                    frames[_fkey(exp)] = fetched.loc[tks] if tks else None
+            else:
+                for exp in missing:
+                    frames[_fkey(exp)] = None
+        parts = [frames.get(_fkey(exp)) for exp in chosen]
+        parts = [p for p in parts if p is not None and not getattr(p, "empty", True)]
+        df = pd.concat(parts) if parts else None
+        candidates = sorted({tk for exp in chosen for tk in tickers_by_exp[exp]})
+    else:
+        candidates = filter_chain_slice(
+            chain_entry["chain"], spot, pos.strike, horizon_expiry=pos.expiry,
+            n_expiries=n_expiries, moneyness_pct=moneyness_pct, rights=rights,
+            monthlies_only=monthlies_only,
+        )
+        if candidates:
+            # The underlier rides in the SAME batched snapshot request (one extra
+            # security, no extra round trip): its live PX_LAST re-anchors the slice
+            # spot so the candidate quotes and the spot they price against are
+            # contemporaneous. The chain window above is still cut on the
+            # morning-snapshot spot — the fresh value only exists once this fetch
+            # returns. On any fetch failure (empty frame, missing row/field) the
+            # snapshot spot stands and the stamp says so.
+            df = fetch_option_snapshots(list(candidates) + [underlier])
+            if df is not None and underlier in df.index:
+                live_spot = coerce_float(df.loc[underlier].get("PX_LAST"))
+                df = df.drop(index=underlier)
+                if live_spot is not None and live_spot > 0:
+                    spot = live_spot
+                    spot_asof = "live"
 
     # Surface + IV+pp (a read-only derivation of the cached slice) and IV-rank (a
     # name-level metric cached beside the chain). Best-effort — a fit failure must not
@@ -539,17 +644,43 @@ def _contemporaneous_mid(pos, sl) -> Optional[float]:
         return None
 
 
+def _scan_sig(dte_range, delta_band) -> tuple:
+    """A hashable signature of the scan controls, for cache keys."""
+    rng = tuple(dte_range) if dte_range is not None else None
+    band = tuple(delta_band) if delta_band is not None else None
+    return (rng, band)
+
+
+def _band_filter_df(df, delta_band):
+    """The slice restricted to |delta| inside the band. A band means the delta must
+    be KNOWN — rows without one drop (matching the joint path's rule). None-band
+    returns the frame untouched."""
+    if delta_band is None or df is None or getattr(df, "empty", True):
+        return df
+    lo, hi = float(delta_band[0]), float(delta_band[1])
+    if "delta_mid" not in df.columns:
+        return df.iloc[0:0]
+    d = df["delta_mid"].abs()
+    return df[(d >= lo) & (d <= hi)]
+
+
 def _drop_candidate_caches(state, account: str) -> None:
-    """Drop the account's cached scanner candidates/rankings (raw slices stay).
-    The cached rankings embed structure context — kept legs, allocated slices — so
-    a structure confirm/reject/choose/edit must invalidate them or a reopened scan
-    serves candidates priced against a resolution the user just changed."""
-    for entry in (getattr(state, "slice_cache", None) or {}).get("slices", {}).values():
+    """Drop the account's cached scanner candidates/rankings (raw slices and
+    per-expiry frames stay). The cached rankings embed structure context — kept
+    legs, allocated slices — so a structure confirm/reject/choose/edit must
+    invalidate them or a reopened scan serves candidates priced against a
+    resolution the user just changed."""
+    sc = getattr(state, "slice_cache", None) or {}
+    for entry in sc.get("slices", {}).values():
         for cache_name in ("candidates_ranked", "candidates_priced"):
             m = entry.get(cache_name)
             if m:
                 for k in [k for k in m if k[0] == account]:
                     m.pop(k, None)
+    jr = sc.get("joint_ranked")
+    if jr:
+        for k in [k for k in jr if k[0] == account]:
+            jr.pop(k, None)
 
 
 def _resolve_scan_structure_id(state, account: str, position_id: str, structure_id):
@@ -593,10 +724,12 @@ def _structure_roll_context(state: PortfolioState, acc: AccountState, pos, sid):
     return kept, rolled[0].get("qty"), kept_warns
 
 
-def _spot_slice_df(state: PortfolioState, underlier: str, spot: float):
-    """A spot-centered near-dated slice frame for a stock overlay (there is no held
-    strike/expiry to anchor on). Reuses the per-underlier chain cache."""
-    from datetime import date, timedelta
+def _spot_slice_df(state: PortfolioState, underlier: str, spot: float, dte_range=None):
+    """A spot-centered slice frame for a stock overlay (there is no held
+    strike/expiry to anchor on). Reuses the per-underlier chain cache. The default
+    window is the first three monthlies from ~30 days out, so the standard
+    30-45 day write is in the universe; an explicit ``dte_range`` (the scan's DTE
+    slider) overrides it."""
     from pm.core.ticker_utils import filter_chain_slice, parse_option_description
     from pm.core.bloomberg_client import fetch_option_snapshots
     chains = state.slice_cache.setdefault("chains", {})
@@ -607,14 +740,20 @@ def _spot_slice_df(state: PortfolioState, underlier: str, spot: float):
         entry = {"chain": parsed, "pulled_at": datetime.now()}
         chains[underlier] = entry
     today = date.today()
-    tickers = filter_chain_slice(entry["chain"], spot, spot,
-                                 horizon_expiry=today + timedelta(days=90),
-                                 n_expiries=3, moneyness_pct=0.15)
+    if dte_range is not None:
+        tickers = filter_chain_slice(entry["chain"], spot, spot,
+                                     expiry_range=_resolve_expiry_range(dte_range),
+                                     moneyness_pct=0.15)
+    else:
+        tickers = filter_chain_slice(entry["chain"], spot, spot,
+                                     horizon_expiry=today + timedelta(days=30),
+                                     n_expiries=3, moneyness_pct=0.15)
     return fetch_option_snapshots(tickers) if tickers else None
 
 
 def generate_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
-                              n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
+                              n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
+                              dte_range=None, delta_band=None):
     """Generate + price the adjustment candidates for a held position — rolls for a held
     option, single-leg overlays for held stock. Attaches the priced candidates to the
     slice cache entry and returns them (or None)."""
@@ -635,7 +774,7 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
     cands = []
     try:
         if pos.asset_class == "option":
-            sl = pull_slice(account, position_id, n_expiries=n_expiries)
+            sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
             if sl is None:
                 return None
             q = _div_yield(acc, sl["underlier"])
@@ -649,25 +788,31 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
             sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
             sibling_legs, rolled_qty, ctx_warns = _structure_roll_context(state, acc, pos, sid)
             cands = candidates_from_slice(
-                sl["df"], held, _contemporaneous_mid(pos, sl), sl["spot"],
+                _band_filter_df(sl["df"], delta_band), held,
+                _contemporaneous_mid(pos, sl), sl["spot"],
                 held_stock=_held_stock(acc, pos), sibling_legs=sibling_legs,
                 rolled_qty=rolled_qty, context_warnings=ctx_warns, risk_free_curve=curve,
                 risk_free_rate=rfr, div_yield=q, objectives=objectives, cap=cap)
             # Keyed per position AND structure anchor: the raw slice is shared
             # across positions/accounts holding the same contract, but the priced
             # candidates embed ONE position's structure context and must never
-            # leak across positions, accounts, or open routes.
-            sl.setdefault("candidates_priced", {})[(account, position_id, sid)] = cands
+            # leak across positions, accounts, or open routes. (The slice entry
+            # itself is window-keyed; the |delta| band scopes the nested key.)
+            sl.setdefault("candidates_priced", {})[
+                (account, position_id, sid, _scan_sig(None, delta_band))] = cands
         elif pos.asset_class in ("equity", "fund_etf"):
             spot = _spot_from_snapshot(acc, pos.bbg_ticker)
             basis = _per_share_basis(pos)
             if spot is None or basis is None or not pos.quantity:
                 return []
-            df = _spot_slice_df(state, pos.bbg_ticker, spot)
+            df = _band_filter_df(_spot_slice_df(state, pos.bbg_ticker, spot,
+                                                dte_range=dte_range), delta_band)
             # Retain the overlay slice so the scanner chain table can read each
             # candidate's contract liquidity (the option-roll path keeps its slice; the
-            # overlay path builds a transient frame, so stash it under the position).
-            state.slice_cache.setdefault("overlay_dfs", {})[position_id] = df
+            # overlay path builds a transient frame, so stash it under the position,
+            # scoped by the scan controls).
+            state.slice_cache.setdefault("overlay_dfs", {})[
+                (position_id, _scan_sig(dte_range, delta_band))] = df
             q = _div_yield(acc, pos.bbg_ticker)
             cands = overlays_from_slice(df, spot, int(pos.quantity), basis,
                                         risk_free_curve=curve, risk_free_rate=rfr,
@@ -679,7 +824,8 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
 
 
 def rank_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
-                          n_expiries: int = 3, structure_id=STRUCTURE_AUTO):
+                          n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
+                          dte_range=None, delta_band=None):
     """Generate + price + rank the adjustment candidates for a held position, grouped
     by objective. Reads the account's client profile and the slice's IV+pp rows and
     ranks each objective's candidates through ``pm.candidates.ranking``; the only
@@ -705,19 +851,23 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     # SAME cache, so the overlay path is no longer compare-dead.
     sid = (_resolve_scan_structure_id(state, account, position_id, structure_id)
            if pos.asset_class == "option" else None)
+    band_sig = _scan_sig(None, delta_band)
     if pos.asset_class == "option":
-        cached_sl = pull_slice(account, position_id, n_expiries=n_expiries)
-        cached_ranked = ((cached_sl.get("candidates_ranked") or {}).get((account, position_id, sid))
+        cached_sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        cached_ranked = ((cached_sl.get("candidates_ranked") or {})
+                         .get((account, position_id, sid, band_sig))
                          if cached_sl else None)
         if cached_ranked:
             return cached_ranked
     else:
-        cached = state.slice_cache.get("overlay_ranked", {}).get(position_id)
+        cached = state.slice_cache.get("overlay_ranked", {}).get(
+            (position_id, _scan_sig(dte_range, delta_band)))
         if cached:
             return cached
 
     cands = generate_slice_candidates(account, position_id, objectives=objectives, cap=cap,
-                                      n_expiries=n_expiries, structure_id=sid)
+                                      n_expiries=n_expiries, structure_id=sid,
+                                      dte_range=dte_range, delta_band=delta_band)
     if not cands:
         return None
 
@@ -730,7 +880,7 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     held = None
     sl = None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
         iv_pp = sl.get("iv_pp") if sl else None
         held = {"delta": _held_option_delta(acc, pos),
                 "dte": (pos.expiry - date.today()).days if pos.expiry else None,
@@ -745,20 +895,24 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
               for obj, cs in by_objective.items()}
 
     if sl is not None:
-        # Keyed per position + structure anchor (see generate_slice_candidates):
-        # the ranking embeds one structure context; same-contract slices are shared.
-        sl.setdefault("candidates_ranked", {})[(account, position_id, sid)] = ranked
+        # Keyed per position + structure anchor + |delta| band (see
+        # generate_slice_candidates): the ranking embeds one structure context;
+        # same-contract slices are shared; the slice entry is window-keyed.
+        sl.setdefault("candidates_ranked", {})[
+            (account, position_id, sid, band_sig)] = ranked
     elif pos.asset_class in ("equity", "fund_etf"):
         # The overlay analog of the slice-attached ranking cache: keyed per
-        # position beside overlay_dfs, read by scanner_candidate / the pill
-        # cache-hit above. Dropped by a scanner Refresh (scanner_view_data).
-        state.slice_cache.setdefault("overlay_ranked", {})[position_id] = ranked
+        # position + scan controls beside overlay_dfs, read by scanner_candidate /
+        # the cache-hit above. Dropped by a scanner Refresh (scanner_view_data).
+        state.slice_cache.setdefault("overlay_ranked", {})[
+            (position_id, _scan_sig(dte_range, delta_band))] = ranked
     return ranked
 
 
 def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
                               objectives=None, cap: int = 15, n_expiries: int = 3,
-                              structure_id=STRUCTURE_AUTO, delta_band=None):
+                              structure_id=STRUCTURE_AUTO, delta_band=None,
+                              dte_range=None):
     """Joint-roll candidates: roll a SET of the enclosing structure's option legs
     together to one common new expiry, priced as the resulting structure (kept
     siblings at entry basis, every new leg at the current slice mid — the same
@@ -788,7 +942,8 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
     if len(pids) == 1:
         return generate_slice_candidates(account, next(iter(pids)), objectives=objectives,
                                          cap=cap, n_expiries=n_expiries,
-                                         structure_id=structure_id)
+                                         structure_id=structure_id,
+                                         dte_range=dte_range, delta_band=delta_band)
 
     sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
     if not sid:
@@ -814,7 +969,7 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
         return None                     # every pid must be a sized option leg
     kept = [d for d in legs if d not in rolled_dicts]
 
-    sl = pull_slice(account, position_id, n_expiries=n_expiries)
+    sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
     if sl is None:
         return None
     by_id = {p.position_id: p for p in acc.positions}
@@ -852,7 +1007,8 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
 
 def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
                           objectives=None, cap: int = 15, n_expiries: int = 3,
-                          structure_id=STRUCTURE_AUTO, delta_band=None):
+                          structure_id=STRUCTURE_AUTO, delta_band=None,
+                          dte_range=None):
     """Generate + rank the joint-roll candidates, grouped by objective — the
     joint analogue of ``rank_slice_candidates``. A one-element rolled set is the
     single-leg path END-TO-END (delegated here too, so its ranking carries the
@@ -864,36 +1020,125 @@ def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
     if len(pids) == 1:
         return rank_slice_candidates(account, next(iter(pids)), objectives=objectives,
                                      cap=cap, n_expiries=n_expiries,
-                                     structure_id=structure_id)
+                                     structure_id=structure_id,
+                                     dte_range=dte_range, delta_band=delta_band)
+    state = _RUNTIME.get("state")
+    if state is None:
+        return None
+    # The roster owns joint caching: keyed by anchor + structure + the rolled SET
+    # + the scan controls, dropped by Refresh and by structure resolutions.
+    sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+    jkey = (account, position_id, sid, frozenset(pids), _scan_sig(dte_range, delta_band))
+    cached = state.slice_cache.get("joint_ranked", {}).get(jkey)
+    if cached:
+        return cached
     cands = generate_joint_candidates(account, position_id, rolled_pids,
                                       objectives=objectives, cap=cap,
-                                      n_expiries=n_expiries, structure_id=structure_id,
-                                      delta_band=delta_band)
+                                      n_expiries=n_expiries, structure_id=sid,
+                                      delta_band=delta_band, dte_range=dte_range)
     if not cands:
         return None
-    state = _RUNTIME.get("state")
-    acc = state.accounts.get(account) if state else None
-    sl = pull_slice(account, position_id, n_expiries=n_expiries)
+    acc = state.accounts.get(account)
+    sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
     iv_pp = sl.get("iv_pp") if sl else None
     from pm.candidates.ranking import rank_candidates
     by_objective: dict = {}
     for c in cands:
         by_objective.setdefault(c.objective, []).append(c)
-    return {obj: rank_candidates(cs, objective=obj,
-                                 client_profile=getattr(acc, "client_profile", None),
-                                 iv_pp=iv_pp, held=None)
-            for obj, cs in by_objective.items()}
+    ranked = {obj: rank_candidates(cs, objective=obj,
+                                   client_profile=getattr(acc, "client_profile", None),
+                                   iv_pp=iv_pp, held=None)
+              for obj, cs in by_objective.items()}
+    state.slice_cache.setdefault("joint_ranked", {})[jkey] = ranked
+    return ranked
+
+
+def scanner_roster(account: str, position_id: str, *, structure_id=STRUCTURE_AUTO):
+    """The Managing band's data, read-only from loaded state: the enclosing
+    structure's legs as roster rows (role · contract · DTE · Δ · morning-snapshot
+    mid · the |Δ| assignment proxy on short legs · the opened-on marker) plus the
+    structure's stored current economics (the load-path Tier-2 record and the
+    snapshot net delta — zero recompute). A standalone position yields its single
+    row; None when nothing resolves."""
+    state = _RUNTIME.get("state")
+    if state is None:
+        return None
+    acc = state.accounts.get(account)
+    pos = position_by_id(state, account, position_id) if state else None
+    if acc is None or pos is None:
+        return None
+    sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+    struct = next((s for s in (getattr(acc, "structures", None) or [])
+                   if s.structure_id == sid), None) if sid else None
+    by_id = {p.position_id: p for p in acc.positions}
+    opts = getattr(getattr(acc, "snapshot", None), "options", None)
+
+    def _snap(tk, col):
+        if opts is not None and not getattr(opts, "empty", True) and tk in opts.index:
+            return coerce_float(opts.loc[tk].get(col))
+        return None
+
+    def _row(pid, alloc, role):
+        p = by_id.get(pid)
+        if p is None:
+            return None
+        if getattr(p, "asset_class", None) == "option":
+            d = _snap(p.bbg_ticker, "delta_mid")
+            qty = alloc if alloc is not None else p.quantity
+            return {"position_id": pid, "role": role or "",
+                    "contract": f"{p.strike:g} {(p.right or '?')[0]}",
+                    "qty": qty,
+                    "dte": (p.expiry - date.today()).days if p.expiry else None,
+                    "delta": d, "mid": _snap(p.bbg_ticker, "PX_MID"),
+                    "p_assign": (abs(d) if (d is not None and (qty or 0) < 0) else None),
+                    "is_option": True, "anchor": pid == position_id}
+        qty = alloc if alloc is not None else p.quantity
+        return {"position_id": pid, "role": role or "stock",
+                "contract": "stock", "qty": qty, "dte": None, "delta": None,
+                "mid": None, "p_assign": None, "is_option": False,
+                "anchor": pid == position_id}
+
+    if struct is not None:
+        rows = [r for r in (_row(lg.position_id, lg.allocated_qty, lg.role)
+                            for lg in struct.legs) if r is not None]
+        tier2 = (getattr(acc, "structure_tier2", None) or {}).get(sid) or {}
+        net_delta = 0.0
+        have_delta = False
+        for lg in struct.legs:
+            p = by_id.get(lg.position_id)
+            if p is None:
+                continue
+            if getattr(p, "asset_class", None) == "option":
+                d = _snap(p.bbg_ticker, "delta_mid")
+                if d is not None:
+                    net_delta += d * (lg.allocated_qty or 0) * 100.0
+                    have_delta = True
+            else:
+                net_delta += (lg.allocated_qty or 0)
+                have_delta = True
+        econ = {"structure_type": getattr(struct, "type", None),
+                "status": getattr(struct, "status", None),
+                "net_delta": net_delta if have_delta else None,
+                "tier2": tier2}
+        return {"rows": rows, "sid": sid, "econ": econ}
+    row = _row(position_id, None, getattr(pos, "right", None) or pos.asset_class)
+    return {"rows": [row] if row else [], "sid": None,
+            "econ": {"structure_type": None, "status": None, "net_delta": None,
+                     "tier2": {}}}
 
 
 def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: int = 15,
                       refresh: bool = False, n_expiries: int = 3,
-                      structure_id=STRUCTURE_AUTO) -> Optional[dict]:
-    """Read-only packaging for the scanner drawer: the ranked adjustment candidates for a
-    held position, plus the slice metadata the view stamps. Delegates to
-    ``rank_slice_candidates`` (the sanctioned on-demand pull + rank); ``refresh`` re-pulls
-    the option slice first. Returns ``{ranked, pulled_at, spot, underlier, kind}`` or
-    ``None`` (no state / position, Bloomberg off, or nothing to scan). The pull is the
-    only market I/O — the view itself never recomputes."""
+                      structure_id=STRUCTURE_AUTO, dte_range=None, delta_band=None,
+                      rolled_pids=None) -> Optional[dict]:
+    """Read-only packaging for the scanner drawer: the ranked adjustment candidates
+    for a held position (single-leg, overlay, or — with 2+ ``rolled_pids`` — the
+    joint path), plus the slice metadata the view stamps: spot/as-of, the full
+    chain rows, the fitted surface + IV+pp, IV-rank (level context beside the
+    shape metric), realized-vol ratio, fit quality, and the listed expiries the
+    DTE control derives its bounds from. ``refresh`` re-pulls the option slice /
+    drops the overlay + joint caches first. The pull is the only market I/O —
+    the view itself never recomputes."""
     state = _RUNTIME.get("state")
     if state is None:
         return None
@@ -904,41 +1149,86 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
     if pos is None:
         return None
 
-    # A refresh re-snapshots the option slice (the sanctioned write path); on the
-    # overlay path it drops the position's cached df + ranking so the scan genuinely
-    # re-generates instead of cache-hitting.
-    if refresh and pos.asset_class == "option":
-        pull_slice(account, position_id, refresh=True, n_expiries=n_expiries)
-    elif refresh:
-        state.slice_cache.get("overlay_dfs", {}).pop(position_id, None)
-        state.slice_cache.get("overlay_ranked", {}).pop(position_id, None)
+    pids = {str(p) for p in (rolled_pids or [])}
+    joint = len(pids) > 1
 
-    ranked = rank_slice_candidates(account, position_id, objectives=objectives, cap=cap,
-                                   n_expiries=n_expiries, structure_id=structure_id)
-    if ranked is None:
-        return None
+    # A refresh re-snapshots the option slice (the sanctioned write path); on the
+    # overlay path it drops the position's cached dfs + rankings (all control
+    # signatures) so the scan genuinely re-generates instead of cache-hitting;
+    # joint rankings for this anchor drop either way.
+    if refresh and pos.asset_class == "option":
+        pull_slice(account, position_id, refresh=True, n_expiries=n_expiries,
+                   dte_range=dte_range)
+    elif refresh:
+        for cname in ("overlay_dfs", "overlay_ranked"):
+            m = state.slice_cache.get(cname, {})
+            for k in [k for k in m if isinstance(k, tuple) and k[0] == position_id]:
+                m.pop(k, None)
+    if refresh:
+        jr = state.slice_cache.get("joint_ranked", {})
+        for k in [k for k in jr if k[0] == account and k[1] == position_id]:
+            jr.pop(k, None)
+
+    note = None
+    if joint:
+        ranked = rank_joint_candidates(account, position_id, pids, objectives=objectives,
+                                       cap=cap, n_expiries=n_expiries,
+                                       structure_id=structure_id,
+                                       delta_band=delta_band, dte_range=dte_range)
+        if ranked is None:
+            # Honest empty state: the joint path found nothing — most often no
+            # admissible common expiry/strike inside the fetched window for one
+            # of the rolled legs (the increment-3 logged case), else no structure.
+            ranked = {}
+            note = ("no admissible roll for the selected legs within the fetched "
+                    "window — widen the DTE range, or check the legs share a "
+                    "detected structure")
+    else:
+        ranked = rank_slice_candidates(account, position_id, objectives=objectives, cap=cap,
+                                       n_expiries=n_expiries, structure_id=structure_id,
+                                       dte_range=dte_range, delta_band=delta_band)
+        if ranked is None and (dte_range is not None or delta_band is not None):
+            ranked = {}
+            note = ("no candidates inside the current DTE / |Δ| band — widen a "
+                    "control and press Scan")
+        elif ranked is None:
+            return None
 
     pulled_at = spot = underlier = spot_asof = None
-    df = surface = iv_pp = None
+    df = surface = iv_pp = iv_rank = None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries)   # cache hit after the rank
+        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
         if sl:
             pulled_at, spot, underlier, df = (sl.get("pulled_at"), sl.get("spot"),
                                               sl.get("underlier"), sl.get("df"))
             surface, iv_pp = sl.get("surface"), sl.get("iv_pp")
             spot_asof = sl.get("spot_asof")
+            iv_rank = sl.get("iv_rank")
     else:
         underlier = pos.bbg_ticker
         spot = _spot_from_snapshot(acc, pos.bbg_ticker)
-        df = state.slice_cache.get("overlay_dfs", {}).get(position_id)
+        df = state.slice_cache.get("overlay_dfs", {}).get(
+            (position_id, _scan_sig(dte_range, delta_band)))
+
+    # Level + quality context for the cap line: IV-rank (the 52-week percentile the
+    # slice already carries), current IV over 30-day realized, and the fit's R².
+    row = _snapshot_underlying_row(acc, underlier) if underlier else None
+    rv30 = coerce_float(row.get("VOLATILITY_30D")) if row is not None else None
+    cur_iv = (iv_rank or {}).get("current_3m_atm") if iv_rank else None
+    iv_rv = (cur_iv / rv30) if (cur_iv is not None and rv30 and rv30 > 0) else None
+    day_pct = coerce_float(row.get("CHG_PCT_1D")) if row is not None else None
 
     metrics = _contract_metrics(df)
     return {"ranked": ranked, "pulled_at": pulled_at, "spot": spot,
-            "spot_asof": spot_asof,
+            "spot_asof": spot_asof, "day_pct": day_pct,
             "underlier": underlier, "kind": pos.asset_class,
             "contract_metrics": metrics, "surface": surface, "iv_pp": iv_pp,
             "contracts": _slice_contracts(df, iv_pp, metrics),
-            "held_strike": getattr(pos, "strike", None)}
+            "held_strike": getattr(pos, "strike", None),
+            "iv_rank": iv_rank, "iv_rv_ratio": iv_rv, "rv30": rv30,
+            "fit_r2": getattr(surface, "r2", None) if surface is not None else None,
+            "listed_expiries": chain_expiries(account, position_id),
+            "note": note, "joint": joint}
 
 
 def _slice_contracts(df, iv_pp, metrics) -> list:

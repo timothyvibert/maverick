@@ -78,6 +78,7 @@ class SurfaceFit:
     residual_std: Optional[float]
     degraded: bool                # True = flat fallback (iv_excess = 0 everywhere)
     reason: str
+    r2: Optional[float] = None    # unweighted fit R² over the fit subset (display quality cue)
 
     def evaluate(self, m: float, T: float) -> Optional[float]:
         if self.degraded or not self.coeffs:
@@ -146,9 +147,16 @@ def fit_surface(contracts, spot, *, today: Optional[date] = None,
     y = np.array([float(c.iv) for c in fit_rows])
     w = np.array([c.vega if (c.vega and c.vega > 0) else 1.0 for c in fit_rows])
     coeffs, resid_std = _wls_irls(X, y, w)
+    # Unweighted R² over the fit subset — a display-only quality cue (the fit
+    # itself is vega-weighted + IRLS; this just answers "how well does the line
+    # describe the dots you see").
+    ss_res = float(np.sum((y - X @ coeffs) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else None
     return SurfaceFit(coeffs=[float(b) for b in coeffs], n_terms=n_terms, n_fit=n_fit,
                       n_expiries=n_expiries, residual_std=resid_std, degraded=False,
-                      reason=f"{n_terms}-term fit on {n_fit} pts / {n_expiries} expiries")
+                      reason=f"{n_terms}-term fit on {n_fit} pts / {n_expiries} expiries",
+                      r2=r2)
 
 
 def _wls(X, y, w):

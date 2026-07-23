@@ -233,6 +233,7 @@ def filter_chain_slice(
     rights: Sequence[str] = ("CALL", "PUT"),
     monthlies_only: bool = True,
     today: Optional[date] = None,
+    expiry_range: Optional[tuple] = None,
 ) -> list[str]:
     """The targeted slice of *parsed_chain* around *spot* and the held (*ref_strike*)
     contract: the canonical tickers for ``n_expiries`` expiries bracketing the roll
@@ -244,9 +245,12 @@ def filter_chain_slice(
     with ``monthlies_only`` (default) only standard 3rd-Friday expiries are kept, so a
     liquid name's weeklies don't balloon the count. Expiry selection is forward-biased
     (the roll-out direction), back-filling earlier monthlies only when fewer than
-    ``n_expiries`` lie ahead. Pure and BBG-free; the caller fetches snapshots for the
-    returned tickers. ``today`` defaults to the current date; it is injectable so the
-    selection is deterministic under test.
+    ``n_expiries`` lie ahead. ``expiry_range`` — an inclusive ``(first, last)``
+    expiry-date window (either end None-open) — overrides the count-based pick
+    entirely: the scan's DTE range resolves to listed expiries client-side, so a
+    fetch can never be asked for an unlisted expiry. Pure and BBG-free; the caller
+    fetches snapshots for the returned tickers. ``today`` defaults to the current
+    date; it is injectable so the selection is deterministic under test.
     """
     if today is None:
         today = date.today()
@@ -278,11 +282,18 @@ def filter_chain_slice(
                        if not monthlies_only or _is_third_friday(p["expiry"])})
     if not expiries:
         return []
-    forward = [e for e in expiries if e >= horizon]
-    chosen = set(forward[:n_expiries])
-    if len(chosen) < n_expiries:
-        back = [e for e in expiries if e < horizon][-(n_expiries - len(chosen)):]
-        chosen |= set(back)
+    if expiry_range is not None:
+        e_lo, e_hi = expiry_range
+        chosen = {e for e in expiries
+                  if (e_lo is None or e >= e_lo) and (e_hi is None or e <= e_hi)}
+        if not chosen:
+            return []
+    else:
+        forward = [e for e in expiries if e >= horizon]
+        chosen = set(forward[:n_expiries])
+        if len(chosen) < n_expiries:
+            back = [e for e in expiries if e < horizon][-(n_expiries - len(chosen)):]
+            chosen |= set(back)
 
     def _in_band(k: float) -> bool:
         if abs(k - spot_v) / spot_v <= moneyness_pct:
