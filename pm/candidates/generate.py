@@ -86,6 +86,12 @@ class Candidate:
     # position's nearest expiry — on a structure-anchored roll that is often a KEPT
     # sibling's — so every tenor read (drivers, client fit, reasons) keys on this.
     new_leg_dte: Optional[int] = None
+    # Joint rolls only: the objective's own selection metric, computed at generation
+    # over the WHOLE rolled set (joint net cash, total delta cut, total directional
+    # move). The ranker's single-leg drivers don't generalise to a multi-leg roll,
+    # so when present this IS the driver. None on every single-leg/overlay candidate;
+    # deliberately None on joint costless too (the lexicographic dte+cap driver holds).
+    joint_driver: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -461,4 +467,271 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
                            f"collar {put.strike:g}/{call.strike:g} @ {exp:%Y-%m-%d}",
                            legs, nc, spot, today))
         made += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Joint rolls — a SET of one structure's legs rolled together to ONE common new
+# expiry, priced as the resulting structure (kept siblings + all new legs).
+# ---------------------------------------------------------------------------
+
+# Ceiling on the enumerated strike assignments per expiry. When the cross-group
+# product would exceed it, every group's choice list is trimmed to an equal
+# closest-move-first budget (the G-th root of the ceiling), so each rolled leg
+# loses its most-distant strikes first — never one leg's whole range while
+# another keeps junk combinations. Truncation is disclosed on the candidates of
+# the affected expiry.
+_JOINT_ENUM_CAP = 2000
+
+JOINT_ROLL = "joint_roll"
+
+
+def _away_dir(right) -> float:
+    return -1.0 if str(right).upper().startswith("P") else 1.0
+
+
+def _partition_rolled_groups(rolled) -> list:
+    """[(leader, [(follower, strike_offset), ...]), ...] over the rolled entries.
+
+    A SPREAD group is a same-right pair with equal |qty| and opposite signs —
+    strikes and quantities come straight off the structure's allocation ledger;
+    the PAIRING itself is chosen here, first match in the ledger's leg order
+    (deterministic; only a hand-edited structure can offer more than one same-right
+    pairing). The SHORT leg leads — it carries the assignment risk — and the long
+    follows at its signed strike offset, so the spread's width is maintained
+    exactly. Every other rolled leg is its own single-leg group (one strike DOF);
+    an UNEQUAL-size same-right opposite-sign pair (a ratio) rolls as independents,
+    which the caller discloses — its geometry is not maintained."""
+    rolled = list(rolled)
+    used: set = set()
+    groups = []
+    for i, a in enumerate(rolled):
+        if i in used:
+            continue
+        partner = None
+        for j in range(i + 1, len(rolled)):
+            if j in used:
+                continue
+            b = rolled[j]
+            if (b["right"] == a["right"]
+                    and abs(abs(_num(b["qty"]) or 0) - abs(_num(a["qty"]) or 0)) < 1e-9
+                    and ((_num(b["qty"]) or 0) > 0) != ((_num(a["qty"]) or 0) > 0)):
+                partner = j
+                break
+        if partner is None:
+            groups.append((a, []))
+            used.add(i)
+        else:
+            b = rolled[partner]
+            leader, follower = (a, b) if (_num(a["qty"]) or 0) < 0 else (b, a)
+            groups.append((leader, [(follower, float(follower["strike"]) - float(leader["strike"]))]))
+            used.update({i, partner})
+    return groups
+
+
+def _passes_band(c: SliceContract, delta_band) -> bool:
+    if delta_band is None:
+        return True
+    d = _num(c.delta)
+    if d is None:
+        return False                     # a band means the delta must be known
+    lo, hi = delta_band
+    return lo <= abs(d) <= hi
+
+
+def _joint_assignments(groups, contracts, expiry, delta_band):
+    """(assignments, truncated) for one common expiry: every assignment covers every
+    rolled leg — leaders enumerate their own right's strikes, spread followers sit
+    at the maintained offset (the pair exists only if the follower contract is
+    listed). Over the ceiling, every group trims to an equal closest-move budget;
+    assignments return in closest-total-move-first order."""
+    from itertools import product
+
+    at_exp = [c for c in contracts if c.expiry == expiry and c.mid is not None
+              and _passes_band(c, delta_band)]
+    by_right: dict = {}
+    for c in at_exp:
+        by_right.setdefault(c.right, []).append(c)
+
+    def _find(right, strike):
+        for c in by_right.get(right, []):
+            if abs(c.strike - strike) < 1e-6:
+                return c
+        return None
+
+    per_group: list = []
+    for leader, followers in groups:
+        choices = []
+        for c in sorted(by_right.get(leader["right"], []),
+                        key=lambda c: abs(c.strike - float(leader["strike"]))):
+            legs = [(leader, c)]
+            ok = True
+            for f, off in followers:
+                fc = _find(f["right"], c.strike + off)
+                if fc is None:
+                    ok = False
+                    break
+                legs.append((f, fc))
+            if ok:
+                choices.append(legs)
+        if not choices:
+            # A rolled leg with no admissible target at this expiry — nothing
+            # listed at the maintained offset, or nothing inside the pulled
+            # slice window. No candidates rather than a guess.
+            return [], False
+        per_group.append(choices)
+
+    total = 1
+    for ch in per_group:
+        total *= len(ch)
+    truncated = total > _JOINT_ENUM_CAP
+    if truncated:
+        # Equal closest-move-first budget per group: each leg loses its most
+        # distant strikes first, no leg keeps its whole range at another's cost.
+        budget = max(1, int(_JOINT_ENUM_CAP ** (1.0 / len(per_group))))
+        per_group = [ch[:budget] for ch in per_group]
+    assignments = [[pair for grp in combo for pair in grp]
+                   for combo in product(*per_group)]
+    # Deterministic closest-total-move-first order for every downstream slice.
+    assignments.sort(key=lambda a: sum(abs(sc.strike - float(r["strike"]))
+                                       for r, sc in a))
+    return assignments, truncated
+
+
+def _joint_nc(assignment) -> Optional[float]:
+    total = 0.0
+    for r, sc in assignment:
+        hm, nm = _num(r.get("mid")), _num(sc.mid)
+        if hm is None or nm is None:
+            return None
+        total += (_num(r["qty"]) or 0.0) * (hm - nm) * _MULT
+    return total
+
+
+def _joint_away(assignment) -> float:
+    return sum((sc.strike - float(r["strike"])) * _away_dir(r["right"])
+               for r, sc in assignment)
+
+
+def joint_candidates_from_slice(slice_df, rolled, spot, *, sibling_legs=None,
+                                context_warnings=None, risk_free_curve=None,
+                                risk_free_rate=0.045, div_yield=0.0, today=None,
+                                objectives=None, cap=_CAP_DEFAULT,
+                                delta_band=None) -> list:
+    """Joint-roll candidates: every entry of ``rolled`` (dicts ``{position_id,
+    strike, expiry, right, qty, mid, delta}`` — the structure's allocated slices
+    with contemporaneous buy-to-close mids) rolls to ONE common new expiry, each
+    leg to its own strike, priced as the resulting structure (``sibling_legs`` =
+    the kept legs, entry basis) through the same engine path as single-leg rolls.
+    Spread pairs inside the rolled set keep their width (one strike DOF; the short
+    leads). ``delta_band`` optionally bounds every new leg's |delta|. The
+    direction-aware objectives and the costless solve apply to the JOINT
+    transaction's cash and the resulting structure's priced economics."""
+    today = today or date.today()
+    objectives = list(objectives) if objectives else list(_DEFAULT_ROLL_OBJECTIVES)
+    rolled = list(rolled or [])
+    if len(rolled) < 2:
+        raise ValueError("joint_candidates_from_slice needs >= 2 rolled legs; "
+                         "a single leg is the single-leg path")
+    contracts = _parse_slice(slice_df)
+    base = list(sibling_legs or [])
+    warns = list(context_warnings or [])
+    groups = _partition_rolled_groups(rolled)
+    # A same-right opposite-sign pair that did NOT pair (unequal sizes — a ratio)
+    # rolls as independents: say so, its geometry is not being maintained.
+    solos = [g[0] for g in groups if not g[1]]
+    if any(a["right"] == b["right"]
+           and ((_num(a["qty"]) or 0) > 0) != ((_num(b["qty"]) or 0) > 0)
+           for i, a in enumerate(solos) for b in solos[i + 1:]):
+        warns.append("unequal-size same-right legs roll independently — their "
+                     "spread geometry is not maintained")
+    latest_old = max(r["expiry"] for r in rolled)
+    expiries = sorted({c.expiry for c in contracts if c.expiry > latest_old})
+    kw = dict(spot=spot, curve=risk_free_curve, r_scalar=risk_free_rate,
+              q=div_yield, today=today)
+    total_contracts = sum(abs(_num(r["qty"]) or 0.0) for r in rolled)
+    old_dte = (latest_old - today).days
+
+    per_exp: list = []                    # [(expiry, assignments, truncated)]
+    for exp in expiries:
+        assigns, cut = _joint_assignments(groups, contracts, exp, delta_band)
+        if assigns:
+            per_exp.append((exp, assigns, cut))
+    if not per_exp:
+        # Nothing strictly beyond the latest rolled expiry inside the pulled
+        # window, or a rolled leg with no admissible target anywhere — the
+        # anchor's slice window bounds what a joint roll can see.
+        logger.info("joint roll: no admissible common expiry in the slice window "
+                    "(latest rolled expiry %s)", latest_old)
+        return []
+    trunc_msg = ("joint enumeration truncated — each rolled leg's most-distant "
+                 "strikes at this expiry were not scored")
+    exp_warns = {exp: (warns + [trunc_msg] if cut else warns)
+                 for exp, _a, cut in per_exp}
+    per_exp = [(exp, assigns) for exp, assigns, _c in per_exp]
+
+    def _emit(objective, exp, assignment, nc, joint_driver):
+        new_legs = [_option_leg(sc, r["qty"], role=_role_for(_num(r["qty"]) or 0, sc.right), **kw)
+                    for r, sc in assignment]
+        legs = base + new_legs
+        moves = " · ".join(f"{r['right'][0].lower()}{float(r['strike']):g}->{sc.strike:g}"
+                           for r, sc in assignment)
+        desc = f"joint roll {moves} @ {exp:%Y-%m-%d}"
+        c = _finish(objective, JOINT_ROLL, desc, legs, nc, spot, today,
+                    new_leg=None, extra_warnings=exp_warns[exp])
+        c.new_leg_dte = (exp - today).days
+        c.joint_driver = joint_driver
+        return c
+
+    out = []
+    for obj in objectives:
+        picks = []                        # (sort_key, expiry, assignment, nc, driver)
+        if obj in (ROLL_FOR_CREDIT, MAX_PREMIUM):
+            for exp, assigns in per_exp:
+                for a in assigns:
+                    nc = _joint_nc(a)
+                    if nc is not None and nc > 0:
+                        picks.append((-nc, exp, a, nc, nc))
+        elif obj == EXTEND_DURATION:
+            # One candidate per expiry: every leader at its nearest strike (the
+            # choices are pre-ordered closest-move-first, so assignment 0 is it).
+            for exp, assigns in per_exp:
+                a = assigns[0]
+                picks.append((-(exp - today).days, exp, a, _joint_nc(a),
+                              float((exp - today).days)))
+        elif obj == DEFEND_CUT_DELTA:
+            for exp, assigns in per_exp:
+                for a in assigns:
+                    cut_total = 0.0
+                    ok = True
+                    for r, sc in a:
+                        od, nd = _num(r.get("delta")), _num(sc.delta)
+                        if od is None or nd is None or abs(nd) >= abs(od):
+                            ok = False
+                            break
+                        cut_total += (abs(od) - abs(nd)) * abs(_num(r["qty"]) or 0.0)
+                    if ok:
+                        picks.append((-cut_total, exp, a, _joint_nc(a), cut_total))
+        elif obj == ROLL_UP_OUT:
+            for exp, assigns in per_exp:
+                for a in assigns:
+                    if any((sc.strike - float(r["strike"])) * _away_dir(r["right"]) <= 0
+                           for r, sc in a):
+                        continue
+                    nc = _joint_nc(a)
+                    cost = abs(nc) if nc is not None else float("inf")
+                    driver = _joint_away(a) + 0.05 * ((exp - today).days - old_dte)
+                    picks.append((cost, exp, a, nc, driver))
+        elif obj == COSTLESS:
+            band = _COSTLESS_PER_SHARE * _MULT * max(total_contracts, 1.0)
+            for exp, assigns in per_exp:                 # expiries already ascend
+                for a in sorted(assigns, key=lambda a: -_joint_away(a)):
+                    nc = _joint_nc(a)
+                    if nc is not None and abs(nc) <= band:
+                        # key preserves (expiry asc, away desc) arrival order
+                        picks.append((len(picks), exp, a, nc, None))
+        else:
+            continue
+        picks.sort(key=lambda t: t[0])
+        out.extend(_emit(obj, exp, a, nc, drv) for _, exp, a, nc, drv in picks[:cap])
     return out

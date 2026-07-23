@@ -756,6 +756,135 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     return ranked
 
 
+def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
+                              objectives=None, cap: int = 15, n_expiries: int = 3,
+                              structure_id=STRUCTURE_AUTO, delta_band=None):
+    """Joint-roll candidates: roll a SET of the enclosing structure's option legs
+    together to one common new expiry, priced as the resulting structure (kept
+    siblings at entry basis, every new leg at the current slice mid — the same
+    seam single-leg rolls use). ``rolled_pids`` is a set of the structure's leg
+    position ids; the scanned ``position_id`` anchors the slice — targets draw
+    from the ANCHOR's pulled window (its forward monthlies, its moneyness band);
+    a rolled sibling beyond that window honestly yields nothing (re-anchoring
+    belongs to the scan controls). A one-element set IS the single-leg path
+    end-to-end (delegated — identical by construction, with that path's normal
+    ranking cache; ``delta_band`` does not apply there and is ignored). The
+    multi-leg path writes no caches — the leg-roster surface will own joint
+    caching when it lands — and may pull one single-ticker mid per rolled leg
+    that sits outside the slice (the joint analogue of the sanctioned held-leg
+    mid; uncached, so each regenerate re-pulls). Returns the priced candidates,
+    or None (no state / Bloomberg off / no enclosing structure / a rolled pid
+    that is not one of its sized option legs)."""
+    state = _RUNTIME.get("state")
+    if state is None or not getattr(state, "bloomberg_ok", False):
+        return None
+    acc = state.accounts.get(account)
+    if acc is None:
+        return None
+    pos = next((p for p in acc.positions if p.position_id == position_id), None)
+    if pos is None or pos.asset_class != "option":
+        return None
+    pids = {str(p) for p in (rolled_pids or [])} or {position_id}
+    if len(pids) == 1:
+        return generate_slice_candidates(account, next(iter(pids)), objectives=objectives,
+                                         cap=cap, n_expiries=n_expiries,
+                                         structure_id=structure_id)
+
+    sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
+    if not sid:
+        return None
+    struct = next((s for s in (getattr(acc, "structures", None) or [])
+                   if s.structure_id == sid), None)
+    if struct is None:
+        return None
+    try:
+        from pm.risk.payoff import build_structure_payoff_legs
+        asm = build_structure_payoff_legs(state, acc, struct)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("joint structure context failed for %s", sid)
+        return None
+    if asm.get("degraded"):
+        return None
+    legs = list(asm.get("leg_dicts") or [])
+    rolled_dicts = [d for d in legs
+                    if d.get("position_id") in pids and d.get("opt_type") in ("Call", "Put")]
+    if {d["position_id"] for d in rolled_dicts} != pids \
+            or any(not d.get("qty") for d in rolled_dicts):
+        return None                     # every pid must be a sized option leg
+    kept = [d for d in legs if d not in rolled_dicts]
+
+    sl = pull_slice(account, position_id, n_expiries=n_expiries)
+    if sl is None:
+        return None
+    by_id = {p.position_id: p for p in acc.positions}
+    prefixes = tuple(f"{p}:" for p in pids)
+    warns = [w for w in (asm.get("warnings") or []) if not w.startswith(prefixes)]
+    rolled = []
+    for d in rolled_dicts:
+        p = by_id.get(d["position_id"])
+        rolled.append({
+            "position_id": d["position_id"], "strike": d["K"], "expiry": d["expiry"],
+            "right": "CALL" if d["opt_type"] == "Call" else "PUT", "qty": d["qty"],
+            "mid": _contemporaneous_mid(p, sl) if p is not None else None,
+            "delta": _held_option_delta(acc, p) if p is not None else None,
+        })
+        full_std = (abs(coerce_float(getattr(p, "quantity", None)) or 0.0)
+                    * ((coerce_float(getattr(p, "multiplier", None)) or 100.0) / 100.0))
+        if full_std and abs(coerce_float(d["qty"]) or 0.0) + 1e-9 < full_std:
+            warns.append(f"{d['position_id']}: rolls the structure's "
+                         f"{abs(d['qty']):g}-contract slice of a {full_std:g}-contract "
+                         "position — the remainder sits outside this structure")
+
+    from pm.candidates.generate import joint_candidates_from_slice
+    try:
+        return joint_candidates_from_slice(
+            sl["df"], rolled, sl["spot"], sibling_legs=kept, context_warnings=warns,
+            risk_free_curve=getattr(state, "risk_free_curve", None) or [],
+            risk_free_rate=getattr(state, "risk_free_rate", 0.045),
+            div_yield=_div_yield(acc, sl["underlier"]), objectives=objectives,
+            cap=cap, delta_band=delta_band)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("joint generation failed for %s", sid)
+        return None
+
+
+def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
+                          objectives=None, cap: int = 15, n_expiries: int = 3,
+                          structure_id=STRUCTURE_AUTO, delta_band=None):
+    """Generate + rank the joint-roll candidates, grouped by objective — the
+    joint analogue of ``rank_slice_candidates``. A one-element rolled set is the
+    single-leg path END-TO-END (delegated here too, so its ranking carries the
+    held-leg context and the normal cache — identical to a direct single-leg
+    scan). Multi-leg sets rank with ``held=None``: each joint candidate carries
+    its objective's own metric (``joint_driver``) and its common-expiry tenor.
+    Returns ``{objective: [RankedCandidate, ...]}`` or None."""
+    pids = {str(p) for p in (rolled_pids or [])} or {position_id}
+    if len(pids) == 1:
+        return rank_slice_candidates(account, next(iter(pids)), objectives=objectives,
+                                     cap=cap, n_expiries=n_expiries,
+                                     structure_id=structure_id)
+    cands = generate_joint_candidates(account, position_id, rolled_pids,
+                                      objectives=objectives, cap=cap,
+                                      n_expiries=n_expiries, structure_id=structure_id,
+                                      delta_band=delta_band)
+    if not cands:
+        return None
+    state = _RUNTIME.get("state")
+    acc = state.accounts.get(account) if state else None
+    sl = pull_slice(account, position_id, n_expiries=n_expiries)
+    iv_pp = sl.get("iv_pp") if sl else None
+    from pm.candidates.ranking import rank_candidates
+    by_objective: dict = {}
+    for c in cands:
+        by_objective.setdefault(c.objective, []).append(c)
+    return {obj: rank_candidates(cs, objective=obj,
+                                 client_profile=getattr(acc, "client_profile", None),
+                                 iv_pp=iv_pp, held=None)
+            for obj, cs in by_objective.items()}
+
+
 def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: int = 15,
                       refresh: bool = False, n_expiries: int = 3,
                       structure_id=STRUCTURE_AUTO) -> Optional[dict]:

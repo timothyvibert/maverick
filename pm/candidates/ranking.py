@@ -220,6 +220,13 @@ def _relief(cand, held) -> Optional[float]:
 
 def _driver(cand, objective, held) -> Optional[float]:
     """The single objective driver, oriented so higher is always better."""
+    # A joint roll carries its objective's own selection metric (joint net cash,
+    # total delta cut, total directional move) — the single-leg drivers below
+    # don't generalise to a multi-leg roll. Joint costless deliberately leaves it
+    # unset so the lexicographic dte+cap driver applies unchanged.
+    jd = _num(getattr(cand, "joint_driver", None))
+    if jd is not None:
+        return jd
     if objective == MAX_PREMIUM:
         # Calls: credit per dollar of cap surrendered (the new strike). Puts: raw
         # credit — a put's strike is no surrendered upside, so no normalization.
@@ -281,6 +288,9 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
         dte_txt = f"{int(round(dte))}d" if dte is not None else "—"
         return f"costless — {dte_txt} to expiry, cap {cap_txt} ({_pctl(pct)})"
     if objective == DEFEND_CUT_DELTA:
+        if _num(getattr(cand, "joint_driver", None)) is not None:
+            # A joint roll's metric is the total cut across every rolled leg.
+            return f"cuts total |Δ|·contracts by {driver:.2f} ({_pctl(pct)})"
         nd = _num(getattr(cand, "new_leg_delta", None))
         hd = _num((held or {}).get("delta"))
         if nd is not None and hd is not None:
