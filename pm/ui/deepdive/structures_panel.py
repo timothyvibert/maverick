@@ -174,7 +174,30 @@ def _money(v) -> str:
 
 
 def _qty(v) -> str:
-    return "—" if v is None else f"{v:g}"
+    return "—" if v is None else f"{v:,.0f}"
+
+
+def _shares_str(e: dict) -> str:
+    """Shares cell/item for one structure — the ONE seam the grid and the modal
+    both render through. Allocated stock shares (signed), with the n-of-m
+    coverage cue ('300/302') only on a MIXED structure (one that also has
+    option legs) whose backing position's full quantity is known and differs —
+    the cue states how much of the stock the options claim; a lone-stock
+    structure (the uncovered residual) makes no coverage claim, so it shows the
+    plain allocated number. '—' when the structure has no stock leg or the
+    shares can't be read. Shares and contracts are never added together."""
+    alloc = e.get("shares_allocated")
+    if alloc is None:
+        return "—"
+    s = f"{alloc:,.0f}"
+    total = e.get("shares_total")
+    try:
+        if (e.get("contracts_net") is not None
+                and total is not None and float(total) != float(alloc)):
+            s = f"{s}/{total:,.0f}"
+    except (TypeError, ValueError):
+        pass
+    return s
 
 
 def _expiry(d) -> str:
@@ -222,7 +245,16 @@ def build_structure_columns() -> list[dict]:
          "filter": False, "cellClass": "struct-caret-cell"},
         {"field": "label", "headerName": "Structure", "flex": 2, "minWidth": 240,
          "filter": "agTextColumnFilter", "tooltipField": "label_tip", "cellClass": "dd-cell-ellipsis"},
-        {"field": "net_qty", "headerName": "Net Qty", "width": 92,
+        # Quantities are per asset class — a mixed stock+option structure never
+        # shows a cross-class sum. Shares is a Python-preformatted string (the
+        # allocated/total coverage cue), so it takes the text filter like the
+        # other preformatted columns; Contracts stays numeric.
+        # Widths browser-measured: a book-scale n-of-m cue ('53,700/53,783')
+        # needs 136; the full 'Contracts' header (no truncated headers) 132.
+        {"field": "shares", "headerName": "Shares", "width": 136,
+         "type": "rightAligned", "filter": "agTextColumnFilter",
+         "tooltipField": "shares"},
+        {"field": "contracts", "headerName": "Contracts", "width": 132,
          "type": "rightAligned", "valueFormatter": QTY_FMT, "filter": "agNumberColumnFilter"},
         {"field": "strikes", "headerName": "Strikes", "width": 110,
          "filter": "agTextColumnFilter"},
@@ -296,6 +328,8 @@ def _structure_row(s, by_id, expanded: set, expandable: bool = True, t2_map=None
         "strikes": _strikes_str(e["strikes"]),
         "expiry": _expiries_str(e["expiries"]),
         "dte": _nearest_dte(e["expiries"]),
+        "shares": _shares_str(e),
+        "contracts": e["contracts_net"],
         "net_qty": e["net_quantity"],
         "net_debit_credit": e["net_debit_credit"],
         "net_pnl": e["net_pnl"],
@@ -309,6 +343,13 @@ def _leg_row(s, leg, by_id, idx: int) -> dict:
     pos = by_id.get(leg.position_id)
     cost, _mval, pnl, premium, _ok = leg_slice(leg, pos)
     desc = format_position_descriptor(pos) if pos is not None else leg.position_id
+    # The leg's own slice goes in its class's column: shares for a stock leg,
+    # contracts for an option leg; an unidentifiable position dashes both.
+    is_opt = pos is not None and pos.asset_class == "option"
+    try:
+        sh = "—" if (is_opt or pos is None) else f"{float(leg.allocated_qty):,.0f}"
+    except (TypeError, ValueError):
+        sh = "—"
     return {
         "_row_id": f"leg::{s.structure_id}::{leg.position_id}::{idx}",
         "_kind": "leg",
@@ -318,6 +359,8 @@ def _leg_row(s, leg, by_id, idx: int) -> dict:
         "label_tip": f" ↳ {leg.role.replace('_', ' ')}: {desc}",
         "band": "", "status": "",
         "strikes": "", "expiry": "", "dte": None,
+        "shares": sh,
+        "contracts": (leg.allocated_qty if is_opt else None),
         "net_qty": leg.allocated_qty,
         "net_debit_credit": cost,
         "net_pnl": pnl,
@@ -340,6 +383,8 @@ def _substructure_row(sub, by_id, t2_map=None) -> dict:
         "strikes": _strikes_str(e["strikes"]),
         "expiry": _expiries_str(e["expiries"]),
         "dte": _nearest_dte(e["expiries"]),
+        "shares": _shares_str(e),
+        "contracts": e["contracts_net"],
         "net_qty": e["net_quantity"],
         "net_debit_credit": e["net_debit_credit"],
         "net_pnl": e["net_pnl"],
@@ -403,7 +448,8 @@ def build_structure_rows(account_state, state, expanded_sids=None) -> list[dict]
                 "label_tip": f"Contention · {alts[0].underlying}",
                 "band": _BAND_LABEL.get(S.LOW_AMBIGUOUS),
                 "status": "Needs your choice",
-                "strikes": "", "expiry": "", "dte": None, "net_qty": None,
+                "strikes": "", "expiry": "", "dte": None,
+                "shares": "—", "contracts": None, "net_qty": None,
                 "net_debit_credit": None, "net_pnl": None, "net_premium": None,
                 "t2_pricing": "—",
             })
@@ -454,7 +500,8 @@ def _tier1_block(e: dict) -> html.Div:
         _econ_item("Net debit/credit", _money(e["net_debit_credit"])),
         _econ_item("Net P&L", _money(e["net_pnl"])),
         _econ_item("Net premium", _money(e["net_premium"])),
-        _econ_item("Net quantity", _qty(e["net_quantity"])),
+        _econ_item("Shares", _shares_str(e)),
+        _econ_item("Contracts", _qty(e["contracts_net"])),
         _econ_item("Strikes", _strikes_str(e["strikes"]) or "—"),
         _econ_item("Expiries", _expiries_str(e["expiries"]) or "—"),
     ])
