@@ -222,6 +222,26 @@ def _is_third_friday(d: date) -> bool:
     return d.weekday() == 4 and 15 <= d.day <= 21
 
 
+def expiry_type_admits(d: date, expiry_type: str = "monthly") -> bool:
+    """Whether a listed expiry is admitted under the scan's expiry-type selection —
+    the ONE predicate every expiry filter routes through. The sets nest:
+    monthly ⊂ weekly ⊂ all.
+
+      'monthly' — standard 3rd-Friday expiries only (the default).
+      'weekly'  — any Friday: the weeklies PLUS the monthly, the full Friday ladder.
+      'all'     — every listed expiry (Mon/Wed weeklies, quarterlies, odd dates).
+
+    Date-shape-based (weekday / day-of-month), deliberately not
+    exchange-calendar-based: a holiday-shifted monthly (a 3rd-Friday expiry moved
+    to the preceding Thursday, e.g. Good Friday) is not matched by 'monthly' or
+    'weekly' and surfaces only under 'all'."""
+    if expiry_type == "all":
+        return True
+    if expiry_type == "weekly":
+        return d.weekday() == 4
+    return _is_third_friday(d)
+
+
 def filter_chain_slice(
     parsed_chain,
     spot: object,
@@ -231,7 +251,7 @@ def filter_chain_slice(
     n_expiries: int = 3,
     moneyness_pct: float = 0.15,
     rights: Sequence[str] = ("CALL", "PUT"),
-    monthlies_only: bool = True,
+    expiry_type: str = "monthly",
     today: Optional[date] = None,
     expiry_range: Optional[tuple] = None,
 ) -> list[str]:
@@ -241,9 +261,10 @@ def filter_chain_slice(
     requested rights.
 
     *parsed_chain* is the enumerated chain — each item a ``parse_option_description``
-    dict or a raw description string (parsed here). Expiries are taken ``>= today``;
-    with ``monthlies_only`` (default) only standard 3rd-Friday expiries are kept, so a
-    liquid name's weeklies don't balloon the count. Expiry selection is forward-biased
+    dict or a raw description string (parsed here). Expiries are taken ``>= today``
+    and filtered by ``expiry_type`` (``expiry_type_admits``: 'monthly' default — so a
+    liquid name's weeklies don't balloon the count — | 'weekly' | 'all'). Expiry
+    selection is forward-biased
     (the roll-out direction), back-filling earlier monthlies only when fewer than
     ``n_expiries`` lie ahead. ``expiry_range`` — an inclusive ``(first, last)``
     expiry-date window (either end None-open) — overrides the count-based pick
@@ -279,7 +300,7 @@ def filter_chain_slice(
 
     horizon = horizon_expiry or min(p["expiry"] for p in items)
     expiries = sorted({p["expiry"] for p in items
-                       if not monthlies_only or _is_third_friday(p["expiry"])})
+                       if expiry_type_admits(p["expiry"], expiry_type)})
     if not expiries:
         return []
     if expiry_range is not None:

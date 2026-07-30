@@ -243,7 +243,8 @@ def price_payoff(
 
 def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
                       *, n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
-                      dte_range=None, delta_band=None, rolled_pids=None):
+                      dte_range=None, delta_band=None, rolled_pids=None,
+                      expiry_type: str = "monthly"):
     """The cached ranked scanner candidate at ``(objective, rank)`` for a held position,
     or None. Reads the slice the scanner already pulled + ranked — but a COLD
     cache (fresh reload, first touch) resolves through ``pull_slice``, which
@@ -267,26 +268,30 @@ def scanner_candidate(account: str, position_id: str, objective: str, rank: int,
         # A joint roll resolves from the joint cache (rank_joint_candidates owns it).
         sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
         ranked_map = state.slice_cache.get("joint_ranked", {}).get(
-            (account, position_id, sid, frozenset(pids), _scan_sig(dte_range, delta_band)))
+            (account, position_id, sid, frozenset(pids),
+             _scan_sig(dte_range, delta_band, expiry_type)))
     elif pos.asset_class == "option":
         # Same sentinel contract as the scan itself: the drawer passes drawer-state's
         # structure_id verbatim (None = standalone), so the (obj, rank) lookup lands
         # on the ranking the clicked table was rendered from.
         sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
-        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                        dte_range=dte_range, expiry_type=expiry_type)
         ranked_map = ((sl.get("candidates_ranked") or {})
-                      .get((account, position_id, sid, _scan_sig(None, delta_band)))
+                      .get((account, position_id, sid,
+                            _scan_sig(None, delta_band, expiry_type)))
                       if sl else None)
     else:
         ranked_map = state.slice_cache.get("overlay_ranked", {}).get(
-            (position_id, _scan_sig(dte_range, delta_band)))
+            (position_id, _scan_sig(dte_range, delta_band, expiry_type)))
     ranked = (ranked_map or {}).get(objective) or []
     return next((r for r in ranked if getattr(r, "rank", None) == rank), None)
 
 
 def price_candidate(account: str, position_id: str, objective: str, rank: int, *,
                     shock=None, n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
-                    dte_range=None, delta_band=None, rolled_pids=None):
+                    dte_range=None, delta_band=None, rolled_pids=None,
+                    expiry_type: str = "monthly"):
     """The candidate side of the current-vs-candidate comparison — a read-only payoff
     reprice of a ranked candidate's resulting position under a shock. Prices the
     candidate's engine legs through the pure ``compute_payoff`` (the same engine the
@@ -297,7 +302,8 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     no engine change. Returns the ``compute_payoff`` dict or None."""
     rc = scanner_candidate(account, position_id, objective, rank, n_expiries=n_expiries,
                            structure_id=structure_id, dte_range=dte_range,
-                           delta_band=delta_band, rolled_pids=rolled_pids)
+                           delta_band=delta_band, rolled_pids=rolled_pids,
+                           expiry_type=expiry_type)
     if rc is None:
         return None
     state = _RUNTIME.get("state")
@@ -306,7 +312,8 @@ def price_candidate(account: str, position_id: str, objective: str, rank: int, *
     if acc is None or pos is None:
         return None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                        dte_range=dte_range, expiry_type=expiry_type)
         spot = sl.get("spot") if sl else None
     else:
         spot = _spot_from_snapshot(acc, pos.bbg_ticker)
@@ -343,11 +350,14 @@ def _spot_from_snapshot(acc: AccountState, underlier: str) -> Optional[float]:
     return coerce_float(df.loc[underlier, "PX_LAST"] if "PX_LAST" in df.columns else None)
 
 
-def chain_expiries(account: str, position_id: str) -> list:
-    """The underlier's LISTED monthly expiries (sorted dates) from the cached chain —
-    the DTE slider's bounds derive from these, so the control can never ask for an
-    expiry that doesn't exist. Enumerates the chain on first touch (the same cached
-    one-per-underlier pull the scan uses). Empty list when unavailable."""
+def chain_expiries(account: str, position_id: str,
+                   expiry_type: str = "monthly") -> list:
+    """The underlier's LISTED expiries of the selected type (sorted dates) from the
+    cached chain — the DTE slider's bounds derive from these, so the control can
+    never ask for an expiry that doesn't exist, and under 'weekly'/'all' it can
+    represent near-dated windows a monthly-only ladder cannot. Enumerates the chain
+    on first touch (the same cached one-per-underlier pull the scan uses). Empty
+    list when unavailable."""
     state = _RUNTIME.get("state")
     if state is None or not getattr(state, "bloomberg_ok", False):
         return []
@@ -357,7 +367,7 @@ def chain_expiries(account: str, position_id: str) -> list:
     underlier = getattr(pos, "underlying_bbg_ticker", None) or getattr(pos, "bbg_ticker", None)
     if not underlier:
         return []
-    from pm.core.ticker_utils import _is_third_friday, parse_option_description
+    from pm.core.ticker_utils import expiry_type_admits, parse_option_description
     chains = state.slice_cache.setdefault("chains", {})
     entry = chains.get(underlier)
     if entry is None:
@@ -369,7 +379,7 @@ def chain_expiries(account: str, position_id: str) -> list:
     today = date.today()
     return sorted({p["expiry"] for p in entry["chain"]
                    if p.get("expiry") and p["expiry"] > today
-                   and _is_third_friday(p["expiry"])})
+                   and expiry_type_admits(p["expiry"], expiry_type)})
 
 
 def _resolve_expiry_range(dte_range) -> Optional[tuple]:
@@ -386,7 +396,7 @@ def _resolve_expiry_range(dte_range) -> Optional[tuple]:
 def pull_slice(
     account: str, position_id: str, *, refresh: bool = False,
     refresh_chain: bool = False, n_expiries: int = 3, moneyness_pct: float = 0.15,
-    rights=("CALL", "PUT"), monthlies_only: bool = True, dte_range=None,
+    rights=("CALL", "PUT"), expiry_type: str = "monthly", dte_range=None,
 ) -> Optional[dict]:
     """Pull the targeted option-chain slice for a held position and cache it on the
     loaded state. A SANCTIONED owned-state WRITE path (parallel to ``resolve_structure``;
@@ -428,11 +438,11 @@ def pull_slice(
     rights_key = tuple(sorted(str(r).upper() for r in rights))
     if dte_range is None:
         key = (underlier, round(float(pos.strike), 4), pos.expiry, int(n_expiries),
-               round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+               round(float(moneyness_pct), 4), str(expiry_type), rights_key)
         if not refresh and key in slices:
             return slices[key]
 
-    from pm.core.ticker_utils import (filter_chain_slice, _is_third_friday,
+    from pm.core.ticker_utils import (filter_chain_slice, expiry_type_admits,
                                       parse_option_description)
 
     chain_entry = chains.get(underlier)
@@ -447,31 +457,32 @@ def pull_slice(
     spot_asof = "snapshot"
 
     if dte_range is not None:
-        # The RANGE family: the DTE range resolves to LISTED monthlies from the
-        # cached chain (client-side — the control can never ask for an unlisted
-        # expiry), keyed by the resolved expiry tuple. Snapshots cache PER EXPIRY
-        # (``exp_frames``), so widening the range fetches exactly the missing
-        # expiries in one batched request and reuses every frame already pulled.
+        # The RANGE family: the DTE range resolves to LISTED expiries of the
+        # selected type from the cached chain (client-side — the control can never
+        # ask for an unlisted expiry), keyed by the resolved expiry tuple.
+        # Snapshots cache PER EXPIRY (``exp_frames``), so widening the range
+        # fetches exactly the missing expiries in one batched request and reuses
+        # every frame already pulled.
         e_lo, e_hi = _resolve_expiry_range(dte_range)
         today_d = date.today()
         chosen = tuple(sorted({p["expiry"] for p in chain_entry["chain"]
                                if p.get("expiry") and today_d < p["expiry"]
                                and e_lo <= p["expiry"] <= e_hi
-                               and (not monthlies_only or _is_third_friday(p["expiry"]))}))
+                               and expiry_type_admits(p["expiry"], expiry_type)}))
         key = (underlier, round(float(pos.strike), 4), pos.expiry, ("rng",) + chosen,
-               round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+               round(float(moneyness_pct), 4), str(expiry_type), rights_key)
         if not refresh and key in slices:
             return slices[key]
         frames = cache.setdefault("exp_frames", {})
 
         def _fkey(exp):
             return (underlier, exp, round(float(pos.strike), 4),
-                    round(float(moneyness_pct), 4), bool(monthlies_only), rights_key)
+                    round(float(moneyness_pct), 4), str(expiry_type), rights_key)
 
         tickers_by_exp = {
             exp: filter_chain_slice(chain_entry["chain"], spot, pos.strike,
                                     expiry_range=(exp, exp), moneyness_pct=moneyness_pct,
-                                    rights=rights, monthlies_only=monthlies_only)
+                                    rights=rights, expiry_type=expiry_type)
             for exp in chosen}
         missing = [exp for exp in chosen
                    if refresh or _fkey(exp) not in frames]
@@ -500,7 +511,7 @@ def pull_slice(
         candidates = filter_chain_slice(
             chain_entry["chain"], spot, pos.strike, horizon_expiry=pos.expiry,
             n_expiries=n_expiries, moneyness_pct=moneyness_pct, rights=rights,
-            monthlies_only=monthlies_only,
+            expiry_type=expiry_type,
         )
         if candidates:
             # The underlier rides in the SAME batched snapshot request (one extra
@@ -644,11 +655,13 @@ def _contemporaneous_mid(pos, sl) -> Optional[float]:
         return None
 
 
-def _scan_sig(dte_range, delta_band) -> tuple:
-    """A hashable signature of the scan controls, for cache keys."""
+def _scan_sig(dte_range, delta_band, expiry_type: str = "monthly") -> tuple:
+    """A hashable signature of the scan controls, for cache keys. Carries the
+    expiry-type so a Monthly scan and a Weekly/All scan at identical dials can
+    never collide in any cache keyed through it."""
     rng = tuple(dte_range) if dte_range is not None else None
     band = tuple(delta_band) if delta_band is not None else None
-    return (rng, band)
+    return (rng, band, str(expiry_type))
 
 
 def _band_filter_df(df, delta_band):
@@ -724,12 +737,16 @@ def _structure_roll_context(state: PortfolioState, acc: AccountState, pos, sid):
     return kept, rolled[0].get("qty"), kept_warns
 
 
-def _spot_slice_df(state: PortfolioState, underlier: str, spot: float, dte_range=None):
+def _spot_slice_df(state: PortfolioState, underlier: str, spot: float, dte_range=None,
+                   expiry_type: str = "monthly"):
     """A spot-centered slice frame for a stock overlay (there is no held
     strike/expiry to anchor on). Reuses the per-underlier chain cache. The default
-    window is the first three monthlies from ~30 days out, so the standard
-    30-45 day write is in the universe; an explicit ``dte_range`` (the scan's DTE
-    slider) overrides it."""
+    window is the first three expiries of the selected type from ~30 days out, so
+    the standard 30-45 day write is in the universe; an explicit ``dte_range``
+    (the scan's DTE slider) overrides it. ``expiry_type`` is passed EXPLICITLY on
+    both branches — this path once inherited filter_chain_slice's own
+    monthly-only default invisibly, which kept weekly writes out of every
+    overlay scan."""
     from pm.core.ticker_utils import filter_chain_slice, parse_option_description
     from pm.core.bloomberg_client import fetch_option_snapshots
     chains = state.slice_cache.setdefault("chains", {})
@@ -743,17 +760,19 @@ def _spot_slice_df(state: PortfolioState, underlier: str, spot: float, dte_range
     if dte_range is not None:
         tickers = filter_chain_slice(entry["chain"], spot, spot,
                                      expiry_range=_resolve_expiry_range(dte_range),
-                                     moneyness_pct=0.15)
+                                     moneyness_pct=0.15, expiry_type=expiry_type)
     else:
         tickers = filter_chain_slice(entry["chain"], spot, spot,
                                      horizon_expiry=today + timedelta(days=30),
-                                     n_expiries=3, moneyness_pct=0.15)
+                                     n_expiries=3, moneyness_pct=0.15,
+                                     expiry_type=expiry_type)
     return fetch_option_snapshots(tickers) if tickers else None
 
 
 def generate_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
                               n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
-                              dte_range=None, delta_band=None):
+                              dte_range=None, delta_band=None,
+                              expiry_type: str = "monthly"):
     """Generate + price the adjustment candidates for a held position — rolls for a held
     option, single-leg overlays for held stock. Attaches the priced candidates to the
     slice cache entry and returns them (or None)."""
@@ -774,7 +793,8 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
     cands = []
     try:
         if pos.asset_class == "option":
-            sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+            sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                            dte_range=dte_range, expiry_type=expiry_type)
             if sl is None:
                 return None
             q = _div_yield(acc, sl["underlier"])
@@ -799,24 +819,26 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
             # leak across positions, accounts, or open routes. (The slice entry
             # itself is window-keyed; the |delta| band scopes the nested key.)
             sl.setdefault("candidates_priced", {})[
-                (account, position_id, sid, _scan_sig(None, delta_band))] = cands
+                (account, position_id, sid,
+                 _scan_sig(None, delta_band, expiry_type))] = cands
         elif pos.asset_class in ("equity", "fund_etf"):
             spot = _spot_from_snapshot(acc, pos.bbg_ticker)
             basis = _per_share_basis(pos)
             if spot is None or basis is None or not pos.quantity:
                 return []
             df = _band_filter_df(_spot_slice_df(state, pos.bbg_ticker, spot,
-                                                dte_range=dte_range), delta_band)
+                                                dte_range=dte_range,
+                                                expiry_type=expiry_type), delta_band)
             # Retain the overlay slice so the scanner chain table can read each
             # candidate's contract liquidity (the option-roll path keeps its slice; the
             # overlay path builds a transient frame, so stash it under the position,
             # scoped by the scan controls).
             state.slice_cache.setdefault("overlay_dfs", {})[
-                (position_id, _scan_sig(dte_range, delta_band))] = df
+                (position_id, _scan_sig(dte_range, delta_band, expiry_type))] = df
             # The overlay slice's own as-of (the option path's pulled_at analog)
             # — the adjustment ticket quotes it, so it must exist to be quoted.
             state.slice_cache.setdefault("overlay_pulled", {})[
-                (position_id, _scan_sig(dte_range, delta_band))] = datetime.now()
+                (position_id, _scan_sig(dte_range, delta_band, expiry_type))] = datetime.now()
             q = _div_yield(acc, pos.bbg_ticker)
             cands = overlays_from_slice(df, spot, int(pos.quantity), basis,
                                         risk_free_curve=curve, risk_free_rate=rfr,
@@ -829,7 +851,8 @@ def generate_slice_candidates(account: str, position_id: str, *, objectives=None
 
 def rank_slice_candidates(account: str, position_id: str, *, objectives=None, cap: int = 15,
                           n_expiries: int = 3, structure_id=STRUCTURE_AUTO,
-                          dte_range=None, delta_band=None):
+                          dte_range=None, delta_band=None,
+                          expiry_type: str = "monthly"):
     """Generate + price + rank the adjustment candidates for a held position, grouped
     by objective. Reads the account's client profile and the slice's IV+pp rows and
     ranks each objective's candidates through ``pm.candidates.ranking``; the only
@@ -855,9 +878,10 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     # SAME cache, so the overlay path is no longer compare-dead.
     sid = (_resolve_scan_structure_id(state, account, position_id, structure_id)
            if pos.asset_class == "option" else None)
-    band_sig = _scan_sig(None, delta_band)
+    band_sig = _scan_sig(None, delta_band, expiry_type)
     if pos.asset_class == "option":
-        cached_sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        cached_sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                               dte_range=dte_range, expiry_type=expiry_type)
         cached_ranked = ((cached_sl.get("candidates_ranked") or {})
                          .get((account, position_id, sid, band_sig))
                          if cached_sl else None)
@@ -865,13 +889,14 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
             return cached_ranked
     else:
         cached = state.slice_cache.get("overlay_ranked", {}).get(
-            (position_id, _scan_sig(dte_range, delta_band)))
+            (position_id, _scan_sig(dte_range, delta_band, expiry_type)))
         if cached:
             return cached
 
     cands = generate_slice_candidates(account, position_id, objectives=objectives, cap=cap,
                                       n_expiries=n_expiries, structure_id=sid,
-                                      dte_range=dte_range, delta_band=delta_band)
+                                      dte_range=dte_range, delta_band=delta_band,
+                                      expiry_type=expiry_type)
     if not cands:
         return None
 
@@ -884,7 +909,8 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
     held = None
     sl = None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                        dte_range=dte_range, expiry_type=expiry_type)
         iv_pp = sl.get("iv_pp") if sl else None
         held = {"delta": _held_option_delta(acc, pos),
                 "dte": (pos.expiry - date.today()).days if pos.expiry else None,
@@ -909,14 +935,14 @@ def rank_slice_candidates(account: str, position_id: str, *, objectives=None, ca
         # position + scan controls beside overlay_dfs, read by scanner_candidate /
         # the cache-hit above. Dropped by a scanner Refresh (scanner_view_data).
         state.slice_cache.setdefault("overlay_ranked", {})[
-            (position_id, _scan_sig(dte_range, delta_band))] = ranked
+            (position_id, _scan_sig(dte_range, delta_band, expiry_type))] = ranked
     return ranked
 
 
 def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
                               objectives=None, cap: int = 15, n_expiries: int = 3,
                               structure_id=STRUCTURE_AUTO, delta_band=None,
-                              dte_range=None):
+                              dte_range=None, expiry_type: str = "monthly"):
     """Joint-roll candidates: roll a SET of the enclosing structure's option legs
     together to one common new expiry, priced as the resulting structure (kept
     siblings at entry basis, every new leg at the current slice mid — the same
@@ -947,7 +973,8 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
         return generate_slice_candidates(account, next(iter(pids)), objectives=objectives,
                                          cap=cap, n_expiries=n_expiries,
                                          structure_id=structure_id,
-                                         dte_range=dte_range, delta_band=delta_band)
+                                         dte_range=dte_range, delta_band=delta_band,
+                                         expiry_type=expiry_type)
 
     sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
     if not sid:
@@ -973,7 +1000,8 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
         return None                     # every pid must be a sized option leg
     kept = [d for d in legs if d not in rolled_dicts]
 
-    sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+    sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                    dte_range=dte_range, expiry_type=expiry_type)
     if sl is None:
         return None
     by_id = {p.position_id: p for p in acc.positions}
@@ -1012,7 +1040,7 @@ def generate_joint_candidates(account: str, position_id: str, rolled_pids, *,
 def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
                           objectives=None, cap: int = 15, n_expiries: int = 3,
                           structure_id=STRUCTURE_AUTO, delta_band=None,
-                          dte_range=None):
+                          dte_range=None, expiry_type: str = "monthly"):
     """Generate + rank the joint-roll candidates, grouped by objective — the
     joint analogue of ``rank_slice_candidates``. A one-element rolled set is the
     single-leg path END-TO-END (delegated here too, so its ranking carries the
@@ -1025,25 +1053,29 @@ def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
         return rank_slice_candidates(account, next(iter(pids)), objectives=objectives,
                                      cap=cap, n_expiries=n_expiries,
                                      structure_id=structure_id,
-                                     dte_range=dte_range, delta_band=delta_band)
+                                     dte_range=dte_range, delta_band=delta_band,
+                                     expiry_type=expiry_type)
     state = _RUNTIME.get("state")
     if state is None:
         return None
     # The roster owns joint caching: keyed by anchor + structure + the rolled SET
     # + the scan controls, dropped by Refresh and by structure resolutions.
     sid = _resolve_scan_structure_id(state, account, position_id, structure_id)
-    jkey = (account, position_id, sid, frozenset(pids), _scan_sig(dte_range, delta_band))
+    jkey = (account, position_id, sid, frozenset(pids),
+            _scan_sig(dte_range, delta_band, expiry_type))
     cached = state.slice_cache.get("joint_ranked", {}).get(jkey)
     if cached:
         return cached
     cands = generate_joint_candidates(account, position_id, rolled_pids,
                                       objectives=objectives, cap=cap,
                                       n_expiries=n_expiries, structure_id=sid,
-                                      delta_band=delta_band, dte_range=dte_range)
+                                      delta_band=delta_band, dte_range=dte_range,
+                                      expiry_type=expiry_type)
     if not cands:
         return None
     acc = state.accounts.get(account)
-    sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+    sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                    dte_range=dte_range, expiry_type=expiry_type)
     iv_pp = sl.get("iv_pp") if sl else None
     from pm.candidates.ranking import rank_candidates
     by_objective: dict = {}
@@ -1060,7 +1092,7 @@ def rank_joint_candidates(account: str, position_id: str, rolled_pids, *,
 def build_adjustment_ticket(account: str, position_id: str, *, objective=None,
                             rank=None, structure_id=STRUCTURE_AUTO, dte_range=None,
                             delta_band=None, rolled_pids=None, capture_pids=None,
-                            n_expiries: int = 3):
+                            n_expiries: int = 3, expiry_type: str = "monthly"):
     """The adjustment ticket for the scanner's selected candidate and/or the
     roster's capture marks — the whole adjustment as ONE transaction: a
     close-set plus an open-set at per-leg contemporaneous mids, the net cash,
@@ -1128,12 +1160,13 @@ def build_adjustment_ticket(account: str, position_id: str, *, objective=None,
             alloc_by_pid = {lg.position_id: lg.allocated_qty for lg in struct.legs}
 
     sl = pull_slice(account, position_id, n_expiries=n_expiries,
-                    dte_range=dte_range) if pos.asset_class == "option" else None
+                    dte_range=dte_range,
+                    expiry_type=expiry_type) if pos.asset_class == "option" else None
     spot = (sl.get("spot") if sl else None) or _spot_from_snapshot(
         acc, pos.underlying_bbg_ticker if pos.asset_class == "option" else pos.bbg_ticker)
     as_of = (sl.get("pulled_at") if sl
              else state.slice_cache.get("overlay_pulled", {}).get(
-                 (position_id, _scan_sig(dte_range, delta_band))))
+                 (position_id, _scan_sig(dte_range, delta_band, expiry_type))))
 
     def _desc(right, strike, expiry):
         r = "C" if str(right or "").upper().startswith("C") else "P"
@@ -1379,10 +1412,44 @@ def scanner_roster(account: str, position_id: str, *, structure_id=STRUCTURE_AUT
                      "tier2": {}}}
 
 
+def _window_expiry_counts(state, underlier, dte_range, expiry_type):
+    """(n_selected_type, n_other_types) LISTED expiries inside the DTE window,
+    read from the already-cached chain — no fetch. (None, None) when the chain
+    or the window is unavailable, so the caller falls back to the generic note."""
+    entry = (state.slice_cache.get("chains", {}) or {}).get(underlier)
+    if not entry or dte_range is None:
+        return (None, None)
+    from pm.core.ticker_utils import expiry_type_admits
+    e_lo, e_hi = _resolve_expiry_range(dte_range)
+    today_d = date.today()
+    wins = {p["expiry"] for p in entry.get("chain") or []
+            if p.get("expiry") and today_d < p["expiry"] and e_lo <= p["expiry"] <= e_hi}
+    sel = {e for e in wins if expiry_type_admits(e, expiry_type)}
+    return (len(sel), len(wins) - len(sel))
+
+
+def _empty_scan_note(expiry_type, n_sel, n_other) -> str:
+    """The empty-scan note, honest about WHY: expiries of the selected type were
+    filtered out of the window (say so, name the broader selection), the window
+    is genuinely empty of listed expiries, or contracts existed and the band /
+    objectives left nothing."""
+    if n_sel == 0 and n_other:
+        label = "Monthly" if expiry_type == "monthly" else "Weekly"
+        broader = "Weekly or All" if expiry_type == "monthly" else "All"
+        plural = "y" if n_other == 1 else "ies"
+        return (f"no {label} expiries in the DTE window — {n_other} listed "
+                f"expir{plural} of other types inside it; switch Expiries "
+                f"to {broader}")
+    if n_sel == 0 and n_other == 0:
+        return "no listed expiries in the DTE window — widen the window and press Scan"
+    return ("no candidates pass the current |Δ| band / objectives — adjust a "
+            "control and press Scan")
+
+
 def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: int = 15,
                       refresh: bool = False, n_expiries: int = 3,
                       structure_id=STRUCTURE_AUTO, dte_range=None, delta_band=None,
-                      rolled_pids=None) -> Optional[dict]:
+                      rolled_pids=None, expiry_type: str = "monthly") -> Optional[dict]:
     """Read-only packaging for the scanner drawer: the ranked adjustment candidates
     for a held position (single-leg, overlay, or — with 2+ ``rolled_pids`` — the
     joint path), plus the slice metadata the view stamps: spot/as-of, the full
@@ -1410,7 +1477,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
     # joint rankings for this anchor drop either way.
     if refresh and pos.asset_class == "option":
         pull_slice(account, position_id, refresh=True, n_expiries=n_expiries,
-                   dte_range=dte_range)
+                   dte_range=dte_range, expiry_type=expiry_type)
     elif refresh:
         for cname in ("overlay_dfs", "overlay_ranked", "overlay_pulled"):
             m = state.slice_cache.get(cname, {})
@@ -1426,7 +1493,8 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
         ranked = rank_joint_candidates(account, position_id, pids, objectives=objectives,
                                        cap=cap, n_expiries=n_expiries,
                                        structure_id=structure_id,
-                                       delta_band=delta_band, dte_range=dte_range)
+                                       delta_band=delta_band, dte_range=dte_range,
+                                       expiry_type=expiry_type)
         if ranked is None:
             # Honest empty state: the joint path found nothing — most often no
             # admissible common expiry/strike inside the fetched window for one
@@ -1438,18 +1506,23 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
     else:
         ranked = rank_slice_candidates(account, position_id, objectives=objectives, cap=cap,
                                        n_expiries=n_expiries, structure_id=structure_id,
-                                       dte_range=dte_range, delta_band=delta_band)
+                                       dte_range=dte_range, delta_band=delta_band,
+                                       expiry_type=expiry_type)
         if ranked is None and (dte_range is not None or delta_band is not None):
             ranked = {}
-            note = ("no candidates inside the current DTE / |Δ| band — widen a "
-                    "control and press Scan")
+            note_underlier = (pos.underlying_bbg_ticker if pos.asset_class == "option"
+                              else pos.bbg_ticker)
+            n_sel, n_other = _window_expiry_counts(state, note_underlier,
+                                                   dte_range, expiry_type)
+            note = _empty_scan_note(expiry_type, n_sel, n_other)
         elif ranked is None:
             return None
 
     pulled_at = spot = underlier = spot_asof = None
     df = surface = iv_pp = iv_rank = None
     if pos.asset_class == "option":
-        sl = pull_slice(account, position_id, n_expiries=n_expiries, dte_range=dte_range)
+        sl = pull_slice(account, position_id, n_expiries=n_expiries,
+                        dte_range=dte_range, expiry_type=expiry_type)
         if sl:
             pulled_at, spot, underlier, df = (sl.get("pulled_at"), sl.get("spot"),
                                               sl.get("underlier"), sl.get("df"))
@@ -1460,7 +1533,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
         underlier = pos.bbg_ticker
         spot = _spot_from_snapshot(acc, pos.bbg_ticker)
         df = state.slice_cache.get("overlay_dfs", {}).get(
-            (position_id, _scan_sig(dte_range, delta_band)))
+            (position_id, _scan_sig(dte_range, delta_band, expiry_type)))
 
     # Level + quality context for the cap line: IV-rank (the 52-week percentile the
     # slice already carries), current IV over 30-day realized, and the fit's R².
@@ -1479,7 +1552,7 @@ def scanner_view_data(account: str, position_id: str, *, objectives=None, cap: i
             "held_strike": getattr(pos, "strike", None),
             "iv_rank": iv_rank, "iv_rv_ratio": iv_rv, "rv30": rv30,
             "fit_r2": getattr(surface, "r2", None) if surface is not None else None,
-            "listed_expiries": chain_expiries(account, position_id),
+            "listed_expiries": chain_expiries(account, position_id, expiry_type),
             "note": note, "joint": joint}
 
 

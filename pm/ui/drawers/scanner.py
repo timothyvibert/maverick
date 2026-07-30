@@ -783,6 +783,34 @@ def _shock_dial(label, sid, lo, hi, step, value=0):
     ])
 
 
+_ETYPES = ("monthly", "weekly", "all")
+_ETYPE_LABEL = {"monthly": "Monthly", "weekly": "Weekly", "all": "All"}
+_ETYPE_TIP = {
+    "monthly": "standard 3rd-Friday expiries only (default)",
+    "weekly": "all Friday expiries — weeklies plus the monthly",
+    "all": "every listed expiry, incl. Mon/Wed weeklies and quarterlies where listed",
+}
+
+
+def _etype_btn_cls(et, selected):
+    return "group-toggle" + (" group-toggle-active" if et == selected else "")
+
+
+def _etype_toggle(selected="monthly"):
+    """The Monthly | Weekly | All segmented control, in the house idiom of the
+    By Position | By Structure toggle. Selecting a segment updates the DTE
+    slider's bounds immediately (the chain is already cached — no fetch); the
+    fetch itself happens on Scan."""
+    return html.Div(className="scanner-ctrl", children=[
+        html.Label("Expiries", className="scanner-ctrl-lbl"),
+        html.Div(className="struct-toggle", children=[
+            html.Button(_ETYPE_LABEL[et], id=f"scanner-et-{et}", n_clicks=0,
+                        className=_etype_btn_cls(et, selected),
+                        title=_ETYPE_TIP[et])
+            for et in _ETYPES]),
+    ])
+
+
 def _sec(title, ctx_id=None, ctx_text=""):
     kids = [html.Span(title)]
     kids.append(html.Span(ctx_text, id=ctx_id, className="scanner-sec-ctx")
@@ -837,9 +865,10 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
         html.Div(className="scanner-ctrls", children=[
             _range_dial("DTE", "scanner-dte", 1, 730, 1, (30, 180)),
             _range_dial("|Δ| band", "scanner-band", 0.02, 0.98, 0.01, (0.02, 0.98)),
+            _etype_toggle(),
             html.Button("Scan", id="scanner-scan", n_clicks=0, className="scanner-scan-btn",
-                        title="Apply the DTE / |Δ| controls — pulls only expiries "
-                              "not already fetched."),
+                        title="Apply the DTE / |Δ| / Expiries controls — pulls only "
+                              "expiries not already fetched."),
         ]),
 
         _sec("Richness", ctx_text="IV+pp vs fitted smile · filled = in fit"),
@@ -896,6 +925,9 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
         ]),
 
         dcc.Store(id="scanner-controls", data=None),
+        # Remounts with the drawer body, so each open resets to Monthly by
+        # construction (the same way the dials reseed via the load callback).
+        dcc.Store(id="scanner-etype", data="monthly"),
         dcc.Store(id="scanner-active", data=None),
         dcc.Store(id="scanner-cmp-sel", data=None),
         dcc.Store(id="scanner-captures", data=[]),
@@ -934,10 +966,12 @@ def _default_dte(listed, pos) -> tuple:
 
 
 def _scan_view(account, position_id, *, structure_id, rolled_pids, dte_range,
-               delta_band, active_hint=None, expiry_hint=None, refresh=False):
+               delta_band, expiry_type="monthly", active_hint=None,
+               expiry_hint=None, refresh=False):
     data = sa.scanner_view_data(account, position_id, structure_id=structure_id,
                                 rolled_pids=rolled_pids, dte_range=dte_range,
-                                delta_band=delta_band, refresh=refresh)
+                                delta_band=delta_band, expiry_type=expiry_type,
+                                refresh=refresh)
     if data is None:
         return {"unavailable": True}
     state = sa.get_state()
@@ -1093,11 +1127,13 @@ def register_scanner_callbacks(app) -> None:
             return (no_update, no_update, no_update, "—", no_update, no_update,
                     no_update, [], None, _msg_fig("no market data"), [], no_update,
                     empty, [], "", [], [], None,
-                    {"dte": list(dte), "band": None, "rolled": rolled},
+                    {"dte": list(dte), "band": None, "rolled": rolled,
+                     "etype": "monthly"},
                     [], {"ids": []}, no_update, no_update, no_update,
                     no_update, no_update)
         pack = _render_pack(view, account, pid, rolled)
-        controls = {"dte": list(dte), "band": None, "rolled": rolled}
+        controls = {"dte": list(dte), "band": None, "rolled": rolled,
+                    "etype": "monthly"}
         today = date.today()
         dmax = max(((listed[-1] - today).days + 1) if listed else 730, dte[1])
         return _pack_tuple(pack, controls) + (
@@ -1120,11 +1156,12 @@ def register_scanner_callbacks(app) -> None:
         State("scanner-active", "data"),
         State("scanner-dte", "value"),
         State("scanner-band", "value"),
+        State("scanner-etype", "data"),
         State("scanner-smile-expiry", "value"),
         prevent_initial_call=True,
     )
     def _rescan(_s, _r, _w, sel_rows, _obj_clicks, ds, controls, active,
-                dte_value, band_value, exp_hint):
+                dte_value, band_value, etype, exp_hint):
         if not ds or ds.get("view") != "scanner" or controls is None:
             return (no_update,) * (len(fill_outputs) + 3)
         trig = ctx.triggered_id
@@ -1134,6 +1171,10 @@ def register_scanner_callbacks(app) -> None:
         active_hint = active
         rolled = list(controls.get("rolled") or [pid])
         dte, band = controls.get("dte"), controls.get("band")
+        # Unlike the dials (which commit on Scan), the segmented Expiries control
+        # has no pending state — clicking a segment IS the commitment (it already
+        # moved the slider bounds), so every rescan applies the LIVE selection.
+        etype = etype or "monthly"
 
         if isinstance(trig, dict) and trig.get("type") == "scanner-obj":
             if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
@@ -1151,7 +1192,7 @@ def register_scanner_callbacks(app) -> None:
         elif trig == "scanner-widen":
             if not _w:
                 return (no_update,) * (len(fill_outputs) + 3)
-            listed = sa.chain_expiries(account, pid)
+            listed = sa.chain_expiries(account, pid, etype)
             today = date.today()
             beyond = [e for e in listed if (e - today).days > (dte[1] if dte else 0)]
             if not beyond:
@@ -1162,18 +1203,51 @@ def register_scanner_callbacks(app) -> None:
                 return (no_update,) * (len(fill_outputs) + 3)
 
         view = _scan_view(account, pid, structure_id=sid, rolled_pids=rolled,
-                          dte_range=dte, delta_band=band, active_hint=active_hint,
+                          dte_range=dte, delta_band=band, expiry_type=etype,
+                          active_hint=active_hint,
                           expiry_hint=exp_hint, refresh=refresh)
         if view.get("unavailable"):
             return (no_update,) * (len(fill_outputs) + 3)
         pack = _render_pack(view, account, pid, rolled, expiry_hint=exp_hint)
         controls = {"dte": list(dte) if dte else None,
-                    "band": list(band) if band else None, "rolled": rolled}
+                    "band": list(band) if band else None, "rolled": rolled,
+                    "etype": etype}
         cleared = html.Div("Select a candidate row above to compare it here.",
                            className="scanner-empty")
         return _pack_tuple(pack, controls) + (
             cleared, _msg_fig("Select a candidate above to draw the adjusted payoff.", 240),
             None)
+
+    @app.callback(
+        Output("scanner-etype", "data"),
+        Output("scanner-et-monthly", "className"),
+        Output("scanner-et-weekly", "className"),
+        Output("scanner-et-all", "className"),
+        Output("scanner-dte", "min", allow_duplicate=True),
+        Output("scanner-dte", "max", allow_duplicate=True),
+        Input("scanner-et-monthly", "n_clicks"),
+        Input("scanner-et-weekly", "n_clicks"),
+        Input("scanner-et-all", "n_clicks"),
+        State("drawer-state", "data"),
+        State("scanner-dte", "value"),
+        prevent_initial_call=True,
+    )
+    def _set_etype(_m, _w, _a, ds, dte_value):
+        trig = ctx.triggered_id
+        if not ds or ds.get("view") != "scanner" or not isinstance(trig, str) \
+                or not trig.startswith("scanner-et-"):
+            return (no_update,) * 6
+        if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
+            return (no_update,) * 6      # remount fires with n_clicks=0
+        et = trig.replace("scanner-et-", "")
+        classes = tuple(_etype_btn_cls(t, et) for t in _ETYPES)
+        # Bounds follow the selection immediately — the chain is already cached
+        # by the opening scan, so this is a pure read; the FETCH waits for Scan.
+        listed = sa.chain_expiries(ds.get("account"), ds.get("position_id"), et)
+        today = date.today()
+        hi = (dte_value[1] if dte_value else 0) or 0
+        dmax = max(((listed[-1] - today).days + 1) if listed else 730, hi)
+        return (et,) + classes + (1, dmax)
 
     @app.callback(
         Output("scanner-captures", "data"),
@@ -1230,6 +1304,7 @@ def register_scanner_callbacks(app) -> None:
                           structure_id=ds.get("structure_id"),
                           rolled_pids=controls.get("rolled") or [ds.get("position_id")],
                           dte_range=controls.get("dte"), delta_band=controls.get("band"),
+                          expiry_type=controls.get("etype") or "monthly",
                           active_hint=active)
         return no_update if view.get("unavailable") else _smile_fig(view, exp_val, None)
 
@@ -1244,6 +1319,7 @@ def _cmp_pair(ds, controls, obj, rank, shock):
     rolled = (controls or {}).get("rolled") or [pid]
     kw = dict(structure_id=sid, dte_range=(controls or {}).get("dte"),
               delta_band=(controls or {}).get("band"),
+              expiry_type=(controls or {}).get("etype") or "monthly",
               rolled_pids=rolled if len(rolled) > 1 else None)
     rc = sa.scanner_candidate(account, pid, obj, rank, **kw)
     current = sa.price_payoff(account, structure_id=sid, position_id=pid, shock=shock)
@@ -1293,7 +1369,8 @@ def register_comparison_callbacks(app) -> None:
         view = _scan_view(ds.get("account"), ds.get("position_id"),
                           structure_id=ds.get("structure_id"), rolled_pids=rolled,
                           dte_range=(controls or {}).get("dte"),
-                          delta_band=(controls or {}).get("band"))
+                          delta_band=(controls or {}).get("band"),
+                          expiry_type=(controls or {}).get("etype") or "monthly")
         smile = no_update
         if not view.get("unavailable"):
             prim = _primary_leg(rc.candidate)
@@ -1341,6 +1418,7 @@ def register_comparison_callbacks(app) -> None:
             rank=(sel or {}).get("rank"), structure_id=ds.get("structure_id"),
             dte_range=(controls or {}).get("dte"),
             delta_band=(controls or {}).get("band"),
+            expiry_type=(controls or {}).get("etype") or "monthly",
             rolled_pids=rolled, capture_pids=captures or [])
         if t is None:
             return empty
