@@ -75,6 +75,12 @@ class AdjustmentTicket:
     resulting: Optional[dict] = None # label + the resulting legs' priced economics (or flat)
     conversion: Optional[str] = None # factual coverage flag ("leaves N naked short calls")
     warnings: list = field(default_factory=list)
+    # Client-context blocks (each None -> its lines simply don't render). Three
+    # clocks, each labeled where it renders: the spot's own as-of, the position
+    # block's extract date, and the per-leg mids' pull time.
+    analyst: Optional[dict] = None       # {provider, rating, target, reason}
+    spot_info: Optional[dict] = None     # {spot, kind: 'live'|'snapshot'|None, asof}
+    position_block: Optional[dict] = None  # {asof, legs: [{label, contract, basis, mv, pnl, pct}], coverage}
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +139,12 @@ def open_leg(*, description, qty, mid, multiplier=_STD_MULT, position_id=None,
 
 
 def assemble(close_set, open_set, *, account, underlier, as_of,
-             resulting=None, conversion=None, warnings=None) -> AdjustmentTicket:
+             resulting=None, conversion=None, warnings=None,
+             analyst=None, spot_info=None, position_block=None) -> AdjustmentTicket:
     """The whole ticket. ``net_cash`` is None the moment any leg's cash is —
-    a partially-priced net would read as a real number."""
+    a partially-priced net would read as a real number. The context blocks
+    (``analyst`` / ``spot_info`` / ``position_block``) are optional; a ticket
+    without them renders exactly the transaction, as before."""
     close_set, open_set = list(close_set or []), list(open_set or [])
     cashes = [lg.cash for lg in close_set + open_set]
     net = None if (not cashes or any(c is None for c in cashes)) else float(sum(cashes))
@@ -151,7 +160,8 @@ def assemble(close_set, open_set, *, account, underlier, as_of,
     return AdjustmentTicket(close_set=close_set, open_set=open_set, net_cash=net,
                             net_label=label, account=account, underlier=underlier,
                             as_of=as_of, resulting=resulting, conversion=conversion,
-                            warnings=list(warnings or []))
+                            warnings=list(warnings or []), analyst=analyst,
+                            spot_info=spot_info, position_block=position_block)
 
 
 # ---------------------------------------------------------------------------
@@ -291,14 +301,34 @@ def resulting_label(leg_dicts, underlying_symbol) -> Optional[str]:
     return None
 
 
-def resulting_line(label, economics) -> Optional[str]:
-    """The one-line resulting summary for the copy text: label + the priced
-    economics that survived. ``economics=None`` with a label still renders the
-    label; an all-closed transaction should pass label='flat'."""
-    if not label and not economics:
-        return None
-    bits = [label or "adjusted position"]
-    e = economics or {}
+def legs_summary(leg_dicts) -> Optional[str]:
+    """A compact leg roster for the RESULTING heading — '217,600 sh + 2,176
+    short 2026-09-18 15 C'. Payoff-engine leg dicts in (standard contracts);
+    None when there are no legs."""
+    parts = []
+    for d in leg_dicts or []:
+        q = _num(d.get("qty"))
+        if not q:
+            continue
+        if d.get("opt_type") == "Stock":
+            parts.append(f"{q:,.0f} sh")
+        elif d.get("opt_type") in ("Call", "Put"):
+            side = "short" if q < 0 else "long"
+            exp = d.get("expiry")
+            exp_s = f"{exp:%Y-%m-%d}" if exp is not None else "?"
+            k = d.get("K")
+            k_s = f"{k:g}" if k is not None else "?"
+            r = "C" if d["opt_type"] == "Call" else "P"
+            parts.append(f"{abs(q):,.0f} {side} {exp_s} {k_s} {r}")
+    return " + ".join(parts) if parts else None
+
+
+def _econ_bits(e) -> list:
+    """The priced-economics fragments shared by ``resulting_line`` (the drawer
+    band) and the copy text's RESULTING section — one composition, two renders.
+    PoP / capital-at-risk render only when the economics dict carries them."""
+    e = e or {}
+    bits = []
     mp = "unbounded" if e.get("unbounded_gain") else (
         _cash_str(e.get("max_profit")) if e.get("max_profit") is not None else None)
     ml = "unbounded" if e.get("unbounded_loss") else (
@@ -314,7 +344,22 @@ def resulting_line(label, economics) -> Optional[str]:
         bits.append("always profitable at expiry")
     elif e.get("always_loss"):
         bits.append("always a loss at expiry")
-    return " - ".join(bits)
+    pop = e.get("pop")
+    if pop is not None:
+        bits.append(f"PoP {pop * 100:.0f}%")
+    car = e.get("capital_at_risk")
+    if car is not None:
+        bits.append(f"capital at risk ${abs(car):,.0f}")
+    return bits
+
+
+def resulting_line(label, economics) -> Optional[str]:
+    """The one-line resulting summary: label + the priced economics that
+    survived. ``economics=None`` with a label still renders the label; an
+    all-closed transaction should pass label='flat'."""
+    if not label and not economics:
+        return None
+    return " - ".join([label or "adjusted position"] + _econ_bits(economics))
 
 
 def coverage_conversion(before: dict, after: dict) -> Optional[str]:
@@ -341,6 +386,85 @@ def _cash_str(v, *, dash="-") -> str:
     return f"{sign}${abs(v):,.0f}"
 
 
+def _money_str(v, *, dash="-") -> str:
+    """Unsigned-positive money ('$2,420,753' / '-$54,925') for basis/MV columns;
+    P&L stays explicitly signed via ``_cash_str``."""
+    if v is None:
+        return dash
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+
+def _pct_str(v, *, dash="-") -> str:
+    if v is None:
+        return dash
+    return f"{v * 100:+.1f}%"
+
+
+def _header_lines(t: "AdjustmentTicket") -> list:
+    """The client-context header: the spot with ITS OWN as-of (a live slice
+    pull shares the mids' clock; the morning snapshot says so; missing market
+    data dashes), and the research line naming the provider AS DATA — the
+    template stays provider-neutral, falling back to 'analyst' when no
+    provider rides the record."""
+    lines = []
+    if t.spot_info is not None:
+        s = t.spot_info or {}
+        spot, kind, asof = s.get("spot"), s.get("kind"), s.get("asof")
+        if spot is None:
+            lines.append("spot - (no market data)")
+        elif kind == "live":
+            ts = f" ({asof:%Y-%m-%d %H:%M})" if asof else ""
+            lines.append(f"spot ${spot:,.2f} - live, same pull as the mids below{ts}")
+        else:
+            lines.append(f"spot ${spot:,.2f} - morning snapshot")
+    if t.analyst is not None:
+        a = t.analyst or {}
+        name = a.get("provider") or "analyst"
+        rating = a.get("rating")
+        rating_s = str(rating).strip().title() if rating else "-"
+        if not rating and a.get("reason"):
+            rating_s += f" ({a['reason']})"
+        target = a.get("target")
+        target_s = f"${target:,.2f}" if target is not None else "-"
+        lines.append(f"{name} rating {rating_s} - price target {target_s}")
+    return lines
+
+
+def _position_lines(t: "AdjustmentTicket") -> list:
+    """The CURRENT POSITION block — extract marks, labeled with the extract's
+    own date (the third clock): per-leg basis / MV / P&L / P&L%, then the
+    coverage line carrying the detector's covered-vs-remaining share split."""
+    pb = t.position_block
+    if not pb:
+        return []
+    asof = pb.get("asof")
+    lines = ["", f"CURRENT POSITION - marks from the {asof} extract" if asof
+             else "CURRENT POSITION"]
+    for lg in pb.get("legs") or []:
+        left = f"{lg.get('label') or 'leg':<13} {lg.get('contract') or '':<36}"
+        lines.append(f"{left} basis {_money_str(lg.get('basis')):>12}   "
+                     f"MV {_money_str(lg.get('mv')):>12}   "
+                     f"P&L {_cash_str(lg.get('pnl'))} ({_pct_str(lg.get('pct'))})")
+    cov = pb.get("coverage")
+    if cov:
+        lines.append(cov)
+    return lines
+
+
+def coverage_line(sh_alloc, sh_total, n_short, noun) -> Optional[str]:
+    """The covered-vs-remaining share split, the same n-of-m discipline the
+    By-Structure quantity columns use — never a cross-class sum. None when any
+    component is missing (no line beats a guessed one)."""
+    a, tot, n = _num(sh_alloc), _num(sh_total), _num(n_short)
+    if a is None or n is None or not n:
+        return None
+    if tot is None or abs(tot - a) < 1e-9:
+        return (f"coverage: {a:,.0f} sh cover the {abs(n):,.0f} {noun} - "
+                "fully covered, 0 sh outside")
+    return (f"coverage: {a:,.0f}/{tot:,.0f} sh cover the {abs(n):,.0f} {noun} - "
+            f"{tot - a:,.0f} sh outside this structure")
+
+
 def _qty_str(v) -> str:
     f = float(v)
     s = f"{f:+g}"
@@ -359,23 +483,39 @@ def _line(lg: TicketLeg) -> str:
 
 
 def ticket_text(t: AdjustmentTicket) -> str:
-    """Plain text the principal can paste. Carries the as-of and the
-    contemporaneous-mids note; a proposal, never an order."""
+    """Plain text the principal can paste — header (spot + research, each with
+    its clock), the CURRENT POSITION extract marks, the PROPOSAL transaction at
+    contemporaneous mids, and the RESULTING position. Every quotable number
+    states its as-of; a proposal, never an order. Context blocks the caller
+    didn't supply simply don't render (the bare transaction reads as before)."""
     asof = t.as_of.strftime("%Y-%m-%d %H:%M") if t.as_of else "unknown"
     lines = [
         f"ADJUSTMENT TICKET - {t.underlier} - account {t.account} - proposal, not an order",
-        f"as of {asof} - per-leg mids are contemporaneous marks from that pull; "
-        "indicative, not executable quotes",
     ]
+    lines += _header_lines(t)
+    lines += _position_lines(t)
+    lines += ["", "PROPOSAL - one net transaction"]
     lines += [_line(lg) for lg in t.close_set]
     lines += [_line(lg) for lg in t.open_set]
     net = _cash_str(t.net_cash)
     if t.net_cash is not None:
         net += " credit" if t.net_cash >= 0 else " debit"
     lines.append(f"NET ({t.net_label})  {net}")
+    lines.append(f"as of {asof} - per-leg mids are contemporaneous marks from "
+                 "that pull; indicative, not executable quotes")
     res = t.resulting or {}
-    if res.get("line"):
-        lines.append(f"resulting: {res['line']}")
+    if res.get("line") or res.get("label"):
+        label = res.get("label") or "adjusted position"
+        summary = res.get("legs_summary")
+        head = f"RESULTING - {label}" + (f" ({summary})" if summary else "")
+        bits = _econ_bits(res.get("economics"))
+        lines += ["", head, " - ".join(bits) if bits else "-"]
+        if t.open_set:
+            n_new = len(t.open_set)
+            when = f"the {t.as_of:%H:%M}" if t.as_of else "the pulled"
+            lines.append("kept legs at entry basis - "
+                         f"new leg{'s' if n_new != 1 else ''} at {when} "
+                         f"mid{'s' if n_new != 1 else ''}")
     if t.conversion:
         lines.append(t.conversion)
     for w in t.warnings:

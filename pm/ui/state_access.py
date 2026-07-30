@@ -1332,10 +1332,84 @@ def build_adjustment_ticket(account: str, position_id: str, *, objective=None,
     elif not label:
         label = f"{len(resulting_legs)}-leg position"
     resulting = {"label": label, "economics": res_econ,
+                 "legs_summary": tkt.legs_summary(resulting_legs),
                  "line": tkt.resulting_line(label, res_econ)}
+
+    # Client-context blocks for the copy text — three labeled clocks: the
+    # spot's own as-of, the extract date under the position marks, and the
+    # mids' pull time (the ticket's as_of). Research provider arrives as
+    # runtime DATA on the analyst record; a covered name shows it, an
+    # uncovered name says so, Bloomberg-off dashes without a claimed reason.
+    und_bbg = (pos.underlying_bbg_ticker if pos.asset_class == "option"
+               else pos.bbg_ticker)
+    if getattr(state, "bloomberg_ok", False):
+        rec = (getattr(state, "analyst_data_by_ticker", None) or {}).get(und_bbg) or {}
+        analyst = {"provider": rec.get("provider"),
+                   "rating": rec.get("analyst_rating"),
+                   "target": rec.get("analyst_target"),
+                   "reason": None if rec else "not covered"}
+    else:
+        analyst = {"provider": None, "rating": None, "target": None, "reason": None}
+    spot_kind = ("live" if (sl and sl.get("spot") is not None
+                            and sl.get("spot_asof") == "live")
+                 else ("snapshot" if spot is not None else None))
+    spot_info = {"spot": spot, "kind": spot_kind,
+                 "asof": sl.get("pulled_at") if sl else None}
+
+    from pm.ui.deepdive.structure_economics import leg_slice, structure_economics
+    extract_ts = getattr(getattr(state, "extract", None), "extract_ts", None)
+    pos_legs: list = []
+    coverage = None
+    if struct is not None:
+        e = structure_economics(struct, by_id)
+        rights = {(by_id[lg.position_id].right or "").upper()
+                  for lg in struct.legs
+                  if by_id.get(lg.position_id) is not None
+                  and by_id[lg.position_id].asset_class == "option"}
+        n_ct = e.get("contracts_net")
+        if len(rights) == 1 and n_ct:
+            r = next(iter(rights))
+            noun = (f"{'short' if n_ct < 0 else 'long'} "
+                    f"{'calls' if r == 'CALL' else 'puts'}")
+            coverage = tkt.coverage_line(e.get("shares_allocated"),
+                                         e.get("shares_total"), n_ct, noun)
+        for lg in struct.legs:
+            p = by_id.get(lg.position_id)
+            cost, mv, pnl, _prem, _ok = leg_slice(lg, p)
+            pct = (pnl / abs(cost)) if (pnl is not None and cost) else None
+            if p is not None and p.asset_class == "option":
+                contract = (f"{lg.allocated_qty:+,.0f}  "
+                            f"{_desc(p.right, p.strike, p.expiry)}")
+            else:
+                contract = f"{(lg.allocated_qty or 0):,.0f} sh"
+            pos_legs.append({"label": (lg.role or "leg").replace("_", " "),
+                             "contract": contract, "basis": cost, "mv": mv,
+                             "pnl": pnl, "pct": pct})
+    else:
+        cost = coerce_float(getattr(pos, "cost_basis", None))
+        mv = coerce_float(getattr(pos, "market_value", None))
+        pnl = coerce_float(getattr(pos, "unrealized_pnl", None))
+        if pnl is None and mv is not None and cost is not None:
+            pnl = mv - cost
+        pct = (pnl / abs(cost)) if (pnl is not None and cost) else None
+        q = coerce_float(pos.quantity) or 0.0
+        if pos.asset_class == "option":
+            kind = "call" if str(pos.right or "").upper().startswith("C") else "put"
+            leg_label = f"{'short' if q < 0 else 'long'} {kind}"
+            contract = f"{q:+,.0f}  {_desc(pos.right, pos.strike, pos.expiry)}"
+        else:
+            leg_label = f"{'short' if q < 0 else 'long'} stock"
+            contract = f"{q:,.0f} sh"
+        pos_legs.append({"label": leg_label, "contract": contract, "basis": cost,
+                         "mv": mv, "pnl": pnl, "pct": pct})
+    position_block = {
+        "asof": f"{extract_ts:%Y-%m-%d}" if extract_ts else None,
+        "legs": pos_legs, "coverage": coverage}
+
     return tkt.assemble(close_set, open_set, account=account, underlier=sym,
                         as_of=as_of, resulting=resulting, conversion=conv,
-                        warnings=warnings)
+                        warnings=warnings, analyst=analyst, spot_info=spot_info,
+                        position_block=position_block)
 
 
 def scanner_roster(account: str, position_id: str, *, structure_id=STRUCTURE_AUTO):

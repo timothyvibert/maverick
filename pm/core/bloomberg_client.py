@@ -321,17 +321,25 @@ def fetch_analyst_data(ticker: str) -> Dict[str, object]:
     return result
 
 
+# The provider override this module's analyst fetchers query with — the value
+# half doubles as the runtime provider label carried on each populated record,
+# so client-facing surfaces can NAME the research source as data (tracked
+# templates stay provider-neutral).
+_ANALYST_OVERRIDE = ("BE998", "UBS")
+
+
 def fetch_analyst_data_batch(tickers: list[str]) -> Dict[str, Dict[str, object]]:
     """Provider-specific analyst rating and target price for N tickers in ONE
     overridden BDP round trip — the batched analog of ``fetch_analyst_data``
     (measured on the live book: 23 single-ticker calls ~13s -> one call ~3s).
 
     Uses BDP with the BE998=UBS override. Returns ``{ticker: {"analyst_rating":
-    str, "analyst_target": float}}`` with the same per-ticker value shaping as
-    the singular fetcher: a missing value's key is absent, and every requested
-    ticker is present (worst case ``{}``). Fails CLOSED exactly like the
-    singular fetcher: if the overridden call cannot be made (override API
-    unavailable) or fails, every ticker maps to ``{}`` — never a bare
+    str, "analyst_target": float, "provider": str}}`` with the same per-ticker
+    value shaping as the singular fetcher: a missing value's key is absent
+    (``provider`` rides only on records that carry at least one value), and
+    every requested ticker is present (worst case ``{}``). Fails CLOSED exactly
+    like the singular fetcher: if the overridden call cannot be made (override
+    API unavailable) or fails, every ticker maps to ``{}`` — never a bare
     non-overridden retry, which would return street consensus that downstream
     traces label as provider research. Never raises.
     """
@@ -346,7 +354,7 @@ def fetch_analyst_data_batch(tickers: list[str]) -> Dict[str, Dict[str, object]]
                 return out
             # polars_bloomberg BQuery.bdp overrides: list[tuple] | None
             try:
-                raw = bdp_fn(list(tickers), fields, overrides=[("BE998", "UBS")])
+                raw = bdp_fn(list(tickers), fields, overrides=[_ANALYST_OVERRIDE])
             except TypeError:
                 # bdp without override support — provider-specific data is
                 # impossible here; surface nothing rather than street consensus.
@@ -380,6 +388,8 @@ def fetch_analyst_data_batch(tickers: list[str]) -> Dict[str, Dict[str, object]]
                             out[t]["analyst_target"] = float(target)
                     except (TypeError, ValueError):
                         pass
+                if out[t]:
+                    out[t]["provider"] = _ANALYST_OVERRIDE[1]
     except Exception as e:
         logger.warning("Batched analyst data fetch failed: %s", e)
     return out
