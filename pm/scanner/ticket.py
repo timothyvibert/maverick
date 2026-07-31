@@ -52,7 +52,8 @@ def build_adjustment_ticket(state, account: str, position_id: str, *, objective=
                                dte_range=dte_range, delta_band=delta_band,
                                rolled_pids=(rolled_pids
                                             if rolled_pids and len(set(rolled_pids)) > 1
-                                            else None))
+                                            else None),
+                               expiry_type=expiry_type)
         if rc is None:
             return None
     cand = getattr(rc, "candidate", None)
