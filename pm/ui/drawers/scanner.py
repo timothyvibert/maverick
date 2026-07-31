@@ -3,7 +3,7 @@
 Layout (the approved order-entry idiom): identity header (ticker · spot · day move ·
 account · as-of) → MANAGING (the structure's legs as a roster grid whose checkboxes
 ARE the rolled set, plus the structure's stored current economics) → SCAN (objective
-tokens, the shared DTE and |Δ| range dials, Scan) → RICHNESS (the full-width smile:
+tokens, the shared DTE and Delta Band range dials, Scan) → RICHNESS (the full-width smile:
 in-fit dots filled, filtered hollow, the fitted line dashed, the selected candidate
 ringed; IV-rank · IV/RV · fit R² beneath) → CANDIDATES (the ranked answer set as a
 grid, the full chain collapsed behind a "+N in chain" line, the widen-window pull) →
@@ -411,15 +411,15 @@ def _payoff_fig(res) -> "object":
     """The adjusted structure at expiry (solid) and today (dashed), breakevens as
     dotted verticals labeled at the axis, the current spot dotted on P&L = 0."""
     if not res:
-        return _msg_fig("Select a candidate above to draw the adjusted payoff.", 240)
+        return _msg_fig("Select a candidate above to draw the adjusted payoff.", 360)
     grid = res.get("grid")
     exp_curve = res.get("expiry_curve")
     if grid is None or len(grid) == 0 or exp_curve is None:
-        return _msg_fig("Payoff unavailable for this candidate (pricing degraded).", 240)
+        return _msg_fig("Payoff unavailable for this candidate (pricing degraded).", 360)
     # The candidate result is the raw engine dict — its arrays are numpy; Dash's
     # JSON layer wants plain floats.
     xs = [float(v) for v in grid]
-    fig = _fig_base(240)
+    fig = _fig_base(360)
     fig.add_scatter(x=xs, y=[float(v) for v in exp_curve], mode="lines",
                     line=dict(color=_CHARCOAL, width=2),
                     hovertemplate="%{x:.2f} · $%{y:,.0f}<extra>at expiry</extra>")
@@ -492,7 +492,16 @@ def _roster_cap(roster, rolled_pids) -> list:
     bes = t2.get("breakevens")
     bits.append(_cap_pair("BE", " / ".join(f"{b:,.0f}" for b in bes) if bes else "—"))
     n = len(rolled_pids or [])
-    bits.append(_cap_pair("rolling", f"{n} leg{'s' if n != 1 else ''}"))
+    if n <= 1:
+        # A 1-leg scan always rolls the ANCHOR (a lone non-anchor tick does not
+        # re-anchor it) — name the contract that actually rolls so this cap can
+        # never visually disagree with the candidate rows. The raw roster rows
+        # carry the anchor as a flag; the ◂ glyph is display-side.
+        anchor = next((r.get("contract") for r in (roster or {}).get("rows") or []
+                       if r.get("anchor")), None)
+        bits.append(_cap_pair("rolling", f"{anchor} ◂" if anchor else f"{n} leg"))
+    else:
+        bits.append(_cap_pair("rolling", f"{n} legs"))
     out = []
     for i, b in enumerate(bits):
         if i:
@@ -639,10 +648,17 @@ def _cmp_table(current, candidate, rc, nav) -> html.Table:
                  f"{ng.get('delta'):+,.0f}" if ng.get("delta") is not None else "—"),
         _cmp_row("Max profit",
                  "∞" if ce.get("unbounded_gain") else _money(ce.get("max_profit")), mp_new),
+        # Red only for a genuinely negative worst case (the candidates grid's
+        # rule) — an always-profitable adjustment's positive "max loss" reads
+        # green, never loss-red.
         _cmp_row("Max loss",
                  "−∞" if ce.get("unbounded_loss") else _money(ce.get("max_loss")),
                  "−∞" if ne.get("unbounded_loss") else _money(ne.get("max_loss")),
-                 adj_cls="scanner-neg"),
+                 adj_cls=("scanner-neg" if (ne.get("unbounded_loss")
+                                            or (ne.get("max_loss") is not None
+                                                and ne["max_loss"] < 0))
+                          else ("scanner-pos" if (ne.get("max_loss") is not None
+                                                  and ne["max_loss"] > 0) else ""))),
         _cmp_row("Breakevens",
                  " / ".join(f"{b:,.0f}" for b in cur_bes) or "—",
                  " / ".join(f"{b:,.0f}" for b in new_bes) or "—"),
@@ -771,15 +787,20 @@ def _range_dial(label, sid, lo, hi, step, value):
 
 
 def _shock_dial(label, sid, lo, hi, step, value=0):
-    return html.Div(className="scanner-ctrl", children=[
-        html.Label(label, className="scanner-ctrl-lbl"),
-        html.Div(dcc.Slider(id=sid, min=lo, max=hi, step=step, value=value,
-                            marks={int(lo): str(int(lo)), 0: "0", int(hi): str(int(hi))},
-                            tooltip={"placement": "bottom", "always_visible": False},
-                            allow_direct_input=False),
-                 className="scanner-ctrl-slider"),
-        dcc.Input(id=f"{sid}-num", type="number", value=value, step=step,
-                  debounce=False, className="scanner-ctrl-num"),
+    # The payoff tab's compact dial idiom (stacked 11px label over slider+typed
+    # entry, flex 1 1 180px via .payoff-ctrl) so the four shock dials sit on ONE
+    # row; ids and the dial_sync pairing are unchanged.
+    return html.Div(className="payoff-ctrl", children=[
+        html.Label(label, className="payoff-ctrl-lbl"),
+        html.Div(className="payoff-dialrow", children=[
+            html.Div(dcc.Slider(id=sid, min=lo, max=hi, step=step, value=value,
+                                marks=None,
+                                tooltip={"placement": "bottom", "always_visible": False},
+                                allow_direct_input=False),
+                     className="payoff-slider"),
+            dcc.Input(id=f"{sid}-num", type="number", value=value, step=step,
+                      debounce=False, className="payoff-num"),
+        ]),
     ])
 
 
@@ -811,8 +832,21 @@ def _etype_toggle(selected="monthly"):
     ])
 
 
-def _sec(title, ctx_id=None, ctx_text=""):
+_RICHNESS_TIP = (
+    "The dashed line is the fitted vol smile — a robust regression of this "
+    "name's listed option IVs across strike and tenor. Dots are contracts: "
+    "filled = in the fit; hollow = excluded (the chain table's Fit column names "
+    "why). IV+pp is a contract's IV minus the fitted line at its strike — "
+    "expensiveness of SHAPE against the name's own smile; the cap line's "
+    "IV-rank gives the LEVEL context and fit R² the regression's quality. A "
+    "degraded fit draws dots only — never a fake line.")
+
+
+def _sec(title, ctx_id=None, ctx_text="", tip=None):
     kids = [html.Span(title)]
+    if tip:
+        # The house native-title info affordance (the Risk section's ⓘ idiom).
+        kids.append(html.Span("ⓘ", className="risk-info", title=tip))
     kids.append(html.Span(ctx_text, id=ctx_id, className="scanner-sec-ctx")
                 if ctx_id else html.Span(ctx_text, className="scanner-sec-ctx"))
     return html.Div(className="scanner-sec", children=kids)
@@ -864,14 +898,15 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
         html.Div(id="scanner-pills", className="scanner-toks"),
         html.Div(className="scanner-ctrls", children=[
             _range_dial("DTE", "scanner-dte", 1, 730, 1, (30, 180)),
-            _range_dial("|Δ| band", "scanner-band", 0.02, 0.98, 0.01, (0.02, 0.98)),
+            _range_dial("Delta Band", "scanner-band", 0.02, 0.98, 0.01, (0.02, 0.98)),
             _etype_toggle(),
             html.Button("Scan", id="scanner-scan", n_clicks=0, className="scanner-scan-btn",
-                        title="Apply the DTE / |Δ| / Expiries controls — pulls only "
-                              "expiries not already fetched."),
+                        title="Apply the DTE / Delta Band / Expiries controls — pulls "
+                              "only expiries not already fetched."),
         ]),
 
-        _sec("Richness", ctx_text="IV+pp vs fitted smile · filled = in fit"),
+        _sec("Richness", ctx_text="IV+pp vs fitted smile · filled = in fit",
+             tip=_RICHNESS_TIP),
         html.Div(className="scanner-smile-head", children=[
             dcc.Dropdown(id="scanner-smile-expiry", options=[], value=None,
                          clearable=False, searchable=False,
@@ -903,10 +938,10 @@ def render_scanner(account: str, *, position_id: str, structure_id=None) -> html
 
         _sec("Payoff", ctx_text="adjusted structure · at expiry & today"),
         dcc.Graph(id="scanner-payoff",
-                  figure=_msg_fig("Select a candidate above to draw the adjusted payoff.", 240),
+                  figure=_msg_fig("Select a candidate above to draw the adjusted payoff.", 360),
                   config={"displayModeBar": False},
-                  className="scanner-payoff-graph", style={"height": "240px"}),
-        html.Div(className="scanner-ctrls", children=[
+                  className="scanner-payoff-graph", style={"height": "360px"}),
+        html.Div(className="payoff-dial", children=[
             _shock_dial("Underlying move %", "scanner-cmp-spot", -30, 30, 1),
             _shock_dial("Vol shift (pts)", "scanner-cmp-vol", -10, 10, 0.5),
             _shock_dial("Rate shift (bps)", "scanner-cmp-rate", -50, 50, 5),
@@ -1215,7 +1250,7 @@ def register_scanner_callbacks(app) -> None:
         cleared = html.Div("Select a candidate row above to compare it here.",
                            className="scanner-empty")
         return _pack_tuple(pack, controls) + (
-            cleared, _msg_fig("Select a candidate above to draw the adjusted payoff.", 240),
+            cleared, _msg_fig("Select a candidate above to draw the adjusted payoff.", 360),
             None)
 
     @app.callback(
@@ -1357,7 +1392,7 @@ def register_comparison_callbacks(app) -> None:
         if rc is None or candidate is None:
             return (html.Div("Comparison unavailable for this candidate.",
                              className="scanner-empty"),
-                    _msg_fig("Payoff unavailable for this candidate.", 240),
+                    _msg_fig("Payoff unavailable for this candidate.", 360),
                     no_update, no_update)
         state = sa.get_state()
         acc = state.accounts.get(ds.get("account")) if state else None

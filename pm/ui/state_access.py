@@ -1516,7 +1516,7 @@ def _empty_scan_note(expiry_type, n_sel, n_other) -> str:
                 f"to {broader}")
     if n_sel == 0 and n_other == 0:
         return "no listed expiries in the DTE window — widen the window and press Scan"
-    return ("no candidates pass the current |Δ| band / objectives — adjust a "
+    return ("no candidates pass the current Delta Band / objectives — adjust a "
             "control and press Scan")
 
 
