@@ -32,18 +32,19 @@ _CAP_DEFAULT = 15
 # |net debit/credit| within this per-share $ reads "costless" (× 100 × contracts).
 _COSTLESS_PER_SHARE = 0.05
 
-# HARVEST — the merged premium objective (income re-write: more credit at a
-# moderate delta in a preferred tenor window) — is registry-defined; its
+# HARVEST (income re-write) and DEFEND (the ITM-run-through away-and-out
+# roll, superseding the retired roll-up-out) are registry-defined; their
 # admission bounds and dials live in pm.candidates.objectives.
-from pm.candidates.objectives import DEFAULT_HARVEST_PARAMS, HARVEST  # noqa: E402
+from pm.candidates.objectives import (  # noqa: E402
+    DEFAULT_DEFEND_PARAMS, DEFAULT_HARVEST_PARAMS, DEFEND, HARVEST,
+    defend_tie)
 
 EXTEND_DURATION = "extend-duration"
 DEFEND_CUT_DELTA = "defend-cut-delta"
 ADD_HEDGE = "add-hedge"
-ROLL_UP_OUT = "roll-up-out"
 COSTLESS = "costless"
-_DEFAULT_ROLL_OBJECTIVES = (HARVEST, EXTEND_DURATION, DEFEND_CUT_DELTA,
-                            ROLL_UP_OUT, COSTLESS)
+_DEFAULT_ROLL_OBJECTIVES = (DEFEND, HARVEST, EXTEND_DURATION,
+                            DEFEND_CUT_DELTA, COSTLESS)
 
 
 def _num(v) -> Optional[float]:
@@ -233,7 +234,7 @@ def _role_for(qty, right) -> str:
 # ---------------------------------------------------------------------------
 
 def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap,
-                 today=None, harvest_params=None) -> list:
+                 today=None, harvest_params=None, defend_params=None) -> list:
     """(SliceContract, kind) picks for one objective, over the later-expiry same-right
     contracts, capped."""
     hm = _num(held_mid)
@@ -276,23 +277,33 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap,
         scored.sort(key=lambda x: -x[0])
         return [(c, _roll_kind(held, c)) for _, c in scored[:cap]]
 
-    if objective == ROLL_UP_OUT:
-        # Roll AWAY from the money AND extend — direction keyed on the rolled leg's
-        # right (calls: higher strikes; puts: lower), which for a short leg is
-        # exactly the assignment-risk-reducing move (the ITM-short workflow) and
-        # for a long leg the premium-at-risk-reducing one. The cap keeps the
-        # cheapest (near-costless) rolls; the ranker orders by directional relief.
+    if objective == DEFEND:
+        # The ITM-run-through defend: roll AWAY from the money — direction
+        # keyed on the rolled leg's right (calls: higher strikes; puts:
+        # lower), the assignment-risk-reducing move for a short and the
+        # premium-at-risk-reducing one for a long — under a ONE-SIDED cash
+        # band: ANY credit is admissible, a debit only up to the dialed
+        # per-share tolerance (the symmetric near-zero band belongs to the
+        # costless objective, not here). Pre-ordered (nearest expiry, then
+        # most recapture) BEFORE the cap, so the cap can never squeeze out a
+        # nearer or bigger-recapture roll; the ranker's lexicographic driver
+        # keeps exactly this order.
+        p = defend_params or DEFAULT_DEFEND_PARAMS
+        band = p.debit_tolerance * _MULT * max(abs(held_qty), 1)
         away = 1.0 if held.right == "CALL" else -1.0
         picks = []
         for c in later:
             if (c.strike - held.strike) * away <= 0:
                 continue
             nm = _num(c.mid)
-            cost = (abs(held_qty * (hm - nm) * _MULT)
-                    if (hm is not None and nm is not None) else float("inf"))
-            picks.append((cost, c))
-        picks.sort(key=lambda x: x[0])
-        return [(c, _roll_kind(held, c)) for _, c in picks[:cap]]
+            if nm is None or hm is None:
+                continue
+            nc = held_qty * (hm - nm) * _MULT
+            if nc < -band:
+                continue
+            picks.append(c)
+        picks.sort(key=lambda c: (c.expiry, -(c.strike - held.strike) * away))
+        return [(c, _roll_kind(held, c)) for c in picks[:cap]]
 
     if objective == COSTLESS:
         # The costless solve: inside the band, NEAREST expiry first — the ranker
@@ -320,7 +331,7 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
                           sibling_legs=None, rolled_qty=None, context_warnings=None,
                           risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
                           today=None, objectives=None, cap=_CAP_DEFAULT,
-                          harvest_params=None) -> list:
+                          harvest_params=None, defend_params=None) -> list:
     """Roll candidates for a held OPTION. ``held`` is a dict
     ``{strike, expiry, right, quantity, delta[, multiplier]}``; ``held_mid`` its
     contemporaneous buy-to-close mid; ``held_stock`` an optional
@@ -372,7 +383,8 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
     hm = _num(held_mid)
     for obj in objectives:
         picks = _select_roll(obj, held_sc, qty_std, held_mid, held_delta, later, cap,
-                             today=today, harvest_params=harvest_params)
+                             today=today, harvest_params=harvest_params,
+                             defend_params=defend_params)
         if not picks:
             continue
         for sc, kind in picks:
@@ -638,7 +650,7 @@ def joint_candidates_from_slice(slice_df, rolled, spot, *, sibling_legs=None,
                                 context_warnings=None, risk_free_curve=None,
                                 risk_free_rate=0.045, div_yield=0.0, today=None,
                                 objectives=None, cap=_CAP_DEFAULT,
-                                delta_band=None) -> list:
+                                delta_band=None, defend_params=None) -> list:
     """Joint-roll candidates: every entry of ``rolled`` (dicts ``{position_id,
     strike, expiry, right, qty, mid, delta}`` — the structure's allocated slices
     with contemporaneous buy-to-close mids) rolls to ONE common new expiry, each
@@ -671,7 +683,6 @@ def joint_candidates_from_slice(slice_df, rolled, spot, *, sibling_legs=None,
     kw = dict(spot=spot, curve=risk_free_curve, r_scalar=risk_free_rate,
               q=div_yield, today=today)
     total_contracts = sum(abs(_num(r["qty"]) or 0.0) for r in rolled)
-    old_dte = (latest_old - today).days
 
     per_exp: list = []                    # [(expiry, assignments, truncated)]
     for exp in expiries:
@@ -736,16 +747,26 @@ def joint_candidates_from_slice(slice_df, rolled, spot, *, sibling_legs=None,
                         cut_total += (abs(od) - abs(nd)) * abs(_num(r["qty"]) or 0.0)
                     if ok:
                         picks.append((-cut_total, exp, a, _joint_nc(a), cut_total))
-        elif obj == ROLL_UP_OUT:
-            for exp, assigns in per_exp:
-                for a in assigns:
+        elif obj == DEFEND:
+            # Joint defend: every rolled leg strictly away, the ONE-SIDED cash
+            # band on the JOINT net (any credit, bounded debit), emitted
+            # nearest-expiry-first then most-total-recapture; the joint driver
+            # is the same lexicography (recapture as a fraction of the summed
+            # held strikes, bounded below the 1-day step).
+            dp = defend_params or DEFAULT_DEFEND_PARAMS
+            band = dp.debit_tolerance * _MULT * max(total_contracts, 1.0)
+            held_k_sum = sum(abs(float(r["strike"])) for r in rolled) or 1.0
+            for exp, assigns in per_exp:                 # expiries already ascend
+                for a in sorted(assigns, key=lambda a: -_joint_away(a)):
                     if any((sc.strike - float(r["strike"])) * _away_dir(r["right"]) <= 0
                            for r, sc in a):
                         continue
                     nc = _joint_nc(a)
-                    cost = abs(nc) if nc is not None else float("inf")
-                    driver = _joint_away(a) + 0.05 * ((exp - today).days - old_dte)
-                    picks.append((cost, exp, a, nc, driver))
+                    if nc is None or nc < -band:
+                        continue
+                    days = (exp - today).days
+                    driver = -days + defend_tie(_joint_away(a) / held_k_sum)
+                    picks.append((len(picks), exp, a, nc, driver))
         elif obj == COSTLESS:
             band = _COSTLESS_PER_SHARE * _MULT * max(total_contracts, 1.0)
             for exp, assigns in per_exp:                 # expiries already ascend

@@ -31,6 +31,29 @@ from typing import Iterator, Optional
 # key on this string; the old roll-for-credit / max-premium tags are retired.
 HARVEST = "harvest"
 
+# The defend objective's tag — the ITM-run-through roll: away-and-out,
+# side-aware, any credit admissible with a bounded debit, ranked nearest
+# expiry first then maximum strike recapture. Supersedes the retired
+# roll-up-out objective (whose cost-blind relief driver retired with it).
+DEFEND = "defend"
+
+# Defend's lexicographic tie term: recapture rel = (K_new − K_held)·away /
+# K_held maps through TIE_MAX·rel/(rel + REL_SCALE) into [0, 0.9) — strictly
+# below the 1-day tenor step, so nearest-expiry always wins and recapture only
+# breaks ties within a day. Directional assignment-risk relief, never a
+# priced cap.
+DEFEND_REL_SCALE = 0.10
+DEFEND_TIE_MAX = 0.9
+
+
+def defend_tie(rel: Optional[float]) -> float:
+    """The bounded recapture tie term. ``rel`` ≤ 0 or unknown grades 0 —
+    admission already guarantees a strictly-away strike, so this is a
+    defensive floor, not a live path."""
+    if rel is None or rel <= 0:
+        return 0.0
+    return DEFEND_TIE_MAX * rel / (rel + DEFEND_REL_SCALE)
+
 # Hard-bound derivation and kernel shape (constants this increment; promotable
 # to dials later). The Δ soft band is target ± DELTA_SOFT_HALF; hard bounds are
 # target ± DELTA_HARD_HALF. The DTE hard window is [lo/2, 2·hi].
@@ -83,6 +106,16 @@ class HarvestParams:
 DEFAULT_HARVEST_PARAMS = HarvestParams()
 
 
+@dataclass(frozen=True)
+class DefendParams:
+    """The Defend dial, native units: the bounded per-share debit a defend
+    roll may cost. Credits are always admissible (the one-sided band)."""
+    debit_tolerance: float = 0.05     # $ per share
+
+
+DEFAULT_DEFEND_PARAMS = DefendParams()
+
+
 def band_kernel(x: Optional[float], lo: float, hi: float,
                 hard_lo: float, hard_hi: float) -> float:
     """The soft-band preference multiplier: 1.0 inside [lo, hi], linear falloff
@@ -108,7 +141,8 @@ def band_kernel(x: Optional[float], lo: float, hi: float,
 
 @dataclass(frozen=True)
 class ParamSpec:
-    """One scanner dial: UI label/unit/range + the UI↔native scale."""
+    """One scanner dial: UI label/unit/range + the UI↔native scale + the
+    Thresholds-tab group it renders under."""
     name: str
     label: str
     unit: str
@@ -117,6 +151,7 @@ class ParamSpec:
     max: float
     scale: float = 1.0            # native = ui * scale
     default_native: float | int = 0
+    group: str = "Harvest"
 
 
 _SPECS: tuple[ParamSpec, ...] = (
@@ -128,6 +163,9 @@ _SPECS: tuple[ParamSpec, ...] = (
               "Δ·100", False, 5, 50, 0.01, DEFAULT_HARVEST_PARAMS.delta_target),
     ParamSpec("harvest_crossing_k", "Execution crossing (fraction of half-spread)",
               "", False, 0, 1, 1.0, DEFAULT_HARVEST_PARAMS.crossing_k),
+    ParamSpec("defend_debit_tolerance", "Defend debit tolerance (per share)",
+              "$ / share", False, 0, 5.0, 1.0,
+              DEFAULT_DEFEND_PARAMS.debit_tolerance, group="Defend"),
 )
 _BY_NAME = {s.name: s for s in _SPECS}
 
@@ -236,3 +274,12 @@ def build_harvest_params() -> HarvestParams:
                                  DEFAULT_HARVEST_PARAMS.delta_target)),
         crossing_k=float(o.get("harvest_crossing_k",
                                DEFAULT_HARVEST_PARAMS.crossing_k)))
+
+
+def build_defend_params() -> DefendParams:
+    """Defaults with the persisted override laid on top — the Defend twin of
+    ``build_harvest_params``."""
+    o = get_param_overrides()
+    return DefendParams(
+        debit_tolerance=float(o.get("defend_debit_tolerance",
+                                    DEFAULT_DEFEND_PARAMS.debit_tolerance)))

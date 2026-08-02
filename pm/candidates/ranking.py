@@ -38,16 +38,17 @@ from typing import Optional
 from pm.candidates.generate import (
     ADD_HEDGE,
     COSTLESS,
+    DEFEND,
     DEFEND_CUT_DELTA,
     EXTEND_DURATION,
     HARVEST,
-    ROLL_UP_OUT,
 )
 from pm.candidates.objectives import (
     DEFAULT_HARVEST_PARAMS,
     OI_THIN,
     SPREAD_FLAG_PCT,
     band_kernel,
+    defend_tie,
 )
 
 # Combination weights + the coverage-confidence damping on the client nudge.
@@ -151,9 +152,6 @@ def _avg_rank_percentile(values) -> list:
 # Objective driver + reason
 # ---------------------------------------------------------------------------
 
-# Tenor weight for the away-and-out relief driver: added days scaled into strike-$ units.
-_OUT_W = 0.05
-
 # Dollar scale of the costless solve's cap tie-break. The priced max_profit maps
 # through 0.5 + 0.4·x/(|x|+_CAP_SCALE) into (0.1, 0.9) strictly; unbounded gain sits
 # at 0.95, missing economics at 0.0. Total spread ≤ 0.95 — STRICTLY below the 1-day
@@ -214,18 +212,15 @@ def _away(cand, held) -> float:
     return -1.0 if str(right).upper().startswith("P") else 1.0
 
 
-def _relief(cand, held) -> Optional[float]:
-    """Away-and-out relief — strike distance in the money-reducing direction plus
-    scaled added tenor. The driver for the Roll away & out objective (higher =
-    more room bought)."""
+def _defend_rel(cand, held) -> Optional[float]:
+    """Defend's recapture: the directional strike distance as a fraction of the
+    held strike — assignment-risk relief bought back, never a priced cap.
+    None when the strikes are unknowable (the candidate sorts last)."""
     nk = _new_strike(cand)
     hk = _num((held or {}).get("strike"))
-    dte = _cand_dte(cand)
-    hdte = _num((held or {}).get("dte"))
-    strike_relief = ((nk - hk) * _away(cand, held)
-                     if (nk is not None and hk is not None) else 0.0)
-    tenor = _OUT_W * ((dte - hdte) if (dte is not None and hdte is not None) else 0.0)
-    return strike_relief + tenor
+    if nk is None or hk is None or not hk:
+        return None
+    return (nk - hk) * _away(cand, held) / abs(hk)
 
 
 def _driver(cand, objective, held) -> Optional[float]:
@@ -240,8 +235,15 @@ def _driver(cand, objective, held) -> Optional[float]:
     if objective == ADD_HEDGE:
         # add-hedge = cheaper/financed protection.
         return _num(getattr(cand, "net_credit", None))
-    if objective == ROLL_UP_OUT:
-        return _relief(cand, held)
+    if objective == DEFEND:
+        # Strictly lexicographic (the costless mechanism, a recapture tie
+        # term): NEAREST expiry first; within a day, maximum directional
+        # strike recapture. Credit is admission-only, never the driver.
+        dte = _cand_dte(cand)
+        rel = _defend_rel(cand, held)
+        if dte is None or rel is None:
+            return None
+        return -dte + defend_tie(rel)
     if objective == COSTLESS:
         # The costless solve: NEAREST expiry first; the priced upside cap
         # (economics.max_profit — never a raw strike) breaks ties within a day.
@@ -328,11 +330,16 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
         held_dte = (held or {}).get("dte")
         added = f", +{dte - int(held_dte)}d added" if held_dte is not None else ""
         return f"{dte}d to expiry{added} ({_pctl(pct)})"
-    if objective == ROLL_UP_OUT:
+    if objective == DEFEND:
+        dte = _cand_dte(cand)
         nk = _new_strike(cand)
         hk = _num((held or {}).get("strike"))
-        relief = f" {nk - hk:+g} strike" if (nk is not None and hk is not None) else ""
-        return f"away & out{relief} ({_pctl(pct)})"
+        nc = _num(getattr(cand, "net_credit", None))
+        dte_txt = f"{int(round(dte))}d nearest" if dte is not None else "—"
+        rec = (f", {nk - hk:+g} strikes recaptured"
+               if (nk is not None and hk is not None) else "")
+        net = f" · net {_money(nc)}" if nc is not None else ""
+        return f"defends — {dte_txt}{rec} ({_pctl(pct)}){net}"
     if objective == COSTLESS:
         dte = _cand_dte(cand)
         e = getattr(cand, "economics", None) or {}

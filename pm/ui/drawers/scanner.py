@@ -32,14 +32,14 @@ from pm.ui.dial_sync import register_dial_sync, register_range_dial_sync
 # Objective labels + the order the tokens read in (the recommender seed picks the
 # default, the tokens override). Any objective the ranker emits still shows.
 _OBJ_LABEL = {
-    "roll-up-out": "Roll away & out",
+    "defend": "Defend · away & out",
     "costless": "Costless · near · max cap",
     "harvest": "Harvest",
     "defend-cut-delta": "Cut Δ",
     "extend-duration": "Extend duration",
     "add-hedge": "Add hedge",
 }
-_OBJ_ORDER = ["roll-up-out", "costless", "harvest", "defend-cut-delta",
+_OBJ_ORDER = ["defend", "costless", "harvest", "defend-cut-delta",
               "extend-duration", "add-hedge"]
 
 # The recommender's action -> the default objective token (action-level; the rule_id
@@ -47,8 +47,8 @@ _OBJ_ORDER = ["roll-up-out", "costless", "harvest", "defend-cut-delta",
 # HARVEST_THETA, TRIM, ADD, MONITOR) opens on the first present objective.
 _SEED = {
     "ROLL_OUT": "harvest",
-    "ROLL_OUT_AND_DOWN": "defend-cut-delta",
-    "ROLL_UP_AND_OUT": "defend-cut-delta",
+    "ROLL_OUT_AND_DOWN": "defend",
+    "ROLL_UP_AND_OUT": "defend",
     "ADD_OVERLAY": "harvest",
     "ADD_HEDGE": "defend-cut-delta",
 }
@@ -169,7 +169,7 @@ def _seed_objective(account, position_id, objectives) -> str:
                 spot = sa._spot_from_snapshot(acc, getattr(pos, "underlying_bbg_ticker", None))
                 if spot is not None:
                     itm = spot > pos.strike if right == "CALL" else spot < pos.strike
-                    lead = "roll-up-out" if itm else "harvest"
+                    lead = "defend" if itm else "harvest"
                     if lead in objectives:
                         return lead
             tickers = {t for t in (getattr(pos, "bbg_ticker", None),

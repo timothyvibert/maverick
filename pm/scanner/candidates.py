@@ -142,8 +142,9 @@ def generate_slice_candidates(state, account: str, position_id: str, *,
     rfr = getattr(state, "risk_free_rate", 0.045)
 
     from pm.candidates.generate import candidates_from_slice, overlays_from_slice
-    from pm.candidates.objectives import build_harvest_params
+    from pm.candidates.objectives import build_defend_params, build_harvest_params
     hp = build_harvest_params()          # persisted scanner dials, read per scan
+    dp = build_defend_params()
     cands = []
     try:
         if pos.asset_class == "option":
@@ -167,7 +168,7 @@ def generate_slice_candidates(state, account: str, position_id: str, *,
                 held_stock=_held_stock(acc, pos), sibling_legs=sibling_legs,
                 rolled_qty=rolled_qty, context_warnings=ctx_warns, risk_free_curve=curve,
                 risk_free_rate=rfr, div_yield=q, objectives=objectives, cap=cap,
-                harvest_params=hp)
+                harvest_params=hp, defend_params=dp)
             # Keyed per position AND structure anchor: the raw slice is shared
             # across positions/accounts holding the same contract, but the priced
             # candidates embed ONE position's structure context and must never
@@ -391,12 +392,13 @@ def generate_joint_candidates(state, account: str, position_id: str, rolled_pids
 
     from pm.candidates.generate import joint_candidates_from_slice
     try:
+        from pm.candidates.objectives import build_defend_params
         return joint_candidates_from_slice(
             sl["df"], rolled, sl["spot"], sibling_legs=kept, context_warnings=warns,
             risk_free_curve=getattr(state, "risk_free_curve", None) or [],
             risk_free_rate=getattr(state, "risk_free_rate", 0.045),
             div_yield=_div_yield(acc, sl["underlier"]), objectives=objectives,
-            cap=cap, delta_band=delta_band)
+            cap=cap, delta_band=delta_band, defend_params=build_defend_params())
     except Exception:
         import logging
         logging.getLogger(__name__).exception("joint generation failed for %s", sid)

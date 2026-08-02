@@ -274,12 +274,16 @@ def render_thresholds_tab(status: Optional[str] = None) -> html.Div:
     # cached candidate rankings — the alert engine is never re-run for them.
     from pm.candidates import objectives as scn
     scn_overrides = scn.get_param_overrides()
-    body_rows.append(html.Tr(className="am-thr-grouprow", children=[
-        html.Td("SCANNER · Harvest", colSpan=4, className="am-thr-group",
-                title=("Candidate-ranking dials, not alert thresholds. Apply "
-                       "takes effect on the next Scan — cached rankings are "
-                       "dropped, the alert engine is untouched."))]))
+    _scn_group = None
     for s in scn.spec_rows():
+        if s.group != _scn_group:
+            _scn_group = s.group
+            body_rows.append(html.Tr(className="am-thr-grouprow", children=[
+                html.Td(f"SCANNER · {s.group}", colSpan=4, className="am-thr-group",
+                        title=("Candidate-ranking dials, not alert thresholds. "
+                               "Apply takes effect on the next Scan — cached "
+                               "rankings are dropped, the alert engine is "
+                               "untouched."))]))
         overridden = s.name in scn_overrides
         eff_ui = (scn.to_ui(s.name, scn_overrides[s.name]) if overridden
                   else scn.default_ui(s.name))
