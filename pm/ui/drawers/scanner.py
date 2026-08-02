@@ -34,23 +34,22 @@ from pm.ui.dial_sync import register_dial_sync, register_range_dial_sync
 _OBJ_LABEL = {
     "roll-up-out": "Roll away & out",
     "costless": "Costless · near · max cap",
-    "roll-for-credit": "Roll for credit",
+    "harvest": "Harvest",
     "defend-cut-delta": "Cut Δ",
     "extend-duration": "Extend duration",
-    "max-premium": "Max premium",
     "add-hedge": "Add hedge",
 }
-_OBJ_ORDER = ["roll-up-out", "costless", "roll-for-credit", "defend-cut-delta",
-              "extend-duration", "max-premium", "add-hedge"]
+_OBJ_ORDER = ["roll-up-out", "costless", "harvest", "defend-cut-delta",
+              "extend-duration", "add-hedge"]
 
 # The recommender's action -> the default objective token (action-level; the rule_id
 # sub-splits stay a later refinement). An unmapped / neutral label (CLOSE,
 # HARVEST_THETA, TRIM, ADD, MONITOR) opens on the first present objective.
 _SEED = {
-    "ROLL_OUT": "roll-for-credit",
+    "ROLL_OUT": "harvest",
     "ROLL_OUT_AND_DOWN": "defend-cut-delta",
     "ROLL_UP_AND_OUT": "defend-cut-delta",
-    "ADD_OVERLAY": "max-premium",
+    "ADD_OVERLAY": "harvest",
     "ADD_HEDGE": "defend-cut-delta",
 }
 
@@ -170,7 +169,7 @@ def _seed_objective(account, position_id, objectives) -> str:
                 spot = sa._spot_from_snapshot(acc, getattr(pos, "underlying_bbg_ticker", None))
                 if spot is not None:
                     itm = spot > pos.strike if right == "CALL" else spot < pos.strike
-                    lead = "roll-up-out" if itm else "max-premium"
+                    lead = "roll-up-out" if itm else "harvest"
                     if lead in objectives:
                         return lead
             tickers = {t for t in (getattr(pos, "bbg_ticker", None),

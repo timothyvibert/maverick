@@ -13,8 +13,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pm.scanner.slice import (_band_filter_df, _div_yield, _scan_sig,
-                              _spot_from_snapshot, _spot_slice_df, pull_slice)
+from pm.scanner.slice import (_band_filter_df, _contract_metrics, _div_yield,
+                              _scan_sig, _spot_from_snapshot, _spot_slice_df,
+                              pull_slice)
 from pm.store.portfolio_state import AccountState, PortfolioState
 from pm.store.state_reads import (coerce_float, position_by_id,
                                   structure_for_position)
@@ -141,6 +142,8 @@ def generate_slice_candidates(state, account: str, position_id: str, *,
     rfr = getattr(state, "risk_free_rate", 0.045)
 
     from pm.candidates.generate import candidates_from_slice, overlays_from_slice
+    from pm.candidates.objectives import build_harvest_params
+    hp = build_harvest_params()          # persisted scanner dials, read per scan
     cands = []
     try:
         if pos.asset_class == "option":
@@ -163,7 +166,8 @@ def generate_slice_candidates(state, account: str, position_id: str, *,
                 _contemporaneous_mid(pos, sl), sl["spot"],
                 held_stock=_held_stock(acc, pos), sibling_legs=sibling_legs,
                 rolled_qty=rolled_qty, context_warnings=ctx_warns, risk_free_curve=curve,
-                risk_free_rate=rfr, div_yield=q, objectives=objectives, cap=cap)
+                risk_free_rate=rfr, div_yield=q, objectives=objectives, cap=cap,
+                harvest_params=hp)
             # Keyed per position AND structure anchor: the raw slice is shared
             # across positions/accounts holding the same contract, but the priced
             # candidates embed ONE position's structure context and must never
@@ -193,7 +197,7 @@ def generate_slice_candidates(state, account: str, position_id: str, *,
             q = _div_yield(acc, pos.bbg_ticker)
             cands = overlays_from_slice(df, spot, int(pos.quantity), basis,
                                         risk_free_curve=curve, risk_free_rate=rfr,
-                                        div_yield=q, cap=cap)
+                                        div_yield=q, cap=cap, harvest_params=hp)
     except Exception:
         import logging
         logging.getLogger(__name__).exception("candidate generation failed for %s", position_id)
@@ -256,10 +260,13 @@ def rank_slice_candidates(state, account: str, position_id: str, *,
 
     # IV+pp rows + the held leg's Δ / DTE are available only on the option roll path
     # (a stock overlay has no held option leg and no anchored slice); the ranker
-    # degrades cleanly when they are absent.
+    # degrades cleanly when they are absent. The liquidity map (bid/ask/OI per
+    # ticker, for Harvest's execution adjustment + flags) reads whichever frame
+    # this scan priced from — the option slice, else the stashed overlay frame.
     iv_pp = None
     held = None
     sl = None
+    liq_df = None
     if pos.asset_class == "option":
         sl = pull_slice(state, account, position_id, n_expiries=n_expiries,
                         dte_range=dte_range, expiry_type=expiry_type)
@@ -267,13 +274,21 @@ def rank_slice_candidates(state, account: str, position_id: str, *,
         held = {"delta": _held_option_delta(acc, pos),
                 "dte": (pos.expiry - date.today()).days if pos.expiry else None,
                 "strike": pos.strike, "right": pos.right}
+        liq_df = sl.get("df") if sl else None
+    else:
+        liq_df = state.slice_cache.get("overlay_dfs", {}).get(
+            (position_id, _scan_sig(dte_range, delta_band, expiry_type)))
 
+    from pm.candidates.objectives import build_harvest_params
     from pm.candidates.ranking import rank_candidates
+    liquidity = _contract_metrics(liq_df)
+    hp = build_harvest_params()
     by_objective: dict = {}
     for c in cands:
         by_objective.setdefault(c.objective, []).append(c)
     ranked = {obj: rank_candidates(cs, objective=obj, client_profile=profile,
-                                   iv_pp=iv_pp, held=held)
+                                   iv_pp=iv_pp, held=held, liquidity=liquidity,
+                                   params=hp)
               for obj, cs in by_objective.items()}
 
     if sl is not None:

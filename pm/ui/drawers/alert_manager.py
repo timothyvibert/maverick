@@ -268,6 +268,36 @@ def render_thresholds_tab(status: Optional[str] = None) -> html.Div:
                                     disabled=not overridden,
                                     className="alert-action-btn am-thr-reset-btn")),
             ]))
+    # SCANNER — the Harvest ranking dials (candidate scanner, not alert
+    # sensitivity). Same table idiom, own id namespace ("scn-*"): Apply
+    # persists these through the scanner-params store and INVALIDATES the
+    # cached candidate rankings — the alert engine is never re-run for them.
+    from pm.candidates import objectives as scn
+    scn_overrides = scn.get_param_overrides()
+    body_rows.append(html.Tr(className="am-thr-grouprow", children=[
+        html.Td("SCANNER · Harvest", colSpan=4, className="am-thr-group",
+                title=("Candidate-ranking dials, not alert thresholds. Apply "
+                       "takes effect on the next Scan — cached rankings are "
+                       "dropped, the alert engine is untouched."))]))
+    for s in scn.spec_rows():
+        overridden = s.name in scn_overrides
+        eff_ui = (scn.to_ui(s.name, scn_overrides[s.name]) if overridden
+                  else scn.default_ui(s.name))
+        body_rows.append(html.Tr(className="am-row am-thr-row", children=[
+            html.Td(s.label, className="am-thr-label"),
+            html.Td(className="am-thr-valcell", children=[
+                dcc.Input(
+                    id={"type": "scn-input", "name": s.name}, type="number",
+                    value=eff_ui, step=(1 if s.is_int else "any"), debounce=True,
+                    className="am-thr-input" + (" am-thr-input-set" if overridden else "")),
+                html.Span(s.unit, className="am-thr-unit"),
+            ]),
+            html.Td(f"{_fmt_num(scn.default_ui(s.name), s.is_int)} {s.unit}".strip(),
+                    className="am-thr-default"),
+            html.Td(html.Button("Reset", id={"type": "scn-reset", "name": s.name},
+                                n_clicks=0, disabled=not overridden,
+                                className="alert-action-btn am-thr-reset-btn")),
+        ]))
     table = html.Table(className="am-table am-thr-table",
                        children=[html.Thead(header), html.Tbody(body_rows)])
     actions = html.Div(className="am-thr-actions", children=[

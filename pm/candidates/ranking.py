@@ -4,12 +4,15 @@ Ranks the roll / overlay candidates the generation layer already priced, so the
 best fit for the desk surfaces first WITH a transparent reason — the list is
 ordered, never reduced to a single recommendation. Two ingredients combine:
 
-* **Objective-fit** — for the active objective (roll-for-credit, max-premium,
-  extend-duration, defend-cut-delta, add-hedge) one driver metric, converted to a
+* **Objective-fit** — for the active objective (harvest, extend-duration,
+  defend-cut-delta, add-hedge, …) one driver metric, converted to a
   within-set percentile so metrics on different scales (dollars, days, delta)
-  become comparable. Roll-for-credit and max-premium additionally earn a small
-  IV-richness bonus (selling a rich short leg is the point of the trade). IV-rank
-  is name-level context, shown upstream, never a per-candidate differentiator.
+  become comparable. Harvest's driver is the execution-adjusted credit per day
+  per standard contract, graded by the soft DTE/Δ band kernels (see
+  ``pm.candidates.objectives``), and additionally earns a small IV-richness
+  bonus GATED on the short leg being inside the fitted smile (selling a rich —
+  and real — quote is the point of the trade). IV-rank is name-level context,
+  shown upstream, never a per-candidate differentiator.
 
 * **Client-fit** — a read of the account's ``ClientProfile`` (tenor preference,
   strategy posture) that NUDGES, never filters. It degrades to neutral on a thin
@@ -37,9 +40,14 @@ from pm.candidates.generate import (
     COSTLESS,
     DEFEND_CUT_DELTA,
     EXTEND_DURATION,
-    MAX_PREMIUM,
-    ROLL_FOR_CREDIT,
+    HARVEST,
     ROLL_UP_OUT,
+)
+from pm.candidates.objectives import (
+    DEFAULT_HARVEST_PARAMS,
+    OI_THIN,
+    SPREAD_FLAG_PCT,
+    band_kernel,
 )
 
 # Combination weights + the coverage-confidence damping on the client nudge.
@@ -49,8 +57,10 @@ _BAND_MULT = {"low": 0.0, "medium": 0.5, "high": 1.0}
 
 # IV-richness bonus: proportional to the short leg's within-set richness percentile,
 # capped so it only re-orders near-ties (never inverts an obviously-better driver).
+# Harvest-only, and GATED on the short leg being inside the fitted smile — a
+# contract the surface fit excluded (wide/stale market) earns no bonus.
 _IV_BONUS_MAX = 0.15
-_IV_BONUS_OBJECTIVES = (ROLL_FOR_CREDIT, MAX_PREMIUM)
+_IV_BONUS_OBJECTIVES = (HARVEST,)
 
 # Tenor fit by bucket distance (same / adjacent / farther); over-extends is flagged,
 # never excluded, when the candidate runs past 1.5× the client's median tenor.
@@ -227,16 +237,8 @@ def _driver(cand, objective, held) -> Optional[float]:
     jd = _num(getattr(cand, "joint_driver", None))
     if jd is not None:
         return jd
-    if objective == MAX_PREMIUM:
-        # Calls: credit per dollar of cap surrendered (the new strike). Puts: raw
-        # credit — a put's strike is no surrendered upside, so no normalization.
-        nc = _num(getattr(cand, "net_credit", None))
-        if _away(cand, held) < 0:
-            return nc
-        k = _new_strike(cand)
-        return (nc / k) if (nc is not None and k) else nc
-    if objective in (ROLL_FOR_CREDIT, ADD_HEDGE):
-        # roll-for-credit = raw credit collected; add-hedge = cheaper/financed protection.
+    if objective == ADD_HEDGE:
+        # add-hedge = cheaper/financed protection.
         return _num(getattr(cand, "net_credit", None))
     if objective == ROLL_UP_OUT:
         return _relief(cand, held)
@@ -261,13 +263,64 @@ def _driver(cand, objective, held) -> Optional[float]:
     return _num(getattr(cand, "net_credit", None))
 
 
+# ---------------------------------------------------------------------------
+# Harvest — execution-adjusted credit per day per contract, band-kerneled
+# ---------------------------------------------------------------------------
+
+_HARVEST_MULT = 100.0    # per-share half-spread -> per-contract dollars
+
+
+def _harvest_parts(cand, liquidity, params) -> Optional[dict]:
+    """The harvest driver's decomposition for one candidate: per-contract
+    credit after the crossing haircut, per day of the OPENED leg's tenor,
+    graded by the DTE and |Δ| band kernels — plus the liquidity readings the
+    flags and reasons quote. None when the driver's inputs are missing (the
+    candidate sorts last with the standard unavailable-driver flag). Joint
+    candidates never reach here (their ``joint_driver`` short-circuits)."""
+    p = params or DEFAULT_HARVEST_PARAMS
+    nc = _num(getattr(cand, "net_credit", None))
+    dte = _cand_dte(cand)
+    opts = _opt_legs(cand)
+    n = abs(_num(opts[0].get("qty")) or 0.0) if opts else 0.0
+    if nc is None or dte is None or not n:
+        return None
+    lq = (liquidity or {}).get(opts[0].get("position_id")) or {}
+    bid, ask = _num(lq.get("bid")), _num(lq.get("ask"))
+    spread = (ask - bid) if (bid is not None and ask is not None and ask >= bid) else None
+    haircut = (p.crossing_k * spread / 2.0 * _HARVEST_MULT) if spread is not None else 0.0
+    per_ct = nc / n - haircut
+    per_day = per_ct / max(dte, 1.0)
+    nd = _num(getattr(cand, "new_leg_delta", None))
+    kd = band_kernel(dte, p.dte_lo, p.dte_hi, p.dte_hard_lo, p.dte_hard_hi)
+    kdelta = band_kernel(abs(nd) if nd is not None else None,
+                         p.delta_lo, p.delta_hi, p.delta_hard_lo, p.delta_hard_hi)
+    mid = _num(lq.get("mid"))
+    if mid is None and spread is not None:
+        mid = (bid + ask) / 2.0
+    return {"driver": per_day * kd * kdelta, "per_day": per_day,
+            "kd": kd, "kdelta": kdelta, "spread_known": spread is not None,
+            "spread_pct": (spread / mid) if (spread is not None and mid and mid > 0)
+            else None,
+            "oi": _num(lq.get("oi"))}
+
+
+def _harvest_reason(cand, parts, pct) -> Optional[str]:
+    nc_txt = _money(_num(getattr(cand, "net_credit", None)))
+    if parts is None:
+        if _num(getattr(cand, "joint_driver", None)) is not None:
+            return f"{nc_txt} joint net credit ({_pctl(pct)})"
+        return None
+    txt = (f"{nc_txt} net credit — ${parts['per_day']:,.2f}/day·contract"
+           + (" after crossing" if parts["spread_known"] else "")
+           + f" ({_pctl(pct)})")
+    if parts["kd"] != 1.0 or parts["kdelta"] != 1.0:
+        txt += f" · band ×{parts['kd']:.2f}, Δ ×{parts['kdelta']:.2f}"
+    return txt
+
+
 def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
     if driver is None:
         return None
-    if objective in (ROLL_FOR_CREDIT, MAX_PREMIUM):
-        # Always the transaction's dollars — the max-premium CALL driver is a
-        # credit-per-$-of-cap ratio and must not render as money.
-        return f"{_money(_num(getattr(cand, 'net_credit', None)))} net credit ({_pctl(pct)})"
     if objective == ADD_HEDGE:
         return f"{_money(driver)} to establish ({_pctl(pct)})"
     if objective == EXTEND_DURATION:
@@ -307,21 +360,30 @@ def _objective_reason(cand, objective, driver, pct, held) -> Optional[str]:
 def _short_leg_excess(cand, excess_by_ticker):
     """(iv_excess, status) for the candidate's short option leg — the leg being SOLD
     by this transaction (kept sibling shorts of an enclosing structure never key it).
-    status: 'ok' (found), 'no_short' (no premium-selling leg), 'not_in_slice' (the
-    short leg's contract fell outside the pulled slice, so no IV+pp)."""
+    status: 'ok' (found, inside the fitted smile), 'not_in_fit' (measured but the
+    surface fit EXCLUDED the contract — wide/stale market or a degraded fit; no
+    bonus, the gate that closes the stale-quote magnet), 'no_short' (no
+    premium-selling leg), 'not_in_slice' (the short leg's contract fell outside
+    the pulled slice, so no IV+pp)."""
     shorts = [lg for lg in _opt_legs(cand) if (lg.get("qty") or 0) < 0]
     if not shorts:
         return None, "no_short"
-    tk = shorts[0].get("position_id")
-    exc = excess_by_ticker.get(tk)
-    if exc is not None:
-        return exc, "ok"
-    return None, "not_in_slice"
+    entry = excess_by_ticker.get(shorts[0].get("position_id"))
+    if entry is None:
+        return None, "not_in_slice"
+    exc, in_fit = entry
+    if exc is None:
+        return None, "not_in_slice"
+    if not in_fit:
+        return None, "not_in_fit"
+    return exc, "ok"
 
 
 def _iv_reason(status, excess, pct) -> Optional[str]:
     if status == "ok":
-        return f"short leg {excess:+.1f}pp rich ({_pctl(pct)})"
+        return f"short leg {excess:+.1f}pp rich ({_pctl(pct)}, in fit)"
+    if status == "not_in_fit":
+        return "no IV+pp bonus — outside the fitted smile"
     if status == "no_short":
         return "no premium leg — no IV+pp bonus"
     return "IV+pp n/a (short leg outside slice)"
@@ -447,15 +509,18 @@ def _sort_key(item):
 
 
 def rank_candidates(candidates, *, objective, client_profile=None, iv_pp=None,
-                    held=None) -> list:
+                    held=None, liquidity=None, params=None) -> list:
     """Rank the priced candidates for one objective. Returns ``[RankedCandidate, ...]``
     ordered best-first (rank 1 = recommended), each carrying its score decomposition
     and a readable reason.
 
     ``candidates`` may contain other objectives — only those tagged ``objective`` are
-    ranked. ``iv_pp`` is the slice's IV+pp rows (``[{ticker, iv_excess, ...}]``);
+    ranked. ``iv_pp`` is the slice's IV+pp rows (``[{ticker, iv_excess, in_fit, ...}]``);
     ``held`` is ``{delta, dte, strike, right}`` for the held leg (rolls) or None
-    (stock overlays). Pure — no Bloomberg, no state writes."""
+    (stock overlays); ``liquidity`` is the per-ticker ``{bid, ask, mid, oi}`` map and
+    ``params`` the ``HarvestParams`` — both consumed by HARVEST only and both
+    defaulting to None, so every other objective's path is byte-identical without
+    them. Pure — no Bloomberg, no state writes."""
     cands = [c for c in (candidates or []) if getattr(c, "objective", None) == objective]
     if not cands:
         return []
@@ -464,14 +529,24 @@ def rank_candidates(candidates, *, objective, client_profile=None, iv_pp=None,
     for row in (iv_pp or []):
         tk = row.get("ticker")
         if tk is not None:
-            excess_by_ticker[tk] = _num(row.get("iv_excess"))
+            excess_by_ticker[tk] = (_num(row.get("iv_excess")), bool(row.get("in_fit")))
 
-    drivers = [_driver(c, objective, held) for c in cands]
+    is_harvest = objective in _IV_BONUS_OBJECTIVES
+    if is_harvest:
+        hparts = [None if _num(getattr(c, "joint_driver", None)) is not None
+                  else _harvest_parts(c, liquidity, params) for c in cands]
+        drivers = [
+            _num(getattr(c, "joint_driver", None)) if
+            _num(getattr(c, "joint_driver", None)) is not None
+            else (p["driver"] if p is not None else None)
+            for c, p in zip(cands, hparts)]
+    else:
+        hparts = [None] * len(cands)
+        drivers = [_driver(c, objective, held) for c in cands]
     driver_pct = _avg_rank_percentile(drivers)
 
-    is_premium = objective in _IV_BONUS_OBJECTIVES
     excess_status = [_short_leg_excess(c, excess_by_ticker) for c in cands]
-    excesses = [e if is_premium else None for (e, _s) in excess_status]
+    excesses = [e if is_harvest else None for (e, _s) in excess_status]
     iv_pct = _avg_rank_percentile(excesses)
 
     band = getattr(getattr(client_profile, "coverage", None), "band", "low")
@@ -484,21 +559,32 @@ def rank_candidates(candidates, *, objective, client_profile=None, iv_pp=None,
         if getattr(cand, "economics", None) is None:
             flags.append("economics unavailable (pricing degraded)")
 
-        # Objective-fit (+ IV bonus for premium objectives).
+        # Objective-fit (+ the gated IV bonus for harvest).
         primary = driver_pct[i]
-        oreason = _objective_reason(cand, objective, drivers[i], primary, held)
+        oreason = (_harvest_reason(cand, hparts[i], primary) if is_harvest
+                   else _objective_reason(cand, objective, drivers[i], primary, held))
         if oreason:
             reasons.append(oreason)
 
-        iv_richness_pct = iv_pct[i] if is_premium else None
+        iv_richness_pct = iv_pct[i] if is_harvest else None
         if primary is None:
             objective_fit = None
             flags.append("objective driver unavailable — sorted last")
         else:
             bonus = _IV_BONUS_MAX * iv_richness_pct if iv_richness_pct is not None else 0.0
             objective_fit = min(1.0, primary + bonus)
-        if is_premium:
+        if is_harvest:
             reasons.append(_iv_reason(excess_status[i][1], excess_status[i][0], iv_richness_pct))
+            hp = hparts[i]
+            if hp is not None:
+                # Liquidity: demote by FLAG, never a silent drop; an unknown
+                # spread is said out loud (no haircut was applied).
+                if not hp["spread_known"]:
+                    reasons.append("spread unknown — no execution adjustment")
+                if hp["spread_pct"] is not None and hp["spread_pct"] > SPREAD_FLAG_PCT:
+                    flags.append(f"wide market — {hp['spread_pct']:.0%} spread")
+                if hp["oi"] is not None and hp["oi"] < OI_THIN:
+                    flags.append(f"thin strike — OI {int(hp['oi'])}")
 
         # Client-fit (nudge, band-scaled).
         cfit, creasons, cflags, over = _client_fit(cand, client_profile)

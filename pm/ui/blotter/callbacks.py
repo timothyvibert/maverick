@@ -610,23 +610,41 @@ def register_callbacks(app: dash.Dash) -> None:
         Input("am-thr-apply", "n_clicks"),
         Input("am-thr-reset-all", "n_clicks"),
         Input({"type": "thr-reset", "name": ALL}, "n_clicks"),
+        Input({"type": "scn-reset", "name": ALL}, "n_clicks"),
         State({"type": "thr-input", "name": ALL}, "value"),
         State({"type": "thr-input", "name": ALL}, "id"),
+        State({"type": "scn-input", "name": ALL}, "value"),
+        State({"type": "scn-input", "name": ALL}, "id"),
         State("deepdive-refresh-tick", "data"),
         prevent_initial_call=True,
     )
-    def _apply_thresholds(_apply, _reset_all, _row_resets, values, ids, tick):
+    def _apply_thresholds(_apply, _reset_all, _row_resets, _scn_resets,
+                          values, ids, scn_values, scn_ids, tick):
+        from pm.candidates import objectives as _scn
         noop = (no_update,) * 9
         trig = ctx.triggered_id
         # Ignore the spurious fire when the inputs/buttons are (re)created with n_clicks 0.
         if not (ctx.triggered[0] if ctx.triggered else {}).get("value"):
             return noop
 
+        # Two families share the tab: alert dials re-run the engine
+        # (persist-then-recompute), SCANNER dials only invalidate the cached
+        # candidate rankings — a scanner-only Apply must NOT re-run the engine.
+        # "Touched" means the persisted store actually changed.
         thr_status = None
+        prior_alert = _settings.get_overrides()
+        prior_scn = _scn.get_param_overrides()
+        alert_touched = scanner_touched = False
         if trig == "am-thr-reset-all":
-            _settings.clear_all()
+            _settings.clear_all()          # one scope: alert AND scanner overrides
+            alert_touched = bool(prior_alert)
+            scanner_touched = bool(prior_scn)
         elif isinstance(trig, dict) and trig.get("type") == "thr-reset":
             _settings.clear_override(trig["name"])
+            alert_touched = True
+        elif isinstance(trig, dict) and trig.get("type") == "scn-reset":
+            _scn.clear_param(trig["name"])
+            scanner_touched = True
         elif trig == "am-thr-apply":
             applied, rejected = 0, []
             for val, cid in zip(values or [], ids or []):
@@ -635,25 +653,80 @@ def register_callbacks(app: dash.Dash) -> None:
                     continue
                 if val is None:                       # blank input -> revert to default
                     _settings.clear_override(name)
+                    alert_touched = alert_touched or name in prior_alert
                     continue
                 try:
                     # Editing a dial back to its default clears the override (keeps the
                     # store minimal and 'set vs default' honest); else persist it.
                     if abs(float(val) - _cat.default_ui(name)) < 1e-9:
                         _settings.clear_override(name)
+                        alert_touched = alert_touched or name in prior_alert
                     else:
                         _settings.set_override(name, val)   # catalog rejects out-of-range
                         applied += 1
+                        alert_touched = True
                 except (ValueError, TypeError) as exc:
                     # An out-of-range entry is REJECTED, never clamped: nothing is
                     # persisted for that dial (an existing override stays), the
                     # message says so, and the reseeded input visibly snaps back.
+                    rejected.append(str(exc))
+            # Scanner rows. The DTE window validates as a PAIR first — an
+            # inverted window rejects whole (neither bound persists).
+            scn_by_name = {(cid or {}).get("name"): val
+                           for val, cid in zip(scn_values or [], scn_ids or [])}
+            pair_bad = False
+            try:
+                lo_ui = (float(scn_by_name["harvest_dte_lo"])
+                         if scn_by_name.get("harvest_dte_lo") is not None
+                         else _scn.default_ui("harvest_dte_lo"))
+                hi_ui = (float(scn_by_name["harvest_dte_hi"])
+                         if scn_by_name.get("harvest_dte_hi") is not None
+                         else _scn.default_ui("harvest_dte_hi"))
+                if lo_ui >= hi_ui:
+                    pair_bad = True
+                    rejected.append("Harvest window: earliest must be below "
+                                    "latest — window unchanged")
+            except (TypeError, ValueError):
+                pass                       # the per-dial validation reports it
+            for val, cid in zip(scn_values or [], scn_ids or []):
+                name = (cid or {}).get("name")
+                if name is None or not _scn.is_param(name):
+                    continue
+                if pair_bad and name in ("harvest_dte_lo", "harvest_dte_hi"):
+                    continue
+                if val is None:
+                    _scn.clear_param(name)
+                    scanner_touched = scanner_touched or name in prior_scn
+                    continue
+                try:
+                    if abs(float(val) - _scn.default_ui(name)) < 1e-9:
+                        _scn.clear_param(name)
+                        scanner_touched = scanner_touched or name in prior_scn
+                    else:
+                        _scn.set_param(name, val)      # rejects out-of-range
+                        applied += 1
+                        scanner_touched = True
+                except (ValueError, TypeError, KeyError) as exc:
                     rejected.append(str(exc))
             if rejected:
                 thr_status = (f"{len(rejected)} rejected — " + "; ".join(rejected)
                               + (f" · {applied} applied" if applied else ""))
         else:
             return noop
+
+        if scanner_touched:
+            # Drop cached rankings so the next Scan re-ranks under the new
+            # dials — no Bloomberg, no engine recompute.
+            sa.refresh_scanner_params()
+
+        s_cls, p_cls, t_cls, n_cls = _am_tab_classes("thresholds")
+        if not alert_touched:
+            # Scanner-only change (or a rejection with nothing persisted): the
+            # fire set is untouched by construction — reseed the tab, leave the
+            # blotter/status bar/deep-dive alone, and DON'T re-run the engine.
+            body = render_alert_manager_body("thresholds", thr_status=thr_status)
+            return (body, s_cls, p_cls, t_cls, n_cls, no_update, no_update,
+                    no_update, no_update)
 
         # Persist-then-recompute: re-evaluate the current book under the new
         # thresholds over already-loaded state (no Bloomberg). Only when nothing
@@ -666,7 +739,6 @@ def register_callbacks(app: dash.Dash) -> None:
             return (no_update, no_update, no_update, no_update, no_update,
                     html.Div(f"Apply failed: {exc}", className="status-left status-empty"),
                     no_update, no_update, "")
-        s_cls, p_cls, t_cls, n_cls = _am_tab_classes("thresholds")
         # Reseed inputs from persisted state; a rejected entry snaps back visibly.
         body = render_alert_manager_body("thresholds", thr_status=thr_status)
         rows = consolidate_fires_to_rows(sa.all_fires(new_state), new_state)

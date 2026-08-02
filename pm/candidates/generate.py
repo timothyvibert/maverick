@@ -32,15 +32,18 @@ _CAP_DEFAULT = 15
 # |net debit/credit| within this per-share $ reads "costless" (× 100 × contracts).
 _COSTLESS_PER_SHARE = 0.05
 
-ROLL_FOR_CREDIT = "roll-for-credit"
+# HARVEST — the merged premium objective (income re-write: more credit at a
+# moderate delta in a preferred tenor window) — is registry-defined; its
+# admission bounds and dials live in pm.candidates.objectives.
+from pm.candidates.objectives import DEFAULT_HARVEST_PARAMS, HARVEST  # noqa: E402
+
 EXTEND_DURATION = "extend-duration"
 DEFEND_CUT_DELTA = "defend-cut-delta"
-MAX_PREMIUM = "max-premium"
 ADD_HEDGE = "add-hedge"
 ROLL_UP_OUT = "roll-up-out"
 COSTLESS = "costless"
-_DEFAULT_ROLL_OBJECTIVES = (ROLL_FOR_CREDIT, EXTEND_DURATION, DEFEND_CUT_DELTA,
-                            ROLL_UP_OUT, COSTLESS, MAX_PREMIUM)
+_DEFAULT_ROLL_OBJECTIVES = (HARVEST, EXTEND_DURATION, DEFEND_CUT_DELTA,
+                            ROLL_UP_OUT, COSTLESS)
 
 
 def _num(v) -> Optional[float]:
@@ -229,15 +232,28 @@ def _role_for(qty, right) -> str:
 # Rolls (held is an option) — the depth-first core
 # ---------------------------------------------------------------------------
 
-def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) -> list:
+def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap,
+                 today=None, harvest_params=None) -> list:
     """(SliceContract, kind) picks for one objective, over the later-expiry same-right
     contracts, capped."""
     hm = _num(held_mid)
-    if objective == ROLL_FOR_CREDIT:
+    if objective == HARVEST:
+        # The income re-write: a strict credit, the new leg's tenor inside the
+        # HARD window and a KNOWN |Δ| inside the hard band (both derived from
+        # the harvest dials — the soft preference is the ranker's kernel, not
+        # admission's). Top-cap by raw credit, the pre-pricing proxy; the
+        # ranker orders by execution-adjusted credit per day per contract.
+        p = harvest_params or DEFAULT_HARVEST_PARAMS
+        ref = today or date.today()
         scored = []
         for c in later:
             nm = _num(c.mid)
-            if nm is None or hm is None:
+            if nm is None or hm is None or c.delta is None:
+                continue
+            dte = (c.expiry - ref).days
+            if not (p.dte_hard_lo <= dte <= p.dte_hard_hi):
+                continue
+            if not (p.delta_hard_lo <= abs(c.delta) <= p.delta_hard_hi):
                 continue
             nc = held_qty * (hm - nm) * _MULT
             if nc > 0:
@@ -257,20 +273,6 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
             return []
         scored = [(abs(held_delta) - abs(c.delta), c) for c in later
                   if c.delta is not None and abs(c.delta) < abs(held_delta)]
-        scored.sort(key=lambda x: -x[0])
-        return [(c, _roll_kind(held, c)) for _, c in scored[:cap]]
-
-    if objective == MAX_PREMIUM:
-        # Roll to collect premium — the credit rolls; the ranker orders by premium per
-        # dollar of cap (a distinct lens from raw credit).
-        scored = []
-        for c in later:
-            nm = _num(c.mid)
-            if nm is None or hm is None:
-                continue
-            nc = held_qty * (hm - nm) * _MULT
-            if nc > 0:
-                scored.append((nc, c))
         scored.sort(key=lambda x: -x[0])
         return [(c, _roll_kind(held, c)) for _, c in scored[:cap]]
 
@@ -317,7 +319,8 @@ def _select_roll(objective, held, held_qty, held_mid, held_delta, later, cap) ->
 def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
                           sibling_legs=None, rolled_qty=None, context_warnings=None,
                           risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
-                          today=None, objectives=None, cap=_CAP_DEFAULT) -> list:
+                          today=None, objectives=None, cap=_CAP_DEFAULT,
+                          harvest_params=None) -> list:
     """Roll candidates for a held OPTION. ``held`` is a dict
     ``{strike, expiry, right, quantity, delta[, multiplier]}``; ``held_mid`` its
     contemporaneous buy-to-close mid; ``held_stock`` an optional
@@ -368,7 +371,8 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
     out = []
     hm = _num(held_mid)
     for obj in objectives:
-        picks = _select_roll(obj, held_sc, qty_std, held_mid, held_delta, later, cap)
+        picks = _select_roll(obj, held_sc, qty_std, held_mid, held_delta, later, cap,
+                             today=today, harvest_params=harvest_params)
         if not picks:
             continue
         for sc, kind in picks:
@@ -389,12 +393,24 @@ def candidates_from_slice(slice_df, held, held_mid, spot, *, held_stock=None,
 # Single-leg overlays (held is stock) — built after the rolls are verified
 # ---------------------------------------------------------------------------
 
+def _in_harvest_band(c, p, ref) -> bool:
+    """The covered-write admission for a stock overlay: a KNOWN |Δ| and a tenor
+    inside the harvest dials' HARD bounds (the soft preference is the ranker's
+    kernel). Mirrors the roll path's harvest admission."""
+    if c.delta is None or c.expiry is None:
+        return False
+    dte = (c.expiry - ref).days
+    return (p.dte_hard_lo <= dte <= p.dte_hard_hi
+            and p.delta_hard_lo <= abs(c.delta) <= p.delta_hard_hi)
+
+
 def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
                         risk_free_curve=None, risk_free_rate=0.045, div_yield=0.0,
-                        today=None, cap=_CAP_DEFAULT) -> list:
-    """Overlays on a held stock position. Long stock: covered call (max-premium),
+                        today=None, cap=_CAP_DEFAULT, harvest_params=None) -> list:
+    """Overlays on a held stock position. Long stock: covered call (harvest —
+    the standard income write, admitted inside the harvest dials' hard bands),
     protective put and collar (add-hedge). SHORT stock: the mirror income write —
-    the covered put (sell an OTM put against the short, max-premium); a hedge
+    the covered put (sell an OTM put against the short, harvest); a hedge
     (protective call) is deliberately not generated.
 
     Overlays are sized to the POSITION: ``floor(|shares| / 100)`` contracts on
@@ -412,29 +428,34 @@ def overlays_from_slice(slice_df, spot, stock_shares, stock_basis, *,
     contracts = _parse_slice(slice_df)
     stock_leg = _stock_leg(stock_shares, stock_basis)
     kw = dict(spot=spot, curve=risk_free_curve, r_scalar=risk_free_rate, q=div_yield, today=today)
+    p = harvest_params or DEFAULT_HARVEST_PARAMS
+    ref = today
 
     if shares < 0:
-        # Covered put (sell an at/below-spot put against short stock) — most
-        # premium first. The long-stock overlays don't apply to a short.
+        # Covered put (sell an at/below-spot put against short stock) — the
+        # harvest write: most premium first inside the hard bands.
         out = []
         for c in sorted([c for c in contracts
-                         if c.right == "PUT" and c.strike <= spot and c.mid],
+                         if c.right == "PUT" and c.strike <= spot and c.mid
+                         and _in_harvest_band(c, p, ref)],
                         key=lambda c: -(c.mid or 0))[:cap]:
             leg = _option_leg(c, -n_contracts, role="short_put", **kw)
-            out.append(_finish(MAX_PREMIUM, "covered_put",
+            out.append(_finish(HARVEST, "covered_put",
                                f"covered put {c.strike:g} @ {c.expiry:%Y-%m-%d}",
                                [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts,
                                spot, today, new_leg=leg))
         return out
 
-    calls = [c for c in contracts if c.right == "CALL" and c.strike >= spot and c.mid]
+    calls = [c for c in contracts if c.right == "CALL" and c.strike >= spot and c.mid
+             and _in_harvest_band(c, p, ref)]
     puts = [c for c in contracts if c.right == "PUT" and c.strike <= spot and c.mid]
     out = []
 
-    # Covered call (sell an OTM call) — most premium first.
+    # Covered call (sell an OTM call) — the harvest write: most premium first
+    # inside the hard bands.
     for c in sorted(calls, key=lambda c: -(c.mid or 0))[:cap]:
         leg = _option_leg(c, -n_contracts, role="short_call", **kw)
-        out.append(_finish(MAX_PREMIUM, "covered_call",
+        out.append(_finish(HARVEST, "covered_call",
                            f"covered call {c.strike:g} @ {c.expiry:%Y-%m-%d}",
                            [stock_leg, leg], (c.mid or 0) * _MULT * n_contracts, spot, today,
                            new_leg=leg))
@@ -686,7 +707,10 @@ def joint_candidates_from_slice(slice_df, rolled, spot, *, sibling_legs=None,
     out = []
     for obj in objectives:
         picks = []                        # (sort_key, expiry, assignment, nc, driver)
-        if obj in (ROLL_FOR_CREDIT, MAX_PREMIUM):
+        if obj == HARVEST:
+            # Joint harvest keeps the joint net-cash driver this increment —
+            # the per-day / execution corrections apply to single-leg rolls
+            # only (disclosed; the roster path's refinement is a later step).
             for exp, assigns in per_exp:
                 for a in assigns:
                     nc = _joint_nc(a)

@@ -185,6 +185,26 @@ def recompute_thresholds() -> Optional[PortfolioState]:
         return reapply_thresholds(state)
 
 
+def refresh_scanner_params() -> bool:
+    """Invalidate every cached candidate ranking so the next Scan re-ranks under
+    the persisted scanner dials — the Thresholds-tab Apply path for the SCANNER
+    group. A sanctioned owned-state write under the write lock: cached rankings
+    embed the parameters they were ranked under, so a dial change must drop
+    them or a reopened scan would serve an order the dials no longer describe.
+    Raw slices, chains and per-expiry frames stay (no Bloomberg); fires,
+    signals and structures are untouched (no engine recompute — scanner dials
+    change candidate ORDER, never alerts). Returns True when a loaded state
+    was re-marked."""
+    with _WRITE_LOCK:
+        state = _RUNTIME.get("state")
+        if state is None:
+            return False
+        for account in state.accounts:
+            _drop_candidate_caches(state, account)
+        (getattr(state, "slice_cache", None) or {}).pop("overlay_ranked", None)
+        return True
+
+
 def price_scenario(
     account: str, *, spot_pct: float = 0.0, vol_pts: float = 0.0,
     rate_bps: float = 0.0, time_days: int = 0, target=None, mode: str = "fast",
