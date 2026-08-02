@@ -444,13 +444,14 @@ def rank_joint_candidates(state, account: str, position_id: str, rolled_pids, *,
     sl = pull_slice(state, account, position_id, n_expiries=n_expiries,
                     dte_range=dte_range, expiry_type=expiry_type)
     iv_pp = sl.get("iv_pp") if sl else None
+    liquidity = _contract_metrics(sl.get("df") if sl else None)
     from pm.candidates.ranking import rank_candidates
     by_objective: dict = {}
     for c in cands:
         by_objective.setdefault(c.objective, []).append(c)
     ranked = {obj: rank_candidates(cs, objective=obj,
                                    client_profile=getattr(acc, "client_profile", None),
-                                   iv_pp=iv_pp, held=None)
+                                   iv_pp=iv_pp, held=None, liquidity=liquidity)
               for obj, cs in by_objective.items()}
     state.slice_cache.setdefault("joint_ranked", {})[jkey] = ranked
     return ranked

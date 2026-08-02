@@ -152,13 +152,18 @@ def _avg_rank_percentile(values) -> list:
 # Objective driver + reason
 # ---------------------------------------------------------------------------
 
-# Dollar scale of the costless solve's cap tie-break. The priced max_profit maps
-# through 0.5 + 0.4·x/(|x|+_CAP_SCALE) into (0.1, 0.9) strictly; unbounded gain sits
-# at 0.95, missing economics at 0.0. Total spread ≤ 0.95 — STRICTLY below the 1-day
-# tenor step — so nearest-term ordering is exactly lexicographic even when caps
-# straddle sign (an underwater covered call's caps are negative), and within a day:
+# PER-CONTRACT dollar scale of the costless solve's cap tie-break. The priced
+# max_profit is normalized by the opened contracts BEFORE the map — a fixed
+# position-total scale saturated on large lines (a 3,190-lot's caps all
+# compressed to ~0.899, the tie-break's designed resolution gone), and the
+# per-contract cap is size-invariant, so the same book ranks identically at
+# any lot count. The per-contract value maps through 0.5 + 0.4·x/(|x|+scale)
+# into (0.1, 0.9) strictly; unbounded gain sits at 0.95, missing economics at
+# 0.0. Total spread ≤ 0.95 — STRICTLY below the 1-day tenor step — so
+# nearest-term ordering is exactly lexicographic even when caps straddle sign
+# (an underwater covered call's caps are negative), and within a day:
 # unpriced < every real cap < unbounded.
-_CAP_SCALE = 10_000.0
+_CAP_SCALE = 1_000.0
 
 
 def _cap_term(cand) -> float:
@@ -170,7 +175,9 @@ def _cap_term(cand) -> float:
     cap = _num(e.get("max_profit"))
     if cap is None:
         return 0.0
-    return 0.5 + 0.4 * cap / (abs(cap) + _CAP_SCALE)
+    n = sum(abs(_num(lg.get("qty")) or 0.0) for lg in _opt_legs(cand)) or 1.0
+    per_ct = cap / n
+    return 0.5 + 0.4 * per_ct / (abs(per_ct) + _CAP_SCALE)
 
 
 def _opt_legs(cand) -> list:
@@ -304,6 +311,33 @@ def _harvest_parts(cand, liquidity, params) -> Optional[dict]:
             "spread_pct": (spread / mid) if (spread is not None and mid and mid > 0)
             else None,
             "oi": _num(lq.get("oi"))}
+
+
+def _liquidity_flags(cand, liquidity) -> list:
+    """Wide-market / thin-strike demotion flags for the candidate's OPENED
+    legs — execution context every objective's rows carry (a contract is wide
+    or thin regardless of why you're rolling to it). Display-only: flags never
+    change a driver. A multi-leg candidate tags each offending leg by its
+    contract so the reader knows which side is thin."""
+    flags: list = []
+    opts = _opt_legs(cand)
+    multi = len(opts) > 1
+    for lg in opts:
+        lq = (liquidity or {}).get(lg.get("position_id")) or {}
+        bid, ask = _num(lq.get("bid")), _num(lq.get("ask"))
+        spread = (ask - bid) if (bid is not None and ask is not None and ask >= bid) else None
+        mid = _num(lq.get("mid"))
+        if mid is None and spread is not None:
+            mid = (bid + ask) / 2.0
+        k = lg.get("K")
+        tag = (f" ({lg.get('opt_type', '?')[0]}{k:g})"
+               if (multi and k is not None) else "")
+        if spread is not None and mid and mid > 0 and spread / mid > SPREAD_FLAG_PCT:
+            flags.append(f"wide market — {spread / mid:.0%} spread{tag}")
+        oi = _num(lq.get("oi"))
+        if oi is not None and oi < OI_THIN:
+            flags.append(f"thin strike — OI {int(oi)}{tag}")
+    return flags
 
 
 def _harvest_reason(cand, parts, pct) -> Optional[str]:
@@ -583,15 +617,12 @@ def rank_candidates(candidates, *, objective, client_profile=None, iv_pp=None,
         if is_harvest:
             reasons.append(_iv_reason(excess_status[i][1], excess_status[i][0], iv_richness_pct))
             hp = hparts[i]
-            if hp is not None:
-                # Liquidity: demote by FLAG, never a silent drop; an unknown
-                # spread is said out loud (no haircut was applied).
-                if not hp["spread_known"]:
-                    reasons.append("spread unknown — no execution adjustment")
-                if hp["spread_pct"] is not None and hp["spread_pct"] > SPREAD_FLAG_PCT:
-                    flags.append(f"wide market — {hp['spread_pct']:.0%} spread")
-                if hp["oi"] is not None and hp["oi"] < OI_THIN:
-                    flags.append(f"thin strike — OI {int(hp['oi'])}")
+            if hp is not None and not hp["spread_known"]:
+                # An unknown spread is said out loud (no haircut was applied).
+                reasons.append("spread unknown — no execution adjustment")
+
+        # Liquidity: demote by FLAG on every objective, never a silent drop.
+        flags.extend(_liquidity_flags(cand, liquidity))
 
         # Client-fit (nudge, band-scaled).
         cfit, creasons, cflags, over = _client_fit(cand, client_profile)
